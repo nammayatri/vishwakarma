@@ -852,23 +852,36 @@ def _fetch_thread_alarm_context(client, channel: str, thread_ts: str) -> str:
 
 
 def _help_text() -> str:
-    return """*Sage — SRE Investigation Bot*
+    return (
+        ":turtle: *Sage — Autonomous SRE Investigation Bot*\n\n"
 
-*Usage:*
-• `@sage <question>` — quick chat reply (no tools)
-• `@sage debug <question>` — full investigation + PDF report
-• `@sage oracle <question>` — start a multi-turn investigation session (follow-ups remember context)
-• `@sage oracle stop` — end the oracle session in this thread
-• `@sage oracle resume <id>` — resume a previous oracle session
-• `@sage costs` — run AWS cost report now
-• `@sage status` — show incident stats
-• `@sage learn [category] <fact>` — add a learning
-• `@sage forget [category] <keyword>` — remove a learning
-• `@sage help` — show this message
+        "*:mag: Investigation*\n"
+        "• `debug <question>` — full investigation with tools + PDF report\n"
+        "• `debug <ride/booking UUID>` — traces ride across BAP/BPP databases\n"
+        "• `oracle <question>` — multi-turn session (follow-ups remember context)\n"
+        "• `oracle stop` — end the oracle session\n"
+        "• `oracle resume <id>` — resume a previous session\n\n"
 
-*Examples:*
-• `@sage debug why are payments pods crashing?` → full RCA with PDF
-• `@sage oracle check RDS CPU spike from 10am` → start oracle session, then ask follow-ups in thread"""
+        "*:bar_chart: Reports*\n"
+        "• `costs` — AWS cost report with anomaly detection + forecast + PDF\n"
+        "• `status` — incident statistics\n\n"
+
+        "*:brain: Knowledge*\n"
+        "• `learn [category] <fact>` — teach me something new\n"
+        "• `forget [category] <keyword>` — remove a learning\n\n"
+
+        "*:speech_balloon: Chat*\n"
+        "• `<anything else>` — quick chat reply (no tools)\n"
+        "• `help` — this message\n\n"
+
+        "*Examples:*\n"
+        "```@sage debug why are payments pods crashing?\n"
+        "@sage debug why did ride f6d18e1e-... get cancelled?\n"
+        "@sage debug RDS CPU high on customer cluster\n"
+        "@sage oracle check RDS CPU spike from 10am\n"
+        "@sage costs\n"
+        "@sage learn rds app-db-r1 often spikes during morning peak```"
+    )
 
 
 def _extract_root_cause(analysis: str) -> str:
