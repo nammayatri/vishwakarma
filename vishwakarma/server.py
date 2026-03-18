@@ -54,6 +54,7 @@ from vishwakarma.core.models import (
     InvestigationResult,
     LLMResult,
     ToolOutput,
+    ToolStatus,
 )
 from vishwakarma.utils.log import suppress_probe_logs
 from vishwakarma.utils.stream import sse_event, sse_done
@@ -351,26 +352,79 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
         question = issue.question()
         alert_name = issue.labels.get("alertname") or issue.title
 
-        # Run pre-investigation enrichment in parallel (all are fast/independent)
         import asyncio as _asyncio
         loop = _asyncio.get_event_loop()
         from vishwakarma.config import load_matching_runbooks
+        from vishwakarma.core.fast_rca import match_fast_rca, synthesize_fast_rca, format_slack_message
 
+        # ── Launch fast RCA + pre-enrichment in parallel ──
+        fast_match = match_fast_rca(alert_name)
+        fast_rca_result = None
+        fast_rca_ts = None
+
+        async def _run_fast_rca():
+            """Fast RCA: parallel checks → LLM classify → post to Slack."""
+            nonlocal fast_rca_result, fast_rca_ts
+            if not fast_match:
+                return
+            toolset_name, tool_name, tool_params = fast_match
+            fast_ts = tm.get(toolset_name)
+            if not fast_ts or not fast_ts.enabled:
+                return
+            try:
+                check_output = await loop.run_in_executor(
+                    None, lambda: fast_ts.execute(tool_name, tool_params)
+                )
+                if check_output.status != ToolStatus.SUCCESS:
+                    return
+                checks = json.loads(check_output.output) if isinstance(check_output.output, str) else check_output.output
+                fast_rca_result = await loop.run_in_executor(
+                    None, lambda: synthesize_fast_rca(llm, checks.get("checks", checks), alert_name)
+                )
+                # Post to Slack immediately
+                if config.is_slack_configured() and fast_rca_result:
+                    from vishwakarma.plugins.relays.slack.plugin import SlackDestination
+                    slack_text = format_slack_message(fast_rca_result, issue.title)
+                    dest = SlackDestination({"token": config.slack_bot_token})
+                    channel = os.environ.get("SLACK_CHANNEL", "#sre-alerts")
+                    resp = dest._get_client().chat_postMessage(
+                        channel=dest._resolve_channel_id(channel),
+                        text=slack_text,
+                    )
+                    fast_rca_ts = resp["ts"]
+                    log.info(f"Fast RCA posted for {alert_name} in {checks.get('elapsed_seconds', '?')}s")
+            except Exception as e:
+                log.warning(f"Fast RCA failed for {alert_name}: {e}")
+
+        # Run fast RCA and all 4 pre-enrichment tasks in parallel
+        fast_rca_future = _run_fast_rca()
         prefetch_future = loop.run_in_executor(None, _prefetch_alert_context, issue)
         prior_future = loop.run_in_executor(None, _build_prior_context, issue)
         entities_future = loop.run_in_executor(None, _extract_alert_entities, issue, llm)
         runbooks_future = loop.run_in_executor(None, load_matching_runbooks, alert_name, llm)
 
-        prefetch_ctx, prior_ctx, entities_ctx, matched_runbooks = await _asyncio.gather(
-            prefetch_future, prior_future, entities_future, runbooks_future
+        # Wait for all to complete (fast RCA + 4 pre-enrichment tasks)
+        _, prefetch_ctx, prior_ctx, entities_ctx, matched_runbooks = await _asyncio.gather(
+            fast_rca_future, prefetch_future, prior_future, entities_future, runbooks_future
         )
 
-        # Pre-inject learnings relevant to this alert (saves a learnings_list + learnings_read step)
+        # Pre-inject learnings relevant to this alert
         learnings_mgr = state.get("learnings")
         learnings_ctx = learnings_mgr.for_alert(alert_name) if learnings_mgr else ""
 
         # Merge all pre-investigation context into extra_system_prompt
         extra_parts = [p for p in [entities_ctx, prefetch_ctx, prior_ctx, learnings_ctx] if p]
+
+        # Inject fast RCA as starting context for deep investigation
+        if fast_rca_result:
+            extra_parts.insert(0,
+                "## Fast RCA (preliminary, posted to Slack)\n"
+                f"{json.dumps(fast_rca_result, indent=2)}\n"
+                "Verify or refute this preliminary finding with deeper investigation. "
+                "If it's correct, focus on root cause chain and remediation details. "
+                "If your evidence contradicts it, explain why in your final RCA."
+            )
+
         extra_parts.append(
             "## Learned Knowledge\n"
             "Relevant facts from past incidents are pre-injected above (if any). "
@@ -411,7 +465,7 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
     except Exception as e:
         log.warning(f"PDF generation failed: {e}")
 
-    # Post to Slack
+    # Post to Slack — thread reply if fast RCA was posted, otherwise new message
     slack_ts = None
     if config.is_slack_configured():
         try:
@@ -424,6 +478,7 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
                 severity=issue.severity,
                 pdf_path=pdf_path,
                 incident_id=incident_id,
+                thread_ts=fast_rca_ts,
             )
             slack_ts = resp.get("ts")
         except Exception as e:
