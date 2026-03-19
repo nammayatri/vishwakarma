@@ -299,7 +299,7 @@ OUTPUT ONLY: {{"root_cause":"x","confidence":"high|medium|low","scenario":"lette
         kwargs = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 512,  # short — we only need a JSON object
+            "max_tokens": 2048,  # reasoning models need space to think THEN output JSON
             "temperature": 0.0,
             "timeout": 120,  # generous timeout since we're streaming
             "stream": True,
