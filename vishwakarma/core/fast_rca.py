@@ -253,16 +253,27 @@ for _name in ["RDSReplicationLag", "ReplicationSlotLag", "DriverDBReplicationLag
 
 
 def _summarize_checks(checks: dict) -> str:
-    """Condense check results to last value per check — keeps prompt short."""
+    """Condense check results to key=value pairs — ultra short for synthesis prompt."""
+    import re
     lines = []
     for k, v in (checks or {}).items():
         if not isinstance(v, str) or v.startswith("(error"):
             continue
-        # Take last line only (most recent datapoint)
         last = v.strip().split("\n")[-1] if v.strip() else ""
-        if last:
-            lines.append(f"{k}: {last[:120]}")
-    return "\n".join(lines[:15])  # max 15 checks
+        if not last:
+            continue
+        # Extract just the number from the last line
+        m = re.search(r'avg=(\d+(?:\.\d+)?)', last)
+        if m:
+            lines.append(f"{k}={m.group(1)}")
+        elif "load=" in last:
+            m2 = re.search(r'load=(\d+(?:\.\d+)?)', last)
+            if m2:
+                lines.append(f"{k}={m2.group(1)}")
+        else:
+            # Truncate heavily
+            lines.append(f"{k}: {last[:60]}")
+    return "; ".join(lines[:12])  # single line, max 12 checks
 
 
 def synthesize_fast_rca(llm, checks: dict, alert_name: str) -> dict:
