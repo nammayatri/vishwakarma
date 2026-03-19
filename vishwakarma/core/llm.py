@@ -295,7 +295,23 @@ class VishwakarmaLLM:
                 return response
             except Exception as e:
                 last_error = e
-                log.warning(f"Model {model} failed ({type(e).__name__}: {str(e)[:80]}), "
+                error_type = type(e).__name__
+                # Rate limit: extract reset time and wait briefly before next attempt
+                if "RateLimit" in error_type or "429" in str(e):
+                    import re
+                    reset_match = re.search(r'resets at: (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})', str(e))
+                    if reset_match:
+                        from datetime import datetime, timezone
+                        try:
+                            reset_time = datetime.strptime(reset_match.group(1), "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                            wait_secs = (reset_time - datetime.now(timezone.utc)).total_seconds()
+                            if 0 < wait_secs <= 10:  # only wait if reset is within 10s
+                                log.info(f"Rate limit resets in {wait_secs:.0f}s — waiting")
+                                time.sleep(min(wait_secs + 0.5, 10))
+                                continue  # retry same model after rate limit reset
+                        except Exception:
+                            pass
+                log.warning(f"Model {model} failed ({error_type}: {str(e)[:80]}), "
                            f"{'trying next' if i < len(models) - 1 else 'no more fallbacks'} "
                            f"[{time.time() - start:.1f}s elapsed]")
         raise last_error  # type: ignore
