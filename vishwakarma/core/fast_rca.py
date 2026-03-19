@@ -299,11 +299,13 @@ OUTPUT ONLY: {{"root_cause":"x","confidence":"high|medium|low","scenario":"lette
         kwargs = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 2048,  # reasoning models need space to think THEN output JSON
+            "max_tokens": 2048,
             "temperature": 0.0,
-            "timeout": 120,  # generous timeout since we're streaming
+            "timeout": 120,
             "stream": True,
             "num_retries": 1,
+            # Disable reasoning/thinking for faster, cleaner JSON output
+            "extra_body": {"chat_template_kwargs": {"enable_thinking": False, "thinking": False}},
         }
         if llm.cfg.api_key:
             kwargs["api_key"] = llm.cfg.api_key

@@ -289,6 +289,12 @@ class VishwakarmaLLM:
                     kwargs["api_base"] = self.cfg.api_base
                 if tools:
                     kwargs["tools"] = tools
+                # Disable reasoning for fast calls (summarize, compress)
+                # Works for GLM-5 (enable_thinking) and Kimi-K2.5 (thinking)
+                if not tools:
+                    kwargs["extra_body"] = {
+                        "chat_template_kwargs": {"enable_thinking": False, "thinking": False}
+                    }
                 response = completion(**kwargs)
                 if i > 0:
                     log.info(f"Fallback to {model} succeeded (primary failed)")
