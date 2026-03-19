@@ -8,6 +8,7 @@ Scheduled runs only post when anomalies are detected (cost spike above threshold
 On-demand runs (via @sage costs) always post the full report.
 """
 import logging
+import os
 import threading
 from datetime import datetime, timedelta, timezone
 
@@ -1234,6 +1235,12 @@ def _generate_and_post_inner(config, force: bool = True, channel: str | None = N
             pdf_path=pdf_path,
         )
         log.info(f"Cost report posted to Slack (severity={severity}, anomalies={len(anomalies)})")
+        # Clean up PDF after successful upload — no need to keep on PV
+        if pdf_path:
+            try:
+                os.remove(pdf_path)
+            except OSError:
+                pass
     except Exception as e:
         log.error(f"Failed to post cost report to Slack: {e}")
         if pdf_path:
@@ -1327,6 +1334,11 @@ def _trigger_cost_investigation(config, anomalies: list[dict], cost_context: str
                 pdf_path=inv_pdf,
             )
             log.info("Cost anomaly investigation completed and posted to Slack")
+            if inv_pdf:
+                try:
+                    os.remove(inv_pdf)
+                except OSError:
+                    pass
         except Exception:
             log.exception("Cost anomaly auto-investigation failed")
         finally:

@@ -72,10 +72,10 @@
     },
     {
       "id": "database-investigation",
-      "update_date": "2026-03-16",
-      "description": "Investigate issues involving application database records — rides, bookings, payments, drivers, riders, or any entity by UUID or phone number. Also covers RDS performance diagnostics using pg_stat_activity and pg_stat_user_tables. Requires database toolset enabled and database learnings on PV.",
+      "update_date": "2026-03-19",
+      "description": "Deep domain debugging: trace application issues through database + source code. Given a ride/booking/payment UUID, resolves the full entity chain, finds the anomaly, then reads the actual Haskell backend code from /data/example-app-src/ to explain WHY the code behaved that way. Covers: rides, bookings, payments, drivers, riders, fare issues, cancellations, search failures.",
       "keywords": ["ride", "booking", "payment", "driver", "rider", "person", "uuid", "trace", "debug", "phone", "fare", "cancel", "refund", "transaction", "quote", "search_request", "pg_stat"],
-      "runbook": "../runbooks/database-investigation.md"
+      "runbook": "../runbooks/custom/domain-debugging.md"
     },
     {
       "id": "allocator-dead",

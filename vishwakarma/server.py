@@ -100,27 +100,6 @@ def create_app(config=None) -> FastAPI:
         _state["toolset_manager"] = config.make_toolset_manager()
         _state["toolset_manager"].check_all()
 
-        # Pull latest backend source code for domain debugging
-        import subprocess
-        repo_path = "/data/example-app-src"
-        try:
-            import os
-            if os.path.exists(os.path.join(repo_path, ".git")):
-                result = subprocess.run(
-                    ["git", "-C", repo_path, "pull", "--ff-only"],
-                    capture_output=True, text=True, timeout=60,
-                )
-                log.info(f"Code repo updated: {result.stdout.strip()}")
-            else:
-                result = subprocess.run(
-                    ["git", "clone", "--depth", "1",
-                     "https://github.com/your-org/backend.git", repo_path],
-                    capture_output=True, text=True, timeout=300,
-                )
-                log.info(f"Code repo cloned: {result.stdout.strip()}")
-        except Exception as e:
-            log.warning(f"Code repo sync failed (non-fatal): {e}")
-
         log.info("Vishwakarma server ready")
 
     # ── /healthz ──────────────────────────────────────────────────────────────
