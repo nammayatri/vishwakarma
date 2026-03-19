@@ -33,5 +33,5 @@ config.yaml
 .pytest_cache/
 .coverage
 htmlcov/
-
+k8s/deployment.yaml
 NY_CONTEXT.md
