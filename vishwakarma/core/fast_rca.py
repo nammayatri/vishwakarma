@@ -312,9 +312,19 @@ Respond ONLY with valid JSON (no markdown fences):
         log.info(f"Fast RCA synthesis response: content_len={len(msg.content or '')}, "
                  f"reasoning_len={len(getattr(msg, 'reasoning_content', '') or '')}, "
                  f"raw_len={len(raw)}, raw_preview={raw[:100]}")
-        # Strip reasoning preamble ("The user wants me to..." before the JSON)
+        # Strip reasoning preamble and extract JSON
         import re
-        json_match = re.search(r'\{[^{}]*"root_cause"[^}]*\}', raw, re.DOTALL)
+        # Try multiple extraction strategies
+        # Strategy 1: Find JSON block containing "root_cause" (handles nested reasoning text)
+        json_match = re.search(r'\{"root_cause".*?"evidence_summary"\s*:\s*"[^"]*"\s*\}', raw, re.DOTALL)
+        if not json_match:
+            # Strategy 2: Find last JSON object in the response (reasoning models put JSON at the end)
+            all_jsons = list(re.finditer(r'\{[^{}]{20,}\}', raw))
+            if all_jsons:
+                json_match = all_jsons[-1]
+        if not json_match:
+            # Strategy 3: Find anything that looks like our expected JSON
+            json_match = re.search(r'\{[^{}]*"root_cause"[^}]*\}', raw, re.DOTALL)
         if json_match:
             raw = json_match.group()
         # Strip markdown fences if present
