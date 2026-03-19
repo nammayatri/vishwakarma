@@ -295,7 +295,14 @@ Respond ONLY with valid JSON (no markdown fences):
 {{"root_cause": "one-line description", "confidence": "high|medium|low", "scenario": "letter", "impact": "what is broken for users (or 'No user impact' if metrics are normal)", "suggested_fix": "immediate action (or 'No action needed' if normal)", "evidence_summary": "2-3 key facts from checks WITH actual numbers"}}"""
 
     try:
-        raw = llm.summarize(prompt).strip()
+        # Use main model chain for classification — fast models can't return clean JSON
+        raw_response = llm._call_with_fallback(
+            models=llm._get_main_chain(),
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=1024,
+            timeout=30,
+        )
+        raw = (raw_response.choices[0].message.content or "").strip()
         # Strip markdown fences if present
         if raw.startswith("```"):
             raw = raw.split("\n", 1)[1] if "\n" in raw else raw[3:]
