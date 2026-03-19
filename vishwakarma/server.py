@@ -370,17 +370,23 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
                 slack_channel_id = dest._resolve_channel_id(
                     os.environ.get("SLACK_CHANNEL", "#sre-alerts")
                 )
-                severity = (issue.severity or "warning").upper()
-                namespace = issue.labels.get("namespace", "atlas")
-                service = issue.labels.get("service", issue.labels.get("instance", ""))
-                service_info = f" in {namespace}" + (f" ({service})" if service else "")
-                ack_text = (
-                    f":rotating_light: *RCA: [{severity}] {alert_name}{service_info}*\n"
-                    f":thread: Investigation running. See thread for fast RCA + full report."
-                )
+                severity_color = "#FF0000" if (issue.severity or "").lower() in ("critical", "high") else "#FFA500"
+                ack_text = f":rotating_light: Investigating: {issue.title}"
+                ack_blocks = [
+                    {
+                        "type": "header",
+                        "text": {"type": "plain_text", "text": f":rotating_light: {issue.title[:150]}", "emoji": True},
+                    },
+                    {"type": "divider"},
+                    {
+                        "type": "context",
+                        "elements": [{"type": "mrkdwn", "text": ":hourglass_flowing_sand: _Investigation in progress — fast RCA + full RCA with PDF will follow in this thread..._"}],
+                    },
+                ]
                 resp = slack_client.chat_postMessage(
                     channel=slack_channel_id,
                     text=ack_text,
+                    attachments=[{"color": severity_color, "blocks": ack_blocks}],
                 )
                 ack_ts = resp["ts"]
             except Exception as e:
@@ -500,6 +506,91 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
         )
         extra_system_prompt = "\n\n".join(extra_parts) or None
 
+        # ── Pattern replay: check if a confirmed pattern matches ──
+        pattern_matched = False
+        try:
+            from vishwakarma.storage.patterns import get_patterns_for_alert, replay_pattern, mark_pattern_hit, mark_pattern_miss
+            patterns = await loop.run_in_executor(
+                None, lambda: get_patterns_for_alert(alert_name)
+            )
+            if patterns:
+                # Try the most confirmed pattern first
+                best = patterns[0]
+                log.info(f"Found pattern for {alert_name}: {best['root_cause_type']} (hit_count={best['hit_count']})")
+
+                # Post pattern replay status
+                if slack_client and slack_channel_id and ack_ts:
+                    try:
+                        slack_client.chat_postMessage(
+                            channel=slack_channel_id, thread_ts=ack_ts,
+                            text=f":brain: Known pattern found: *{best['root_cause_type']}* (confirmed {best['hit_count']}x). Replaying investigation steps...",
+                            blocks=[{"type": "context", "elements": [
+                                {"type": "mrkdwn", "text": f":brain: _Known pattern: *{best['root_cause_type']}* (confirmed {best['hit_count']}x) — replaying {len(best['investigation_steps'])} steps..._"}
+                            ]}],
+                        )
+                    except Exception:
+                        pass
+
+                validation = await loop.run_in_executor(
+                    None, lambda: replay_pattern(best, engine.executor, llm, question)
+                )
+                if validation and validation.get("matched") and validation.get("confidence") in ("high", "medium"):
+                    pattern_matched = True
+                    mark_pattern_hit(best["id"], incident_id)
+                    # Build instant RCA from pattern
+                    analysis = (
+                        f"## Root Cause\n{validation.get('root_cause', best['root_cause_detail'])}\n\n"
+                        f"## Confidence: {validation.get('confidence', 'medium').upper()}\n"
+                        f"Known pattern (confirmed {best['hit_count'] + 1}x). "
+                        f"Root cause type: {best['root_cause_type']}\n\n"
+                        f"## Evidence\n{validation.get('evidence', 'Pattern matched')}\n\n"
+                        f"## Differences from Previous\n{validation.get('differences', 'None')}\n\n"
+                        f"## Immediate Fix\n{best.get('fix', 'See previous incidents')}\n\n"
+                        f"## Investigation Method\nPattern replay — {len(best['investigation_steps'])} targeted tool calls instead of full investigation.\n"
+                        f"Previously confirmed on: {time.strftime('%Y-%m-%d', time.localtime(best['last_seen']))}"
+                    )
+                    log.info(f"Pattern matched for {alert_name}: {best['root_cause_type']} — skipping full investigation")
+
+                    # Post match result
+                    if slack_client and slack_channel_id and ack_ts:
+                        try:
+                            slack_client.chat_postMessage(
+                                channel=slack_channel_id, thread_ts=ack_ts,
+                                text=f":white_check_mark: Pattern matched! {validation.get('root_cause', '')}",
+                                blocks=[{"type": "context", "elements": [
+                                    {"type": "mrkdwn", "text": f":white_check_mark: _Pattern matched ({validation.get('confidence', '?')} confidence) — instant RCA generated_"}
+                                ]}],
+                            )
+                        except Exception:
+                            pass
+
+                    # Create result object for PDF + Slack posting
+                    from vishwakarma.core.models import LLMResult, InvestigationMeta
+                    result = LLMResult(
+                        answer=analysis,
+                        tool_outputs=[],
+                        messages=[],
+                        meta=InvestigationMeta(steps=len(best["investigation_steps"])),
+                    )
+                else:
+                    # Pattern didn't match current data
+                    if validation:
+                        mark_pattern_miss(best["id"])
+                    log.info(f"Pattern did not match for {alert_name} — falling back to full investigation")
+                    if slack_client and slack_channel_id and ack_ts:
+                        try:
+                            slack_client.chat_postMessage(
+                                channel=slack_channel_id, thread_ts=ack_ts,
+                                text=":x: Pattern didn't match current data — running full investigation",
+                                blocks=[{"type": "context", "elements": [
+                                    {"type": "mrkdwn", "text": ":x: _Pattern didn't match current data — different root cause. Running full investigation..._"}
+                                ]}],
+                            )
+                        except Exception:
+                            pass
+        except Exception as e:
+            log.debug(f"Pattern check failed (non-fatal): {e}")
+
         # ── Streaming investigation with real-time Slack updates ──
         # Same style as the Slack "debug" path: small context blocks,
         # real-time tool call start/result, yellow status message.
@@ -518,6 +609,7 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
                 return val[:50].replace("\n", " ")
 
             # Post initial status message in thread
+            log.info(f"Streaming investigation: slack_client={bool(slack_client)} channel={slack_channel_id} ack_ts={ack_ts}")
             if slack_client and slack_channel_id and ack_ts:
                 try:
                     resp = slack_client.chat_postMessage(
@@ -529,8 +621,9 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
                         ]}],
                     )
                     status_ts = resp["ts"]
+                    log.info(f"Status message posted: ts={status_ts}")
                 except Exception as e:
-                    log.debug(f"Status message failed (non-fatal): {e}")
+                    log.warning(f"Status message failed: {e}")
 
             for event in engine.stream_investigate(
                 question=question,
@@ -602,15 +695,16 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
                     pass
 
             # Build a result-like object for the rest of the flow
-            from vishwakarma.core.models import LLMResult
+            from vishwakarma.core.models import LLMResult, InvestigationMeta
             return LLMResult(
                 answer=analysis,
                 tool_outputs=[],
                 messages=[],
-                meta=None,
+                meta=InvestigationMeta(steps=tool_count),
             )
 
-        result = await loop.run_in_executor(None, _run_streaming_investigation)
+        if not pattern_matched:
+            result = await loop.run_in_executor(None, _run_streaming_investigation)
     except Exception as e:
         log.error(f"Alert investigation failed for {issue.title}: {e}", exc_info=True)
         if fingerprint:

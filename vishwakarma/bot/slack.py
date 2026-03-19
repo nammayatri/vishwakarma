@@ -788,14 +788,38 @@ def start_bot(config: "VishwakarmaConfig") -> None:
             llm = config.make_llm()
             learnings_manager.compact(category, llm.summarize)
 
+            # Extract and save replayable pattern
+            pattern_saved = False
+            try:
+                from vishwakarma.storage.patterns import extract_pattern_from_rca, save_pattern
+                import uuid
+                tool_outputs = json.loads(incident.get("tool_outputs", "[]")) if incident.get("tool_outputs") else []
+                pattern_data = extract_pattern_from_rca(llm, alert_name, analysis, tool_outputs)
+                if pattern_data:
+                    save_pattern(
+                        pattern_id=str(uuid.uuid4()),
+                        alert_name=alert_name,
+                        root_cause_type=pattern_data["root_cause_type"],
+                        root_cause_detail=pattern_data["root_cause_detail"],
+                        investigation_steps=pattern_data["investigation_steps"],
+                        verification_criteria=pattern_data["verification_criteria"],
+                        fix=pattern_data["fix"],
+                        incident_id=incident_id,
+                    )
+                    pattern_saved = True
+                    log.info(f"[FEEDBACK] Pattern saved: {alert_name}/{pattern_data['root_cause_type']}")
+            except Exception as e:
+                log.warning(f"[FEEDBACK] Pattern extraction failed (non-fatal): {e}")
+
             # Replace buttons with confirmation
+            pattern_note = " + investigation pattern saved for auto-replay" if pattern_saved else ""
             client.chat_update(
                 channel=channel_id,
                 ts=msg_ts,
                 text=f"✅ RCA marked correct by <@{user}>",
                 blocks=[{
                     "type": "section",
-                    "text": {"type": "mrkdwn", "text": f"✅ *Marked correct by <@{user}>* — root cause added to `{category}` learnings."},
+                    "text": {"type": "mrkdwn", "text": f"✅ *Marked correct by <@{user}>* — root cause added to `{category}` learnings{pattern_note}."},
                 }],
             )
         except Exception as e:

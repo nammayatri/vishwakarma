@@ -127,21 +127,33 @@ _DRAINER_DECISION_TREE = """\
 - **Scenario F (Pods UP + stop_metric active)**: stop_metric value is > 0, drainer intentionally stopped → Root cause: Drainer stopped"""
 
 _ALB_5XX_DECISION_TREE = """\
-- **Scenario A (Low 5xx + baseline noise)**: target_5xx < 20/min consistently, no spike pattern → Root cause: Normal baseline noise, not a real incident
-- **Scenario B (High target_5xx + high latency)**: target_5xx spike + response_time avg > 3s → Root cause: Downstream timeout (504), a backend service or DB is slow
-- **Scenario C (High target_5xx + low latency + specific handler)**: target_5xx spike + response_time < 1s + api_5xx shows one handler dominating → Root cause: Application bug in that specific API handler (500)
-- **Scenario D (High elb_5xx + unhealthy hosts)**: elb_5xx > 0 + unhealthy_hosts > 0 → Root cause: ALB cannot route to backends, pods are failing health checks or down
-- **Scenario E (High 5xx + bad_pods)**: target_5xx spike + bad_pods shows CrashLoopBackOff or OOMKilled for a key service → Root cause: Pod crashes causing 5xx, identify which service
-- **Scenario F (Broad 5xx across all services)**: api_5xx and istio_5xx show multiple services failing → Root cause: Shared dependency failure (DB, Redis, or network), not a single service issue"""
+BASELINES — normal values (not an incident):
+- ALB target_5xx: 20-40/min is NORMAL baseline. Only >100/min sustained is a real spike.
+- ALB elb_5xx: 0-2/min is normal. >10/min is concerning.
+- Response time avg: 10-30ms is normal. >500ms is slow. >3s is timeout territory.
+- Bad pods: protocol-rider-person-stat, protocol-safety-dashboard, gps-processor, sdk-config-server in CrashLoopBackOff are KNOWN and should be IGNORED.
+
+- **Scenario A (Low 5xx + baseline noise)**: target_5xx < 50/min consistently, no spike pattern → Root cause: Normal baseline noise, not a real incident. NO ACTION NEEDED.
+- **Scenario B (High target_5xx + high latency)**: target_5xx >100/min + response_time avg > 500ms → Root cause: Downstream timeout (504), a backend service or DB is slow
+- **Scenario C (High target_5xx + low latency + specific handler)**: target_5xx >100/min + response_time < 100ms + api_5xx shows one handler dominating → Root cause: Application bug in that specific API handler (500)
+- **Scenario D (High elb_5xx + unhealthy hosts)**: elb_5xx > 10/min + bad_pods shows CrashLoopBackOff for a MAIN service (not the known bad pods listed above) → Root cause: ALB cannot route to backends
+- **Scenario E (Broad 5xx across services)**: api_5xx and istio_5xx show multiple services failing >100/min total → Root cause: Shared dependency failure (DB, Redis, or network)"""
 
 _RDS_CPU_DECISION_TREE = """\
-- **Scenario A (Missing index / full table scan)**: rds_cpu high + ReadIOPS spike + pi_top_sql shows one query > 40% db.load → Root cause: Expensive query doing sequential scan, needs index
-- **Scenario B (Bad deploy)**: rds_cpu high + pi_top_sql shows new query pattern not seen before → Root cause: Recent deploy introduced expensive query or connection leak
-- **Scenario C (Autovacuum)**: rds_cpu high + WriteIOPS high + pi_wait_events shows VacuumDelay or XactSync dominant → Root cause: Autovacuum running on large table, will self-resolve
-- **Scenario D (Connection pool exhaustion)**: rds_DatabaseConnections surged + app_db_errors shows "too many clients" or "connection pool" → Root cause: PgBouncer or app connection pool exhausted
+IMPORTANT BASELINES — use these to determine if values are actually anomalous:
+- driver-w3 normal CPU: ~17-20%. customer-w1 normal CPU: ~10-12%. driver-r1 normal CPU: ~28-33%.
+- Normal ALB 5xx: 20-40/min (baseline noise). A "spike" means >100/min sustained.
+- Normal PI wait events: IO:DataFileRead, IO:XactSync, CPU are always present. Only significant if one event is >50% of total db.load.
+- If CPU is within normal range AND 5xx is within normal range → this is NOT an incident. Classify as Scenario H.
+
+- **Scenario A (Missing index / full table scan)**: rds_cpu >50% (well above baseline) + rds_ReadIOPS spike >5x normal + pi_top_sql shows one query >40% db.load → Root cause: Expensive query doing sequential scan, needs index
+- **Scenario B (Bad deploy)**: rds_cpu >50% + pi_top_sql shows new query pattern not seen before → Root cause: Recent deploy introduced expensive query or connection leak
+- **Scenario C (Autovacuum)**: rds_cpu elevated + rds_WriteIOPS high + pi_wait_events shows VacuumDelay or XactSync as >50% of total load → Root cause: Autovacuum running on large table, will self-resolve
+- **Scenario D (Connection pool exhaustion)**: rds_DatabaseConnections surged >2x normal + app_db_errors shows "too many clients" or "connection pool" → Root cause: PgBouncer or app connection pool exhausted
 - **Scenario E (Replication lag)**: rds_cpu high on reader + WriteIOPS high on writer → Root cause: Heavy write load causing replica lag, reads falling behind
-- **Scenario F (DB causing 5xx)**: rds_cpu high + investigate_alb_5xx_target_5xx shows spike → Root cause: Database overload is causing downstream 5xx errors — HIGH IMPACT, user-facing
-- **Scenario G (Background job / low urgency)**: rds_cpu high + no app_db_errors + investigate_alb_5xx_target_5xx is low/zero → Root cause: Background analytics or batch job consuming CPU, no user impact"""
+- **Scenario F (DB causing 5xx)**: rds_cpu >60% (genuinely high, not baseline) + investigate_alb_5xx_target_5xx >100/min (sustained, not baseline noise of 20-40/min) → Root cause: Database overload is causing downstream 5xx errors — HIGH IMPACT
+- **Scenario G (Background job / low urgency)**: rds_cpu elevated but <60% + no app_db_errors + investigate_alb_5xx_target_5xx in normal range (<50/min) → Root cause: Background analytics or batch job, no user impact
+- **Scenario H (Normal load / false alarm)**: rds_cpu within normal baseline range (driver-w3 <25%, customer-w1 <15%) + 5xx within baseline (<50/min) + no anomaly in any metric → Root cause: Normal load, alert threshold too sensitive or transient spike already resolved. NOT AN INCIDENT."""
 
 _RDS_CONNECTIONS_DECISION_TREE = """\
 - **Scenario A (HPA scale-up)**: connections surged + hpa_and_scale shows recent SuccessfulRescale or replica increase → Root cause: Pod autoscaling increased pod count, each new pod opens DB connections. Expected during traffic spikes, will stabilize.
@@ -263,6 +275,16 @@ def synthesize_fast_rca(llm, checks: dict, alert_name: str) -> dict:
 
     prompt = f"""You are an SRE analyzing a "{alert_name}" alert. Classify the root cause from these parallel check results.
 
+CRITICAL RULES:
+1. DO NOT assume values are anomalous without comparing to baselines. Normal ≠ incident.
+2. If a metric is within its normal baseline range, it is NOT evidence of a problem.
+3. ALB 5xx of 20-40/min is NORMAL baseline noise — only >100/min sustained is a real spike.
+4. RDS CPU: driver-w3 normal=17-20%, customer-w1 normal=10-12%, driver-r1 normal=28-33%. Only >50% is concerning.
+5. PI wait events (IO:DataFileRead, IO:XactSync, CPU) are ALWAYS present — they only matter if one dominates >50% of total db.load.
+6. If ALL metrics are within normal ranges, classify as "Normal load / false alarm" with HIGH confidence.
+7. Error messages in app logs that say "SECONDARY_CLUSTER" or "429" are often pre-existing baseline issues, NOT caused by this alert.
+8. Confidence should be LOW if you're not sure, MEDIUM if evidence is suggestive but not definitive, HIGH only with clear anomalous data.
+
 ## Check Results
 {json.dumps(checks, indent=2)}
 
@@ -270,7 +292,7 @@ def synthesize_fast_rca(llm, checks: dict, alert_name: str) -> dict:
 {decision_tree}
 
 Respond ONLY with valid JSON (no markdown fences):
-{{"root_cause": "one-line description", "confidence": "high|medium|low", "scenario": "A|B|C|D|E|F", "impact": "what is broken for users", "suggested_fix": "immediate action", "evidence_summary": "2-3 key facts from checks"}}"""
+{{"root_cause": "one-line description", "confidence": "high|medium|low", "scenario": "letter", "impact": "what is broken for users (or 'No user impact' if metrics are normal)", "suggested_fix": "immediate action (or 'No action needed' if normal)", "evidence_summary": "2-3 key facts from checks WITH actual numbers"}}"""
 
     try:
         raw = llm.summarize(prompt).strip()

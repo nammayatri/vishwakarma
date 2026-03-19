@@ -77,6 +77,10 @@ def init_db(db_path: str | None = None) -> None:
         _conn.execute("PRAGMA synchronous=NORMAL")
         _conn.executescript(SCHEMA)
         _conn.commit()
+        # Initialize pattern tables
+        from vishwakarma.storage.patterns import PATTERNS_SCHEMA
+        _conn.executescript(PATTERNS_SCHEMA)
+        _conn.commit()
         log.info(f"Database initialized at {_db_path}")
 
 
