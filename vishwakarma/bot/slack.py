@@ -385,44 +385,58 @@ def start_bot(config: "VishwakarmaConfig") -> None:
             threading.Thread(target=run_oracle, daemon=True).start()
             return
 
-        # debug <question> → full investigation + PDF
-        # OR auto-detect investigation intent from the question
+        # ── Determine: investigate or chat? ──
+        # 1. "debug X" → always investigate, no questions asked
+        # 2. Thread reply → fetch thread context, use it to decide + enrich
+        # 3. Auto-detect from keywords/patterns
+        is_thread_reply = thread_ts and event.get("ts") != thread_ts
+        thread_context = ""
+        thread_text = ""
+
+        # Fetch thread context if we're in a thread
+        if is_thread_reply and client:
+            try:
+                thread_msgs = client.conversations_replies(
+                    channel=channel, ts=thread_ts, limit=30
+                )
+                messages_list = thread_msgs.get("messages", [])
+                thread_text = "\n".join(m.get("text", "")[:500] for m in messages_list)
+                # Also grab alarm context from parent message (CloudWatch alarms)
+                thread_context = _fetch_thread_alarm_context(client, channel, thread_ts)
+            except Exception as e:
+                log.debug(f"Thread fetch failed (non-fatal): {e}")
+
+        # Route: debug prefix = direct investigate
         is_investigation = question_lower.startswith("debug ")
         if is_investigation:
-            question = question[len("debug "):].strip()  # strip "debug " prefix
-        elif not is_investigation:
-            is_investigation = _is_investigation_intent(question)
+            question = question[len("debug "):].strip()
+        else:
+            # Auto-detect: check the message + thread context together
+            # If user says "check redis" in a thread about an RDS alert, that's investigation
+            combined_context = f"{question} {thread_text[:500]}" if thread_text else question
+            is_investigation = _is_investigation_intent(combined_context)
 
-            # If the user replied in a thread, try to fetch the thread's parent message.
-            # Amazon Q posts CloudWatch alarms as thread starters — grab the alarm context.
-            thread_context = ""
-            if client and thread_ts and event.get("ts") != thread_ts:
-                thread_context = _fetch_thread_alarm_context(client, channel, thread_ts)
-
-            # Build investigation question: user question + alarm context if found
+        if is_investigation:
+            # Build investigation question with thread context
             if thread_context:
                 full_question = f"{question}\n\n{thread_context}"
+            elif thread_text and is_thread_reply:
+                # Use thread text as context even if no alarm format detected
+                full_question = f"{question}\n\n## Thread Context\n{thread_text[:3000]}"
             else:
                 full_question = question
 
             say(text=f":mag: Investigating: *{question[:100]}*...", thread_ts=thread_ts)
         else:
-            # Check if this is a thread reply to an investigation — provide contextual response
-            is_thread_reply = thread_ts and event.get("ts") != thread_ts
-            if is_thread_reply and client:
+            # Not investigation — contextual reply if in thread, simple chat otherwise
+            if is_thread_reply and thread_text:
+                has_investigation = any(
+                    kw in thread_text.lower()
+                    for kw in ["fast rca", "root cause", "investigation", "confidence",
+                               "evidence", "deep investigation", "investigation started"]
+                )
                 def run_contextual_reply():
                     try:
-                        # Fetch thread messages for context
-                        thread_msgs = client.conversations_replies(
-                            channel=channel, ts=thread_ts, limit=30
-                        )
-                        messages = thread_msgs.get("messages", [])
-                        # Check if this thread has investigation content (fast RCA or full RCA)
-                        thread_text = "\n".join(m.get("text", "")[:500] for m in messages)
-                        has_investigation = any(
-                            kw in thread_text.lower()
-                            for kw in ["fast rca", "root cause", "investigation", "confidence", "evidence", "deep investigation"]
-                        )
                         if has_investigation:
                             reply = _contextual_thread_reply(config, question, thread_text)
                         else:
