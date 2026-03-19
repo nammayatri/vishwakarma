@@ -286,20 +286,11 @@ def synthesize_fast_rca(llm, checks: dict, alert_name: str) -> dict:
     if not decision_tree:
         decision_tree = _DRAINER_DECISION_TREE
 
-    prompt = f"""RESPOND WITH ONLY A JSON OBJECT. NO REASONING. NO EXPLANATION. NO THINKING. JUST THE JSON.
+    # Keep prompt SHORT — long prompts trigger reasoning mode in kimi-k2-5-dev
+    checks_text = _summarize_checks(checks)
+    prompt = f"""Alert: "{alert_name}". {checks_text}
 
-Alert: "{alert_name}". Classify root cause.
-
-Baselines: RDS CPU driver-w3 normal=17-20%. ALB 5xx normal=20-40/min. If all within baseline → scenario H.
-
-Check Results (latest values only):
-{_summarize_checks(checks)}
-
-Decision Tree:
-{decision_tree}
-
-OUTPUT ONLY THIS JSON (replace values, nothing else before or after):
-{{"root_cause": "one-line", "confidence": "high|medium|low", "scenario": "letter", "impact": "user impact or No user impact", "suggested_fix": "action or No action needed", "evidence_summary": "key facts with numbers"}}"""
+OUTPUT ONLY: {{"root_cause":"x","confidence":"high|medium|low","scenario":"letter","impact":"x","suggested_fix":"x","evidence_summary":"x"}}"""
 
     try:
         # Use streaming to avoid timeout while model is producing tokens
