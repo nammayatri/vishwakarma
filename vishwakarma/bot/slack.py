@@ -762,6 +762,18 @@ def start_bot(config: "VishwakarmaConfig") -> None:
         channel_id = body["channel"]["id"]
         msg_ts = body["message"]["ts"]
 
+        # Immediately replace buttons with "Saving..." status
+        try:
+            client.chat_update(
+                channel=channel_id, ts=msg_ts,
+                text="Saving...",
+                blocks=[{"type": "context", "elements": [
+                    {"type": "mrkdwn", "text": ":hourglass: _Saving learning + investigation pattern..._"}
+                ]}],
+            )
+        except Exception:
+            pass
+
         try:
             from vishwakarma.storage.queries import get_incident
             incident = get_incident(incident_id)
@@ -820,16 +832,20 @@ def start_bot(config: "VishwakarmaConfig") -> None:
             except Exception as e:
                 log.warning(f"[FEEDBACK] Pattern extraction failed (non-fatal): {e}")
 
-            # Replace buttons with confirmation
-            pattern_note = " + investigation pattern saved for auto-replay" if pattern_saved else ""
+            # Replace with detailed confirmation of what was saved
+            saved_items = [f":brain: Learning saved to `{category}`"]
+            if pattern_saved:
+                saved_items.append(f":gear: Investigation pattern saved (`{pattern_data.get('root_cause_type', '?')}`) — will auto-replay on next same alert")
+            saved_items.append(":chart_with_upwards_trend: Evidence baselines updated")
+            saved_text = "\n".join(saved_items)
             client.chat_update(
                 channel=channel_id,
                 ts=msg_ts,
                 text=f"✅ RCA marked correct by <@{user}>",
-                blocks=[{
-                    "type": "section",
-                    "text": {"type": "mrkdwn", "text": f"✅ *Marked correct by <@{user}>* — root cause added to `{category}` learnings{pattern_note}."},
-                }],
+                blocks=[
+                    {"type": "section", "text": {"type": "mrkdwn", "text": f":white_check_mark: *Marked correct by <@{user}>*"}},
+                    {"type": "context", "elements": [{"type": "mrkdwn", "text": saved_text}]},
+                ],
             )
         except Exception as e:
             log.error(f"[FEEDBACK] vk_rca_correct failed: {e}", exc_info=True)
