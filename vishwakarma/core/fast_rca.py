@@ -320,7 +320,7 @@ def synthesize_fast_rca(llm, checks: dict, alert_name: str) -> dict:
     # Inject alert-specific threshold so LLM knows what actually triggers the alarm
     threshold_hint = _ALERT_THRESHOLDS.get(alert_name, "")
     threshold_line = f" Alert threshold: {threshold_hint}." if threshold_hint else ""
-    prompt = f"""{alert_name}.{threshold_line} {checks_text}. Compare current vs yesterday_*. If similar=normal. Return JSON: {{"root_cause":"x","confidence":"high","scenario":"H","impact":"No user impact","suggested_fix":"No action needed","evidence_summary":"x"}}"""
+    prompt = f"""{alert_name}.{threshold_line} Data: {checks_text}. Compare current vs yesterday_*. If within 20% of yesterday=normal, else=incident. Fill ALL values in this JSON: {{"root_cause":"FILL: what is wrong or Normal load","confidence":"FILL: high or medium or low","scenario":"FILL: H if normal else A-G","impact":"FILL: user impact or No user impact","suggested_fix":"FILL: action or No action needed","evidence_summary":"FILL: key numbers from data"}}"""
 
     try:
         # Use streaming to avoid timeout while model is producing tokens
