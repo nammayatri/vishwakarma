@@ -405,6 +405,33 @@ def start_bot(config: "VishwakarmaConfig") -> None:
 
             say(text=f":mag: Investigating: *{question[:100]}*...", thread_ts=thread_ts)
         else:
+            # Check if this is a thread reply to an investigation — provide contextual response
+            is_thread_reply = thread_ts and event.get("ts") != thread_ts
+            if is_thread_reply and client:
+                def run_contextual_reply():
+                    try:
+                        # Fetch thread messages for context
+                        thread_msgs = client.conversations_replies(
+                            channel=channel, ts=thread_ts, limit=30
+                        )
+                        messages = thread_msgs.get("messages", [])
+                        # Check if this thread has investigation content (fast RCA or full RCA)
+                        thread_text = "\n".join(m.get("text", "")[:500] for m in messages)
+                        has_investigation = any(
+                            kw in thread_text.lower()
+                            for kw in ["fast rca", "root cause", "investigation", "confidence", "evidence", "deep investigation"]
+                        )
+                        if has_investigation:
+                            reply = _contextual_thread_reply(config, question, thread_text)
+                        else:
+                            reply = _simple_chat(config, question)
+                        say(text=reply, thread_ts=thread_ts)
+                    except Exception as e:
+                        log.error(f"Thread reply failed: {e}", exc_info=True)
+                        say(text=f"❌ {str(e)[:200]}", thread_ts=thread_ts)
+                threading.Thread(target=run_contextual_reply, daemon=True).start()
+                return
+
             # Simple chat — just LLM, no tools, fast reply
             def run_chat():
                 try:
@@ -842,6 +869,44 @@ def start_bot(config: "VishwakarmaConfig") -> None:
     t = threading.Thread(target=_start, daemon=True, name="slack-bot")
     t.start()
     log.info("Slack bot started in background thread")
+
+
+def _contextual_thread_reply(config, question: str, thread_context: str) -> str:
+    """Reply to a question in an investigation thread using the thread's context."""
+    import re
+    import litellm
+    model = config.llm.fast_model or config.llm.model
+    # Truncate thread context to avoid exceeding context limits
+    if len(thread_context) > 12000:
+        thread_context = thread_context[:6000] + "\n...(truncated)...\n" + thread_context[-6000:]
+    response = litellm.completion(
+        model=model,
+        api_key=config.llm.api_key,
+        api_base=config.llm.api_base,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are Sage, an SRE at ExampleApp. "
+                    "You are replying in a Slack thread that contains an alert investigation. "
+                    "The thread context (investigation results) is provided below. "
+                    "Answer the user's question based on the investigation context. "
+                    "Be specific — reference findings, metrics, and evidence from the thread. "
+                    "If the user asks to check something not covered in the investigation, "
+                    "suggest the specific command or tool they should use, or tell them to run "
+                    "`@sage debug <specific question>` for a deeper follow-up investigation.\n\n"
+                    f"## Investigation Thread Context\n{thread_context}"
+                ),
+            },
+            {"role": "user", "content": question},
+        ],
+        max_tokens=2048,
+        temperature=0.3,
+        timeout=30,
+    )
+    content = response.choices[0].message.content or "I'm not sure — try `@sage debug <your question>` for a full investigation."
+    content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+    return content or "I'm not sure — try `@sage debug <your question>` for a full investigation."
 
 
 def _simple_chat(config, question: str) -> str:

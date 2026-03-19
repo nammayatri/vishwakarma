@@ -99,6 +99,28 @@ def create_app(config=None) -> FastAPI:
         _state["learnings"] = LearningsManager()
         _state["toolset_manager"] = config.make_toolset_manager()
         _state["toolset_manager"].check_all()
+
+        # Pull latest backend source code for domain debugging
+        import subprocess
+        repo_path = "/data/example-app-src"
+        try:
+            import os
+            if os.path.exists(os.path.join(repo_path, ".git")):
+                result = subprocess.run(
+                    ["git", "-C", repo_path, "pull", "--ff-only"],
+                    capture_output=True, text=True, timeout=60,
+                )
+                log.info(f"Code repo updated: {result.stdout.strip()}")
+            else:
+                result = subprocess.run(
+                    ["git", "clone", "--depth", "1",
+                     "https://github.com/your-org/backend.git", repo_path],
+                    capture_output=True, text=True, timeout=300,
+                )
+                log.info(f"Code repo cloned: {result.stdout.strip()}")
+        except Exception as e:
+            log.warning(f"Code repo sync failed (non-fatal): {e}")
+
         log.info("Vishwakarma server ready")
 
     # ── /healthz ──────────────────────────────────────────────────────────────
@@ -357,6 +379,26 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
         from vishwakarma.config import load_matching_runbooks
         from vishwakarma.core.fast_rca import match_fast_rca, get_companion_checks, synthesize_fast_rca, format_slack_message
 
+        # ── Post immediate acknowledgment to Slack ──
+        ack_ts = None
+        slack_channel_id = None
+        slack_client = None
+        if config.is_slack_configured():
+            try:
+                from vishwakarma.plugins.relays.slack.plugin import SlackDestination
+                dest = SlackDestination({"token": config.slack_bot_token})
+                slack_client = dest._get_client()
+                slack_channel_id = dest._resolve_channel_id(
+                    os.environ.get("SLACK_CHANNEL", "#sre-alerts")
+                )
+                resp = slack_client.chat_postMessage(
+                    channel=slack_channel_id,
+                    text=f":mag: *Investigation started:* {issue.title}\n_Fast RCA running..._",
+                )
+                ack_ts = resp["ts"]
+            except Exception as e:
+                log.warning(f"Slack ack failed (non-fatal): {e}")
+
         # ── Launch fast RCA + pre-enrichment in parallel ──
         fast_match = match_fast_rca(alert_name)
         fast_rca_result = None
@@ -409,17 +451,28 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
                 fast_rca_result = await loop.run_in_executor(
                     None, lambda: synthesize_fast_rca(llm, merged_checks, alert_name)
                 )
-                # Post to Slack immediately
+                # Post to Slack immediately — as thread reply under ack message
                 if config.is_slack_configured() and fast_rca_result:
-                    from vishwakarma.plugins.relays.slack.plugin import SlackDestination
                     slack_text = format_slack_message(fast_rca_result, issue.title)
-                    dest = SlackDestination({"token": config.slack_bot_token})
-                    channel = os.environ.get("SLACK_CHANNEL", "#sre-alerts")
-                    resp = dest._get_client().chat_postMessage(
-                        channel=dest._resolve_channel_id(channel),
-                        text=slack_text,
-                    )
-                    fast_rca_ts = resp["ts"]
+                    try:
+                        if slack_client and slack_channel_id:
+                            resp = slack_client.chat_postMessage(
+                                channel=slack_channel_id,
+                                text=slack_text,
+                                thread_ts=ack_ts,
+                            )
+                            fast_rca_ts = resp["ts"]
+                        else:
+                            from vishwakarma.plugins.relays.slack.plugin import SlackDestination
+                            dest = SlackDestination({"token": config.slack_bot_token})
+                            channel = os.environ.get("SLACK_CHANNEL", "#sre-alerts")
+                            resp = dest._get_client().chat_postMessage(
+                                channel=dest._resolve_channel_id(channel),
+                                text=slack_text,
+                            )
+                            fast_rca_ts = resp["ts"]
+                    except Exception as e:
+                        log.warning(f"Fast RCA Slack post failed: {e}")
                     log.info(f"Fast RCA posted for {alert_name} in {checks.get('elapsed_seconds', '?')}s")
             except Exception as e:
                 log.warning(f"Fast RCA failed for {alert_name}: {e}")
@@ -460,12 +513,74 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
         )
         extra_system_prompt = "\n\n".join(extra_parts) or None
 
+        # ── Progress callback for live Slack updates ──
+        _progress_ts = None  # the single updatable progress message
+        _last_progress_time = 0.0
+        _tool_count = 0
+
+        def _on_progress(event: dict) -> None:
+            nonlocal _progress_ts, _last_progress_time, _tool_count
+            if not slack_client or not slack_channel_id or not ack_ts:
+                return
+
+            etype = event.get("type")
+            step = event.get("step", "?")
+            max_steps = event.get("max_steps", engine.max_steps)
+
+            # Track cumulative tool count
+            if etype == "tool_calls":
+                _tool_count += event.get("count", 0)
+
+            # Throttle: update at most once per 10s, or on significant milestones
+            now = time.time()
+            is_milestone = etype in ("checkpoint", "compaction", "complete", "hypothesis")
+            if not is_milestone and (now - _last_progress_time) < 10:
+                return
+
+            # Build progress text
+            if etype == "step_start":
+                tools_info = f" | Tools used: {_tool_count}" if _tool_count else ""
+                text = f":microscope: *Deep Investigation* — Step {step}/{max_steps}{tools_info}"
+            elif etype == "tool_calls":
+                tool_names = ", ".join(event.get("tools", [])[:4])
+                text = f":microscope: *Deep Investigation* — Step {step}/{max_steps}\nChecking: {tool_names}\nTools used: {_tool_count}"
+            elif etype == "hypothesis":
+                snippet = event.get("content", "")[:150].replace("\n", " ")
+                text = f":microscope: *Deep Investigation* — Step {step}/{max_steps}\n:bulb: _{snippet}_\nTools used: {_tool_count}"
+            elif etype == "checkpoint":
+                text = f":microscope: *Deep Investigation* — Step {step}/{max_steps}\n:clipboard: Evaluating evidence — RCA or continue?\nTools used: {_tool_count}"
+            elif etype == "compaction":
+                text = f":microscope: *Deep Investigation* — Step {step}/{max_steps}\n:compression: Context compacted (long investigation)\nTools used: {_tool_count}"
+            elif etype == "complete":
+                text = f":white_check_mark: *Deep Investigation complete* — {step} steps, {_tool_count} tool calls\n_Generating PDF..._"
+            else:
+                return
+
+            try:
+                if _progress_ts:
+                    slack_client.chat_update(
+                        channel=slack_channel_id,
+                        ts=_progress_ts,
+                        text=text,
+                    )
+                else:
+                    resp = slack_client.chat_postMessage(
+                        channel=slack_channel_id,
+                        text=text,
+                        thread_ts=ack_ts,
+                    )
+                    _progress_ts = resp["ts"]
+                _last_progress_time = now
+            except Exception as e:
+                log.debug(f"Progress update failed (non-fatal): {e}")
+
         result = await loop.run_in_executor(
             None,
             lambda: engine.investigate(
                 question=question,
                 runbooks=matched_runbooks or None,
                 extra_system_prompt=extra_system_prompt,
+                on_progress=_on_progress,
             ),
         )
     except Exception as e:
@@ -506,7 +621,7 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
                 severity=issue.severity,
                 pdf_path=pdf_path,
                 incident_id=incident_id,
-                thread_ts=fast_rca_ts,
+                thread_ts=ack_ts or fast_rca_ts,
             )
             slack_ts = resp.get("ts")
         except Exception as e:
