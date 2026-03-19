@@ -90,10 +90,30 @@ class CodeSearchToolset(Toolset):
         super().__init__(config)
         self._code_path = (config or {}).get("code_path", DEFAULT_CODE_PATH)
 
+    _last_pull: float = 0  # class-level: track last git pull time
+
     def check_prerequisites(self) -> tuple[bool, str]:
         if os.path.isdir(self._code_path):
             return True, ""
         return False, f"Code path not found: {self._code_path}"
+
+    def _ensure_latest(self) -> None:
+        """Git pull if last pull was >30 min ago. Non-blocking — runs in background."""
+        import time, threading
+        now = time.time()
+        if now - CodeSearchToolset._last_pull < 1800:  # 30 min cooldown
+            return
+        CodeSearchToolset._last_pull = now
+
+        def _pull():
+            try:
+                subprocess.run(
+                    ["git", "-C", self._code_path, "pull", "--ff-only"],
+                    capture_output=True, timeout=30,
+                )
+            except Exception:
+                pass
+        threading.Thread(target=_pull, daemon=True).start()
 
     def get_tools(self) -> list[ToolDef]:
         return [
@@ -189,6 +209,7 @@ class CodeSearchToolset(Toolset):
         ]
 
     def execute(self, tool_name: str, params: dict) -> ToolOutput:
+        self._ensure_latest()  # non-blocking git pull in background
         if tool_name == "code_search":
             return self._code_search(params)
         if tool_name == "code_read":
