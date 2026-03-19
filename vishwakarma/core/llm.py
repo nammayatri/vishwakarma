@@ -30,6 +30,9 @@ os.environ.setdefault("LITELLM_LOG", "ERROR")
 class LLMConfig(BaseModel):
     model: str
     fast_model: str | None = None  # cheap/fast model for summarization + compaction
+    # Fallback chains — tried in order, first success wins
+    fast_fallbacks: list[str] = []  # e.g. ["openai/kimi-latest", "openai/glm-flash-experimental"]
+    model_fallbacks: list[str] = []  # e.g. ["openai/glm-latest"]
     api_key: str | None = None
     api_base: str | None = None
     api_version: str | None = None
@@ -240,25 +243,75 @@ class VishwakarmaLLM:
             cached_tokens=cached_tokens,
         )
 
+    def _call_with_fallback(
+        self,
+        models: list[str],
+        messages: list[dict],
+        max_tokens: int = 4096,
+        temperature: float = 0.0,
+        timeout: int = 60,
+        tools: list | None = None,
+    ):
+        """Try models in order, return first successful response.
+
+        Raises the last exception if all models fail.
+        """
+        last_error = None
+        for i, model in enumerate(models):
+            try:
+                kwargs: dict[str, Any] = {
+                    "model": model,
+                    "messages": messages,
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                    "timeout": timeout,
+                }
+                if self.cfg.api_key:
+                    kwargs["api_key"] = self.cfg.api_key
+                if self.cfg.api_base:
+                    kwargs["api_base"] = self.cfg.api_base
+                if tools:
+                    kwargs["tools"] = tools
+                response = completion(**kwargs)
+                if i > 0:
+                    log.info(f"Fallback to {model} succeeded (primary failed)")
+                return response
+            except Exception as e:
+                last_error = e
+                log.warning(f"Model {model} failed ({type(e).__name__}), "
+                           f"{'trying next' if i < len(models) - 1 else 'no more fallbacks'}")
+        raise last_error  # type: ignore
+
+    def _get_fast_chain(self) -> list[str]:
+        """Get ordered list of fast models to try."""
+        primary = self.cfg.fast_model or self.cfg.model
+        fallbacks = self.cfg.fast_fallbacks or []
+        chain = [primary] + [f for f in fallbacks if f != primary]
+        # Always include main model as last resort
+        if self.cfg.model not in chain:
+            chain.append(self.cfg.model)
+        return chain
+
+    def _get_main_chain(self) -> list[str]:
+        """Get ordered list of main models to try."""
+        chain = [self.cfg.model] + (self.cfg.model_fallbacks or [])
+        return chain
+
     def summarize(self, prompt: str) -> str:
         """
         Fast, cheap LLM call to compress a long tool output.
-        Uses fast_model if configured (open-fast), otherwise falls back to main model.
+        Uses fast model chain with fallbacks.
         """
-        model = self.cfg.fast_model or self.cfg.model
         try:
-            response = completion(
-                model=model,
+            response = self._call_with_fallback(
+                models=self._get_fast_chain(),
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.0,
-                max_tokens=4096,   # 1024 was too small for compaction summaries
-                timeout=60,
-                **({"api_key": self.cfg.api_key} if self.cfg.api_key else {}),
-                **({"api_base": self.cfg.api_base} if self.cfg.api_base else {}),
+                max_tokens=4096,
+                timeout=30,  # fast calls should be fast — 30s timeout per model
             )
             return response.choices[0].message.content or prompt[:2000]
         except Exception as e:
-            log.warning(f"Summarization failed: {e} — truncating instead")
+            log.warning(f"All summarization models failed: {e} — truncating instead")
             return prompt[:4000] + "\n... [truncated]"
 
     def build_meta(self, steps: int, compactions: int, start_time: float) -> InvestigationMeta:
