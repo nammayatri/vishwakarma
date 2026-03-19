@@ -426,6 +426,13 @@ def start_bot(config: "VishwakarmaConfig") -> None:
             else:
                 full_question = question
 
+            # If no thread context and question references past issues,
+            # search incident DB and attach prior investigation as context
+            if not thread_context and not (thread_text and is_thread_reply):
+                prior_ctx = _find_prior_investigation(question)
+                if prior_ctx:
+                    full_question = f"{question}\n\n{prior_ctx}"
+
             say(text=f":mag: Investigating: *{question[:100]}*...", thread_ts=thread_ts)
         else:
             # Not investigation — contextual reply if in thread, simple chat otherwise
@@ -870,6 +877,73 @@ def start_bot(config: "VishwakarmaConfig") -> None:
     t = threading.Thread(target=_start, daemon=True, name="slack-bot")
     t.start()
     log.info("Slack bot started in background thread")
+
+
+def _find_prior_investigation(question: str) -> str:
+    """Search incident DB for prior investigations relevant to the question.
+
+    Extracts keywords from the question and searches recent incidents.
+    Returns formatted context string, or empty string if nothing found.
+    """
+    try:
+        from vishwakarma.storage.queries import search_incidents
+    except Exception:
+        return ""
+
+    q = question.lower()
+
+    # Extract search terms — alert names, service names, keywords
+    search_terms = []
+    # Common alert/service patterns to extract
+    for term in [
+        "rds", "redis", "alb", "5xx", "drainer", "allocator", "producer",
+        "cpu", "memory", "connection", "replication", "login", "ratio",
+        "crash", "oom", "latency", "pod", "timeout",
+    ]:
+        if term in q:
+            search_terms.append(term)
+
+    # Also try significant multi-word phrases
+    for phrase in [
+        "high cpu", "not running", "looks dead", "success rate",
+        "ride to search", "config parse",
+    ]:
+        if phrase in q:
+            search_terms.append(phrase)
+
+    if not search_terms:
+        # Fallback: use the whole question as search
+        search_terms = [question[:60]]
+
+    # Search for each term, deduplicate by incident_id
+    seen_ids: set[str] = set()
+    matches: list[dict] = []
+    for term in search_terms[:3]:  # limit to 3 searches
+        try:
+            results = search_incidents(term, limit=3)
+            for r in results:
+                iid = r.get("incident_id", r.get("id", ""))
+                if iid not in seen_ids:
+                    seen_ids.add(iid)
+                    matches.append(r)
+        except Exception:
+            continue
+
+    if not matches:
+        return ""
+
+    # Format the top 2 most recent matches as context
+    parts = ["## Prior Investigations (from incident DB)"]
+    for m in matches[:2]:
+        title = m.get("title", "?")
+        created = m.get("created_at", "?")
+        analysis = m.get("analysis", "")
+        # Truncate analysis to key findings
+        if len(analysis) > 2000:
+            analysis = analysis[:2000] + "...(truncated)"
+        parts.append(f"### {title} ({created})\n{analysis}")
+
+    return "\n\n".join(parts)
 
 
 def _is_investigation_intent(question: str) -> bool:
