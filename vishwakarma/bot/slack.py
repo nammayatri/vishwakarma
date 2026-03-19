@@ -429,29 +429,14 @@ def start_bot(config: "VishwakarmaConfig") -> None:
             say(text=f":mag: Investigating: *{question[:100]}*...", thread_ts=thread_ts)
         else:
             # Not investigation — contextual reply if in thread, simple chat otherwise
-            if is_thread_reply and thread_text:
-                has_investigation = any(
-                    kw in thread_text.lower()
-                    for kw in ["fast rca", "root cause", "investigation", "confidence",
-                               "evidence", "deep investigation", "investigation started"]
-                )
-                def run_contextual_reply():
-                    try:
-                        if has_investigation:
-                            reply = _contextual_thread_reply(config, question, thread_text)
-                        else:
-                            reply = _simple_chat(config, question)
-                        say(text=reply, thread_ts=thread_ts)
-                    except Exception as e:
-                        log.error(f"Thread reply failed: {e}", exc_info=True)
-                        say(text=f"❌ {str(e)[:200]}", thread_ts=thread_ts)
-                threading.Thread(target=run_contextual_reply, daemon=True).start()
-                return
-
-            # Simple chat — just LLM, no tools, fast reply
+            # In a thread → always use thread context for the reply
+            # Not in a thread → simple chat
             def run_chat():
                 try:
-                    reply = _simple_chat(config, question)
+                    if is_thread_reply and thread_text:
+                        reply = _contextual_thread_reply(config, question, thread_text)
+                    else:
+                        reply = _simple_chat(config, question)
                     say(text=reply, thread_ts=thread_ts)
                 except Exception as e:
                     log.error(f"Chat failed: {e}", exc_info=True)
