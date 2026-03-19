@@ -13,9 +13,12 @@ The engine layer handles require_approval / bash_always_allow / bash_always_deny
 This toolset handles the configured allow/block lists.
 """
 import logging
+import os
 import re
 import shlex
 import subprocess
+import threading
+import time
 from typing import Any
 
 from vishwakarma.core.tools import Toolset, ToolDef, ToolOutput, ToolStatus
@@ -24,6 +27,110 @@ from vishwakarma.core.toolset_manager import register_toolset
 log = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT = 120  # seconds
+
+
+class PersistentShell:
+    """Singleton persistent bash process — no fork/exec per command.
+
+    Keeps one bash process alive. Commands are sent via stdin with a unique
+    delimiter to detect when output is complete. ~100ms faster per command
+    compared to subprocess.run() which forks a new process each time.
+    """
+    _instance = None
+    _lock = threading.Lock()
+
+    @classmethod
+    def get(cls) -> "PersistentShell":
+        if cls._instance is None or not cls._instance.alive:
+            with cls._lock:
+                if cls._instance is None or not cls._instance.alive:
+                    cls._instance = PersistentShell()
+        return cls._instance
+
+    def __init__(self):
+        self._proc = subprocess.Popen(
+            ["bash", "--norc", "--noprofile"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env={**os.environ, "PS1": "", "TERM": "dumb"},
+        )
+        self._lock = threading.Lock()
+        log.debug("Persistent shell started (PID %d)", self._proc.pid)
+
+    @property
+    def alive(self) -> bool:
+        return self._proc and self._proc.poll() is None
+
+    def run(self, command: str, timeout: int = DEFAULT_TIMEOUT) -> tuple[int, str, str]:
+        """Run a command and return (exit_code, stdout, stderr).
+
+        Falls back to subprocess.run() if persistent shell is dead.
+        """
+        if not self.alive:
+            return self._fallback(command, timeout)
+
+        # Use a unique delimiter to detect end of output
+        delimiter = f"__VK_END_{id(command)}_{time.monotonic_ns()}__"
+
+        # Construct command that captures exit code and outputs delimiter
+        wrapped = (
+            f"{{ {command} ; }} 2>/tmp/_vk_stderr\n"
+            f"echo \"{delimiter}$?\"\n"
+        )
+
+        with self._lock:
+            try:
+                self._proc.stdin.write(wrapped)
+                self._proc.stdin.flush()
+
+                # Read until delimiter
+                stdout_lines = []
+                exit_code = 0
+                deadline = time.monotonic() + timeout
+
+                while time.monotonic() < deadline:
+                    line = self._proc.stdout.readline()
+                    if not line:
+                        break
+                    if line.startswith(delimiter):
+                        exit_code = int(line[len(delimiter):].strip() or "0")
+                        break
+                    stdout_lines.append(line)
+                else:
+                    # Timeout — kill and restart
+                    self._proc.kill()
+                    self._proc = None
+                    return 124, "".join(stdout_lines), f"Command timed out after {timeout}s"
+
+                stdout = "".join(stdout_lines)
+
+                # Read stderr from temp file
+                try:
+                    with open("/tmp/_vk_stderr", "r") as f:
+                        stderr = f.read()
+                except Exception:
+                    stderr = ""
+
+                return exit_code, stdout, stderr
+
+            except Exception as e:
+                log.warning(f"Persistent shell error: {e}, falling back")
+                return self._fallback(command, timeout)
+
+    @staticmethod
+    def _fallback(command: str, timeout: int) -> tuple[int, str, str]:
+        """Fallback to subprocess.run() when persistent shell is unavailable."""
+        try:
+            result = subprocess.run(
+                command, shell=True, capture_output=True, text=True, timeout=timeout,
+            )
+            return result.returncode, result.stdout, result.stderr
+        except subprocess.TimeoutExpired:
+            return 124, "", f"Command timed out after {timeout}s"
+        except Exception as e:
+            return 1, "", str(e)
 
 
 @register_toolset
@@ -93,40 +200,28 @@ class BashToolset(Toolset):
 
         log.debug(f"bash: {command}")
         try:
-            result = subprocess.run(
-                command,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout,
-            )
-            output = result.stdout
-            if result.returncode != 0:
-                stderr = result.stderr.strip()
-                error_msg = f"Exit code {result.returncode}"
-                if stderr:
-                    error_msg += f"\n{stderr}"
-                if result.stdout:
-                    error_msg += f"\nstdout:\n{result.stdout}"
+            shell = PersistentShell.get()
+            exit_code, stdout, stderr = shell.run(command, timeout=self.timeout)
+
+            if exit_code != 0:
+                error_msg = f"Exit code {exit_code}"
+                if stderr.strip():
+                    error_msg += f"\n{stderr.strip()}"
+                if stdout.strip():
+                    error_msg += f"\nstdout:\n{stdout}"
                 return ToolOutput(
                     status=ToolStatus.ERROR,
                     error=error_msg,
                     invocation=f"bash({command})",
                 )
-            if not output.strip():
+            if not stdout.strip():
                 return ToolOutput(
                     status=ToolStatus.NO_DATA,
                     invocation=f"bash({command})",
                 )
             return ToolOutput(
                 status=ToolStatus.SUCCESS,
-                output=output,
-                invocation=f"bash({command})",
-            )
-        except subprocess.TimeoutExpired:
-            return ToolOutput(
-                status=ToolStatus.ERROR,
-                error=f"Command timed out after {self.timeout}s",
+                output=stdout,
                 invocation=f"bash({command})",
             )
         except Exception as e:
