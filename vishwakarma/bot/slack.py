@@ -802,7 +802,8 @@ def start_bot(config: "VishwakarmaConfig") -> None:
                         root_cause_type=pattern_data["root_cause_type"],
                         root_cause_detail=pattern_data["root_cause_detail"],
                         investigation_steps=pattern_data["investigation_steps"],
-                        verification_criteria=pattern_data["verification_criteria"],
+                        verification_keywords=pattern_data.get("verification_keywords", []),
+                        verification_anti_keywords=pattern_data.get("verification_anti_keywords", []),
                         fix=pattern_data["fix"],
                         incident_id=incident_id,
                     )

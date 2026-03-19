@@ -532,7 +532,7 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
                         pass
 
                 validation = await loop.run_in_executor(
-                    None, lambda: replay_pattern(best, engine.executor, llm, question)
+                    None, lambda: replay_pattern(best, engine.executor, llm, question, fast_rca_result=fast_rca_result)
                 )
                 if validation and validation.get("matched") and validation.get("confidence") in ("high", "medium"):
                     pattern_matched = True
