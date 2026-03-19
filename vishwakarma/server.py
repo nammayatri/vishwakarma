@@ -492,76 +492,117 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
         )
         extra_system_prompt = "\n\n".join(extra_parts) or None
 
-        # ── Progress callback for live Slack updates ──
-        _progress_ts = None  # the single updatable progress message
-        _last_progress_time = 0.0
-        _tool_count = 0
+        # ── Streaming investigation with real-time Slack updates ──
+        # Same style as the Slack "debug" path: small context blocks,
+        # real-time tool call start/result, yellow status message.
 
-        def _on_progress(event: dict) -> None:
-            nonlocal _progress_ts, _last_progress_time, _tool_count
-            if not slack_client or not slack_channel_id or not ack_ts:
-                return
+        def _run_streaming_investigation():
+            """Run stream_investigate() with live Slack tool-by-tool updates."""
+            status_ts = None
+            tool_lines: list[str] = []
+            analysis = ""
 
-            etype = event.get("type")
-            step = event.get("step", "?")
-            max_steps = event.get("max_steps", engine.max_steps)
+            def _short_params(params: dict) -> str:
+                """Shorten params for display."""
+                if not params:
+                    return ""
+                val = str(next(iter(params.values()), ""))
+                return val[:50].replace("\n", " ")
 
-            # Track cumulative tool count
-            if etype == "tool_calls":
-                _tool_count += event.get("count", 0)
-
-            # Throttle: update at most once per 10s, or on significant milestones
-            now = time.time()
-            is_milestone = etype in ("checkpoint", "compaction", "complete", "hypothesis")
-            if not is_milestone and (now - _last_progress_time) < 10:
-                return
-
-            # Build progress text
-            if etype == "step_start":
-                tools_info = f" | Tools used: {_tool_count}" if _tool_count else ""
-                text = f":microscope: *Deep Investigation* — Step {step}/{max_steps}{tools_info}"
-            elif etype == "tool_calls":
-                tool_names = ", ".join(event.get("tools", [])[:4])
-                text = f":microscope: *Deep Investigation* — Step {step}/{max_steps}\nChecking: {tool_names}\nTools used: {_tool_count}"
-            elif etype == "hypothesis":
-                snippet = event.get("content", "")[:150].replace("\n", " ")
-                text = f":microscope: *Deep Investigation* — Step {step}/{max_steps}\n:bulb: _{snippet}_\nTools used: {_tool_count}"
-            elif etype == "checkpoint":
-                text = f":microscope: *Deep Investigation* — Step {step}/{max_steps}\n:clipboard: Evaluating evidence — RCA or continue?\nTools used: {_tool_count}"
-            elif etype == "compaction":
-                text = f":microscope: *Deep Investigation* — Step {step}/{max_steps}\n:compression: Context compacted (long investigation)\nTools used: {_tool_count}"
-            elif etype == "complete":
-                text = f":white_check_mark: *Deep Investigation complete* — {step} steps, {_tool_count} tool calls\n_Generating PDF..._"
-            else:
-                return
-
-            try:
-                if _progress_ts:
-                    slack_client.chat_update(
-                        channel=slack_channel_id,
-                        ts=_progress_ts,
-                        text=text,
-                    )
-                else:
+            # Post initial status message in thread
+            if slack_client and slack_channel_id and ack_ts:
+                try:
                     resp = slack_client.chat_postMessage(
                         channel=slack_channel_id,
-                        text=text,
                         thread_ts=ack_ts,
+                        text=":hourglass: Starting deep investigation...",
+                        blocks=[{"type": "context", "elements": [
+                            {"type": "mrkdwn", "text": ":hourglass: _Starting deep investigation..._"}
+                        ]}],
                     )
-                    _progress_ts = resp["ts"]
-                _last_progress_time = now
-            except Exception as e:
-                log.debug(f"Progress update failed (non-fatal): {e}")
+                    status_ts = resp["ts"]
+                except Exception as e:
+                    log.debug(f"Status message failed (non-fatal): {e}")
 
-        result = await loop.run_in_executor(
-            None,
-            lambda: engine.investigate(
+            for event in engine.stream_investigate(
                 question=question,
                 runbooks=matched_runbooks or None,
                 extra_system_prompt=extra_system_prompt,
-                on_progress=_on_progress,
-            ),
-        )
+            ):
+                etype = event.get("type", "")
+
+                if etype == "tool_call_start":
+                    tool = event.get("tool", "")
+                    params = event.get("params", {})
+                    param_str = _short_params(params)
+                    tool_lines.append(f":gear: `{tool}({param_str})`")
+                    visible = tool_lines[-10:]
+                    status_text = "\n".join(visible)
+                    if slack_client and status_ts:
+                        try:
+                            slack_client.chat_update(
+                                channel=slack_channel_id, ts=status_ts, text=status_text,
+                                blocks=[{"type": "context", "elements": [
+                                    {"type": "mrkdwn", "text": status_text}
+                                ]}],
+                            )
+                        except Exception:
+                            pass
+
+                elif etype == "tool_call_result":
+                    status = event.get("status", "")
+                    marker = ":white_check_mark:" if status == "success" else ":x:"
+                    tool_name = event.get("tool", "")
+                    for i in range(len(tool_lines) - 1, -1, -1):
+                        if tool_name and f"`{tool_name}(" in tool_lines[i] and ":white_check_mark:" not in tool_lines[i] and ":x:" not in tool_lines[i]:
+                            tool_lines[i] = tool_lines[i] + f" {marker}"
+                            break
+                    visible = tool_lines[-10:]
+                    status_text = "\n".join(visible)
+                    if slack_client and status_ts:
+                        try:
+                            slack_client.chat_update(
+                                channel=slack_channel_id, ts=status_ts, text=status_text,
+                                blocks=[{"type": "context", "elements": [
+                                    {"type": "mrkdwn", "text": status_text}
+                                ]}],
+                            )
+                        except Exception:
+                            pass
+
+                elif etype == "compaction":
+                    tool_lines.append(":compression: _context compacted_")
+
+                elif etype == "max_steps_reached":
+                    analysis = event.get("content", "") or "Investigation reached max steps."
+
+                elif etype == "done":
+                    analysis = event.get("content", "") or analysis
+
+            # Finalize status message
+            tool_count = len([t for t in tool_lines if ":gear:" in t])
+            if slack_client and status_ts:
+                try:
+                    final_text = "\n".join(tool_lines[-10:]) + f"\n:white_check_mark: _Done — {tool_count} tools_"
+                    slack_client.chat_update(
+                        channel=slack_channel_id, ts=status_ts, text=final_text,
+                        blocks=[{"type": "context", "elements": [
+                            {"type": "mrkdwn", "text": final_text}
+                        ]}],
+                    )
+                except Exception:
+                    pass
+
+            # Build a result-like object for the rest of the flow
+            from vishwakarma.core.models import LLMResult
+            return LLMResult(
+                answer=analysis,
+                tool_outputs=[],
+                messages=[],
+                meta=None,
+            )
+
+        result = await loop.run_in_executor(None, _run_streaming_investigation)
     except Exception as e:
         log.error(f"Alert investigation failed for {issue.title}: {e}", exc_info=True)
         if fingerprint:
