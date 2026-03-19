@@ -252,6 +252,19 @@ for _name in ["RDSReplicationLag", "ReplicationSlotLag", "DriverDBReplicationLag
     _DECISION_TREES[_name] = _RDS_REPLICATION_LAG_DECISION_TREE
 
 
+def _summarize_checks(checks: dict) -> str:
+    """Condense check results to last value per check — keeps prompt short."""
+    lines = []
+    for k, v in (checks or {}).items():
+        if not isinstance(v, str) or v.startswith("(error"):
+            continue
+        # Take last line only (most recent datapoint)
+        last = v.strip().split("\n")[-1] if v.strip() else ""
+        if last:
+            lines.append(f"{k}: {last[:120]}")
+    return "\n".join(lines[:15])  # max 15 checks
+
+
 def synthesize_fast_rca(llm, checks: dict, alert_name: str) -> dict:
     """
     Single fast_model LLM call to classify the root cause from check results.
@@ -279,8 +292,8 @@ Alert: "{alert_name}". Classify root cause.
 
 Baselines: RDS CPU driver-w3 normal=17-20%. ALB 5xx normal=20-40/min. If all within baseline → scenario H.
 
-Check Results:
-{json.dumps(checks, indent=2)[:3000]}
+Check Results (latest values only):
+{_summarize_checks(checks)}
 
 Decision Tree:
 {decision_tree}
@@ -289,24 +302,29 @@ OUTPUT ONLY THIS JSON (replace values, nothing else before or after):
 {{"root_cause": "one-line", "confidence": "high|medium|low", "scenario": "letter", "impact": "user impact or No user impact", "suggested_fix": "action or No action needed", "evidence_summary": "key facts with numbers"}}"""
 
     try:
-        # Use main model chain for classification — fast models can't return clean JSON
-        raw_response = llm._call_with_fallback(
-            models=llm._get_main_chain(),
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=1024,
-            timeout=60,
-            total_budget=90,
-        )
-        msg = raw_response.choices[0].message
-        raw = (msg.content or "").strip()
-        # Reasoning models put output in reasoning_content when content is empty
-        if not raw:
-            raw = getattr(msg, "reasoning_content", "") or ""
-            raw = raw.strip()
-        # Log what we got for debugging
-        log.info(f"Fast RCA synthesis response: content_len={len(msg.content or '')}, "
-                 f"reasoning_len={len(getattr(msg, 'reasoning_content', '') or '')}, "
-                 f"raw_len={len(raw)}, raw_preview={raw[:100]}")
+        # Use streaming to avoid timeout while model is producing tokens
+        from litellm import completion as _completion
+        model = llm._get_main_chain()[0]
+        kwargs = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 512,  # short — we only need a JSON object
+            "temperature": 0.0,
+            "timeout": 120,  # generous timeout since we're streaming
+            "stream": True,
+            "num_retries": 1,
+        }
+        if llm.cfg.api_key:
+            kwargs["api_key"] = llm.cfg.api_key
+        if llm.cfg.api_base:
+            kwargs["api_base"] = llm.cfg.api_base
+
+        raw = ""
+        for chunk in _completion(**kwargs):
+            delta = chunk.choices[0].delta.content or ""
+            raw += delta
+        raw = raw.strip()
+        log.info(f"Fast RCA synthesis response: len={len(raw)}, preview={raw[:100]}")
         # Strip reasoning preamble and extract JSON
         import re
         # Try multiple extraction strategies
