@@ -302,7 +302,17 @@ Respond ONLY with valid JSON (no markdown fences):
             max_tokens=1024,
             timeout=30,
         )
-        raw = (raw_response.choices[0].message.content or "").strip()
+        msg = raw_response.choices[0].message
+        raw = (msg.content or "").strip()
+        # Reasoning models put output in reasoning_content when content is empty
+        if not raw:
+            raw = getattr(msg, "reasoning_content", "") or ""
+            raw = raw.strip()
+        # Strip reasoning preamble ("The user wants me to..." before the JSON)
+        import re
+        json_match = re.search(r'\{[^{}]*"root_cause"[^}]*\}', raw, re.DOTALL)
+        if json_match:
+            raw = json_match.group()
         # Strip markdown fences if present
         if raw.startswith("```"):
             raw = raw.split("\n", 1)[1] if "\n" in raw else raw[3:]

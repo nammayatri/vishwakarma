@@ -309,7 +309,15 @@ class VishwakarmaLLM:
                 max_tokens=4096,
                 timeout=30,  # fast calls should be fast — 30s timeout per model
             )
-            return response.choices[0].message.content or prompt[:2000]
+            msg = response.choices[0].message
+            content = msg.content or ""
+            # Reasoning models may put content in reasoning_content
+            if not content.strip():
+                content = getattr(msg, "reasoning_content", "") or ""
+            # Strip reasoning preamble if present
+            import re
+            content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+            return content or prompt[:2000]
         except Exception as e:
             log.warning(f"All summarization models failed: {e} — truncating instead")
             return prompt[:4000] + "\n... [truncated]"
