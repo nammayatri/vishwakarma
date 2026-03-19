@@ -273,26 +273,20 @@ def synthesize_fast_rca(llm, checks: dict, alert_name: str) -> dict:
     if not decision_tree:
         decision_tree = _DRAINER_DECISION_TREE
 
-    prompt = f"""You are an SRE analyzing a "{alert_name}" alert. Classify the root cause from these parallel check results.
+    prompt = f"""RESPOND WITH ONLY A JSON OBJECT. NO REASONING. NO EXPLANATION. NO THINKING. JUST THE JSON.
 
-CRITICAL RULES:
-1. DO NOT assume values are anomalous without comparing to baselines. Normal ≠ incident.
-2. If a metric is within its normal baseline range, it is NOT evidence of a problem.
-3. ALB 5xx of 20-40/min is NORMAL baseline noise — only >100/min sustained is a real spike.
-4. RDS CPU: driver-w3 normal=17-20%, customer-w1 normal=10-12%, driver-r1 normal=28-33%. Only >50% is concerning.
-5. PI wait events (IO:DataFileRead, IO:XactSync, CPU) are ALWAYS present — they only matter if one dominates >50% of total db.load.
-6. If ALL metrics are within normal ranges, classify as "Normal load / false alarm" with HIGH confidence.
-7. Error messages in app logs that say "SECONDARY_CLUSTER" or "429" are often pre-existing baseline issues, NOT caused by this alert.
-8. Confidence should be LOW if you're not sure, MEDIUM if evidence is suggestive but not definitive, HIGH only with clear anomalous data.
+Alert: "{alert_name}". Classify root cause.
 
-## Check Results
-{json.dumps(checks, indent=2)}
+Baselines: RDS CPU driver-w3 normal=17-20%. ALB 5xx normal=20-40/min. If all within baseline → scenario H.
 
-## Decision Tree
+Check Results:
+{json.dumps(checks, indent=2)[:3000]}
+
+Decision Tree:
 {decision_tree}
 
-Respond ONLY with valid JSON (no markdown fences):
-{{"root_cause": "one-line description", "confidence": "high|medium|low", "scenario": "letter", "impact": "what is broken for users (or 'No user impact' if metrics are normal)", "suggested_fix": "immediate action (or 'No action needed' if normal)", "evidence_summary": "2-3 key facts from checks WITH actual numbers"}}"""
+OUTPUT ONLY THIS JSON (replace values, nothing else before or after):
+{{"root_cause": "one-line", "confidence": "high|medium|low", "scenario": "letter", "impact": "user impact or No user impact", "suggested_fix": "action or No action needed", "evidence_summary": "key facts with numbers"}}"""
 
     try:
         # Use main model chain for classification — fast models can't return clean JSON
@@ -300,7 +294,8 @@ Respond ONLY with valid JSON (no markdown fences):
             models=llm._get_main_chain(),
             messages=[{"role": "user", "content": prompt}],
             max_tokens=1024,
-            timeout=30,
+            timeout=60,
+            total_budget=90,
         )
         msg = raw_response.choices[0].message
         raw = (msg.content or "").strip()
