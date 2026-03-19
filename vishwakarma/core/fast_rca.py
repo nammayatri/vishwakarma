@@ -286,11 +286,16 @@ def synthesize_fast_rca(llm, checks: dict, alert_name: str) -> dict:
     if not decision_tree:
         decision_tree = _DRAINER_DECISION_TREE
 
-    # Keep prompt SHORT — long prompts trigger reasoning mode in kimi-k2-5-dev
     checks_text = _summarize_checks(checks)
-    prompt = f"""Alert: "{alert_name}". {checks_text}
+    prompt = f"""Classify this "{alert_name}" alert. Is it a real incident or normal?
 
-OUTPUT ONLY: {{"root_cause":"x","confidence":"high|medium|low","scenario":"letter","impact":"x","suggested_fix":"x","evidence_summary":"x"}}"""
+{checks_text}
+
+Baselines: RDS CPU driver-w3=17-20%, customer-w1=10-12%. ALB 5xx=20-40/min normal. Connections=130-140 normal.
+If all metrics within baseline, root_cause="Normal load, false alarm", confidence="high", scenario="H", impact="No user impact".
+
+Return filled JSON:
+{{"root_cause":"<what is wrong or Normal load false alarm>","confidence":"<high or medium or low>","scenario":"<H for normal or A-G for real issue>","impact":"<user impact description or No user impact>","suggested_fix":"<action needed or No action needed>","evidence_summary":"<2-3 facts with actual numbers from checks above>"}}"""
 
     try:
         # Use streaming to avoid timeout while model is producing tokens
