@@ -26,6 +26,10 @@ log = logging.getLogger(__name__)
 litellm.suppress_debug_info = True
 os.environ.setdefault("LITELLM_LOG", "ERROR")
 
+# Cap LiteLLM's internal retry backoff — don't let it wait 60s between retries
+litellm.num_retries = 2              # max 2 retries per call (not infinite)
+litellm.request_timeout = 30         # 30s per attempt
+
 
 class LLMConfig(BaseModel):
     model: str
@@ -249,22 +253,35 @@ class VishwakarmaLLM:
         messages: list[dict],
         max_tokens: int = 4096,
         temperature: float = 0.0,
-        timeout: int = 60,
+        timeout: int = 30,
         tools: list | None = None,
+        total_budget: int = 60,
     ):
         """Try models in order, return first successful response.
 
-        Raises the last exception if all models fail.
+        Each model gets `timeout` seconds. Total time across all models
+        capped at `total_budget` seconds. Raises the last exception if all fail.
         """
+        start = time.time()
         last_error = None
         for i, model in enumerate(models):
+            # Check total time budget
+            elapsed = time.time() - start
+            if elapsed > total_budget:
+                log.warning(f"Fallback chain exhausted time budget ({total_budget}s)")
+                break
+            remaining = min(timeout, int(total_budget - elapsed))
+            if remaining < 5:
+                break  # not enough time for another attempt
+
             try:
                 kwargs: dict[str, Any] = {
                     "model": model,
                     "messages": messages,
                     "temperature": temperature,
                     "max_tokens": max_tokens,
-                    "timeout": timeout,
+                    "timeout": remaining,
+                    "num_retries": 1,  # max 1 retry per model in the chain
                 }
                 if self.cfg.api_key:
                     kwargs["api_key"] = self.cfg.api_key
@@ -278,8 +295,9 @@ class VishwakarmaLLM:
                 return response
             except Exception as e:
                 last_error = e
-                log.warning(f"Model {model} failed ({type(e).__name__}), "
-                           f"{'trying next' if i < len(models) - 1 else 'no more fallbacks'}")
+                log.warning(f"Model {model} failed ({type(e).__name__}: {str(e)[:80]}), "
+                           f"{'trying next' if i < len(models) - 1 else 'no more fallbacks'} "
+                           f"[{time.time() - start:.1f}s elapsed]")
         raise last_error  # type: ignore
 
     def _get_fast_chain(self) -> list[str]:

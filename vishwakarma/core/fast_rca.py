@@ -321,14 +321,23 @@ Respond ONLY with valid JSON (no markdown fences):
             raw = raw.strip()
         return json.loads(raw)
     except (json.JSONDecodeError, Exception) as e:
-        log.warning(f"Fast RCA synthesis failed: {e}")
+        log.warning(f"Fast RCA synthesis failed ({type(e).__name__}): {e}")
+        # Graceful degradation: summarize raw checks without LLM
+        check_summary = []
+        for k, v in (checks or {}).items():
+            if isinstance(v, str) and not v.startswith("(error"):
+                lines = v.strip().split("\n")
+                last = lines[-1] if lines else ""
+                if last:
+                    check_summary.append(f"{k}: {last[:80]}")
+        evidence = "; ".join(check_summary[:5]) if check_summary else str(e)
         return {
-            "root_cause": "Unable to classify — check results available for deep investigation",
+            "root_cause": "LLM classification unavailable — raw check results below (deep investigation will follow)",
             "confidence": "low",
             "scenario": "unknown",
-            "impact": "Unknown — see check results",
-            "suggested_fix": "Wait for deep investigation",
-            "evidence_summary": str(e),
+            "impact": "Unknown — LLM unavailable, raw checks collected",
+            "suggested_fix": "Deep investigation in progress",
+            "evidence_summary": evidence,
         }
 
 
