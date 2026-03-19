@@ -252,6 +252,25 @@ for _name in ["RDSReplicationLag", "ReplicationSlotLag", "DriverDBReplicationLag
     _DECISION_TREES[_name] = _RDS_REPLICATION_LAG_DECISION_TREE
 
 
+# Alert-specific thresholds — injected into synthesis prompt so LLM knows what "high" means
+_ALERT_THRESHOLDS: dict[str, str] = {
+    "RDSHighCPU": "CPU >75% for 3x5min. Normal: driver-w3=17-20%, customer-w1=10-12%",
+    "RDS_CPU_High": "CPU >75% for 3x5min",
+    "RDSHighConnections": "Connections >2500 for 1min. Normal: 130-300",
+    "ALB5xxErrors": "5xx >100/min for 2min. Normal: 20-40/min",
+    "HTTPCode_Target_5XX_Count": "5xx >100/min for 2min. Normal: 20-40/min",
+    "RedisHighCPU": "EngineCPU >80% for 5min. Normal: 10-30%",
+    "RedisHighMemory": "Memory >90%. Normal: 40-60%",
+    "NoDriverDrainerRunning": "Pod count=0 for 5min. Normal: 5 pods running",
+    "NoAppDrainerRunning": "Pod count=0 for 5min. Normal: 5 pods running",
+    "LoginSuccessRate": "Auth-to-verify ratio <10% for 15min with >90 requests. Normal: 95-100%",
+    "RideToSearchRatioDown": "Ratio <15% for 3min with >1500 searches. Normal: 30-60%",
+    "AllocatorLooksDead": "stream_jobs_counter delta=0 for 30s. Normal: >0",
+    "RDSReplicationLag": "Slot lag >1GB. Normal: varies",
+    "ProducerNotProducing": "Producer metric=0 for 10min. Normal: >0",
+}
+
+
 def _summarize_checks(checks: dict) -> str:
     """Condense check results to key=value pairs — ultra short for synthesis prompt."""
     import re
@@ -298,7 +317,10 @@ def synthesize_fast_rca(llm, checks: dict, alert_name: str) -> dict:
         decision_tree = _DRAINER_DECISION_TREE
 
     checks_text = _summarize_checks(checks)
-    prompt = f"""{alert_name}. {checks_text}. Compare current vs yesterday_*. If similar=normal. Return JSON: {{"root_cause":"x","confidence":"high","scenario":"H","impact":"No user impact","suggested_fix":"No action needed","evidence_summary":"x"}}"""
+    # Inject alert-specific threshold so LLM knows what actually triggers the alarm
+    threshold_hint = _ALERT_THRESHOLDS.get(alert_name, "")
+    threshold_line = f" Alert threshold: {threshold_hint}." if threshold_hint else ""
+    prompt = f"""{alert_name}.{threshold_line} {checks_text}. Compare current vs yesterday_*. If similar=normal. Return JSON: {{"root_cause":"x","confidence":"high","scenario":"H","impact":"No user impact","suggested_fix":"No action needed","evidence_summary":"x"}}"""
 
     try:
         # Use streaming to avoid timeout while model is producing tokens
@@ -312,7 +334,8 @@ def synthesize_fast_rca(llm, checks: dict, alert_name: str) -> dict:
             "timeout": 120,
             "stream": True,
             "num_retries": 1,
-            # Disable reasoning/thinking for faster, cleaner JSON output
+            # Force JSON output + disable reasoning
+            "response_format": {"type": "json_object"},
             "extra_body": {"chat_template_kwargs": {"enable_thinking": False, "thinking": False}},
         }
         if llm.cfg.api_key:

@@ -384,7 +384,7 @@ def should_auto_resolve(
     alert_name: str,
     current_metrics: dict[str, float],
     fast_rca_confidence: str = "",
-    min_samples: int = 3,
+    min_samples: int = 2,
 ) -> tuple[bool, str]:
     """Determine if this alert can be auto-resolved based on learned evidence.
 
