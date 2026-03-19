@@ -298,16 +298,7 @@ def synthesize_fast_rca(llm, checks: dict, alert_name: str) -> dict:
         decision_tree = _DRAINER_DECISION_TREE
 
     checks_text = _summarize_checks(checks)
-    prompt = f"""Classify this "{alert_name}" alert. Is it a real incident or normal?
-
-CURRENT DATA:
-{checks_text}
-
-IMPORTANT: Compare "yesterday_*" values with current values. If current is within 20% of yesterday at the same time, it is NORMAL — not an incident.
-If no yesterday data available, use these static baselines: RDS CPU driver-w3=17-20%, customer-w1=10-12%. ALB 5xx=20-40/min. Connections=130-140.
-
-Return filled JSON:
-{{"root_cause":"<what is wrong or Normal load false alarm>","confidence":"<high or medium or low>","scenario":"<H if normal, A-G if real issue>","impact":"<user impact or No user impact>","suggested_fix":"<action or No action needed>","evidence_summary":"<current vs yesterday comparison with numbers>"}}"""
+    prompt = f"""{alert_name}. {checks_text}. Compare current vs yesterday_*. If similar=normal. Return JSON: {{"root_cause":"x","confidence":"high","scenario":"H","impact":"No user impact","suggested_fix":"No action needed","evidence_summary":"x"}}"""
 
     try:
         # Use streaming to avoid timeout while model is producing tokens
