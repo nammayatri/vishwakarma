@@ -370,9 +370,17 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
                 slack_channel_id = dest._resolve_channel_id(
                     os.environ.get("SLACK_CHANNEL", "#sre-alerts")
                 )
+                severity = (issue.severity or "warning").upper()
+                namespace = issue.labels.get("namespace", "atlas")
+                service = issue.labels.get("service", issue.labels.get("instance", ""))
+                service_info = f" in {namespace}" + (f" ({service})" if service else "")
+                ack_text = (
+                    f":rotating_light: *RCA: [{severity}] {alert_name}{service_info}*\n"
+                    f":thread: Investigation running. See thread for fast RCA + full report."
+                )
                 resp = slack_client.chat_postMessage(
                     channel=slack_channel_id,
-                    text=f":mag: *Investigation started:* {issue.title}\n_Fast RCA running..._",
+                    text=ack_text,
                 )
                 ack_ts = resp["ts"]
             except Exception as e:
