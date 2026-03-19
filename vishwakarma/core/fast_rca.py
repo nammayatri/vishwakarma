@@ -289,13 +289,14 @@ def synthesize_fast_rca(llm, checks: dict, alert_name: str) -> dict:
     checks_text = _summarize_checks(checks)
     prompt = f"""Classify this "{alert_name}" alert. Is it a real incident or normal?
 
+CURRENT DATA:
 {checks_text}
 
-Baselines: RDS CPU driver-w3=17-20%, customer-w1=10-12%. ALB 5xx=20-40/min normal. Connections=130-140 normal.
-If all metrics within baseline, root_cause="Normal load, false alarm", confidence="high", scenario="H", impact="No user impact".
+IMPORTANT: Compare "yesterday_*" values with current values. If current is within 20% of yesterday at the same time, it is NORMAL — not an incident.
+If no yesterday data available, use these static baselines: RDS CPU driver-w3=17-20%, customer-w1=10-12%. ALB 5xx=20-40/min. Connections=130-140.
 
 Return filled JSON:
-{{"root_cause":"<what is wrong or Normal load false alarm>","confidence":"<high or medium or low>","scenario":"<H for normal or A-G for real issue>","impact":"<user impact description or No user impact>","suggested_fix":"<action needed or No action needed>","evidence_summary":"<2-3 facts with actual numbers from checks above>"}}"""
+{{"root_cause":"<what is wrong or Normal load false alarm>","confidence":"<high or medium or low>","scenario":"<H if normal, A-G if real issue>","impact":"<user impact or No user impact>","suggested_fix":"<action or No action needed>","evidence_summary":"<current vs yesterday comparison with numbers>"}}"""
 
     try:
         # Use streaming to avoid timeout while model is producing tokens
