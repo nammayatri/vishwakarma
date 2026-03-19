@@ -816,6 +816,22 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
     except Exception as e:
         log.warning(f"PDF generation failed: {e}")
 
+    # Update ack message to show completion
+    if slack_client and slack_channel_id and ack_ts:
+        try:
+            severity_color = "#36a64f"  # green for completed
+            slack_client.chat_update(
+                channel=slack_channel_id, ts=ack_ts,
+                text=f":white_check_mark: RCA complete for {issue.title}",
+                attachments=[{"color": severity_color, "blocks": [
+                    {"type": "header", "text": {"type": "plain_text", "text": f":white_check_mark: {issue.title[:150]}", "emoji": True}},
+                    {"type": "divider"},
+                    {"type": "context", "elements": [{"type": "mrkdwn", "text": ":thread: _Investigation complete. See thread for full RCA report + PDF._"}]},
+                ]}],
+            )
+        except Exception as e:
+            log.debug(f"Ack update failed (non-fatal): {e}")
+
     # Post to Slack — thread reply if fast RCA was posted, otherwise new message
     slack_ts = None
     if config.is_slack_configured():

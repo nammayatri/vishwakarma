@@ -308,6 +308,10 @@ Respond ONLY with valid JSON (no markdown fences):
         if not raw:
             raw = getattr(msg, "reasoning_content", "") or ""
             raw = raw.strip()
+        # Log what we got for debugging
+        log.info(f"Fast RCA synthesis response: content_len={len(msg.content or '')}, "
+                 f"reasoning_len={len(getattr(msg, 'reasoning_content', '') or '')}, "
+                 f"raw_len={len(raw)}, raw_preview={raw[:100]}")
         # Strip reasoning preamble ("The user wants me to..." before the JSON)
         import re
         json_match = re.search(r'\{[^{}]*"root_cause"[^}]*\}', raw, re.DOTALL)
