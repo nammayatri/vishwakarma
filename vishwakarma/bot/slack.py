@@ -411,10 +411,31 @@ def start_bot(config: "VishwakarmaConfig") -> None:
         if is_investigation:
             question = question[len("debug "):].strip()
         else:
-            # Auto-detect: check the message + thread context together
-            # If user says "check redis" in a thread about an RDS alert, that's investigation
-            combined_context = f"{question} {thread_text[:500]}" if thread_text else question
-            is_investigation = _is_investigation_intent(combined_context)
+            # Auto-detect investigation intent
+            is_investigation = _is_investigation_intent(question)
+            # In a thread with investigation context: many messages that look like
+            # investigation keywords ("redis", "root cause") are actually questions
+            # ABOUT the existing investigation, not new investigation requests.
+            # Downgrade to chat if the message is short and asking about thread content.
+            if is_investigation and is_thread_reply and thread_text:
+                has_investigation = any(
+                    kw in thread_text.lower()
+                    for kw in ["fast rca", "root cause", "investigation", "confidence",
+                               "evidence", "deep investigation", "investigation started"]
+                )
+                if has_investigation:
+                    # Thread already has an investigation. Only trigger a NEW investigation
+                    # if the user is clearly requesting one (action verbs + new scope).
+                    action_verbs = ["check", "investigate", "look into", "find out",
+                                    "debug", "diagnose", "troubleshoot", "run", "also check"]
+                    # Urgency signals = new issue being reported, not a question about existing
+                    urgency_signals = ["now", "just started", "just happened", "happening now",
+                                       "currently", "right now", "again", "new"]
+                    has_action = any(v in question.lower() for v in action_verbs)
+                    has_urgency = any(s in question.lower() for s in urgency_signals)
+                    if not has_action and not has_urgency:
+                        # No action verb → user is asking about the existing investigation
+                        is_investigation = False
 
         if is_investigation:
             # Build investigation question with thread context
