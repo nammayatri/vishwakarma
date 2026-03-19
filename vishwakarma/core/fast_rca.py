@@ -21,6 +21,7 @@ log = logging.getLogger(__name__)
 # Maps tool_name → list of (toolset_name, tool_name, params) to run alongside
 _COMPANION_CHECKS: dict[str, list[tuple[str, str, dict]]] = {
     "investigate_rds_cpu": [("cloud_alerts", "investigate_alb_5xx", {})],
+    "investigate_ratio_drop": [("cloud_alerts", "investigate_alb_5xx", {})],
 }
 
 _REGISTRY: dict[str, tuple[str, str, dict]] = {
@@ -44,6 +45,10 @@ _REGISTRY: dict[str, tuple[str, str, dict]] = {
     "RDSCPUUtilization": ("cloud_alerts", "investigate_rds_cpu", {"db_cluster": "driver"}),
     "DriverDBHighCPU": ("cloud_alerts", "investigate_rds_cpu", {"db_cluster": "driver"}),
     "CustomerDBHighCPU": ("cloud_alerts", "investigate_rds_cpu", {"db_cluster": "customer"}),
+    # Config parse failure
+    "SystemConfigParseFailure": ("cloud_alerts", "investigate_config_failure", {}),
+    # Allocator
+    "AllocatorLooksDead": ("cloud_alerts", "investigate_allocator", {}),
     # RDS high connections
     "RDSHighConnections": ("cloud_alerts", "investigate_rds_connections", {"db_cluster": "driver"}),
     "DriverDBHighConnections": ("cloud_alerts", "investigate_rds_connections", {"db_cluster": "driver"}),
@@ -56,6 +61,10 @@ _REGISTRY: dict[str, tuple[str, str, dict]] = {
     "DriverDBReplicationLag": ("cloud_alerts", "investigate_rds_replication_lag", {"db_cluster": "driver"}),
     "CustomerDBReplicationLag": ("cloud_alerts", "investigate_rds_replication_lag", {"db_cluster": "customer"}),
     "AuroraReplicaLag": ("cloud_alerts", "investigate_rds_replication_lag", {"db_cluster": "driver"}),
+    # Business metrics — ride to search ratio
+    "RideToSearchRatioDown": ("cloud_alerts", "investigate_ratio_drop", {}),
+    # Login success rate
+    "LoginSuccessRate": ("cloud_alerts", "investigate_login_success", {}),
     # Redis
     "RedisHighCPU": ("cloud_alerts", "investigate_redis", {"cluster": "all"}),
     "RedisHighMemory": ("cloud_alerts", "investigate_redis", {"cluster": "all"}),
@@ -96,6 +105,9 @@ def match_fast_rca(alert_name: str) -> tuple[str, str, dict] | None:
     # Substring match for Producer
     if "producer" in alert_lower and ("not" in alert_lower or "producing" in alert_lower or "silent" in alert_lower):
         return ("cloud_alerts", "investigate_producer", {})
+    # Substring match for Allocator
+    if "allocator" in alert_lower and ("dead" in alert_lower or "not" in alert_lower or "down" in alert_lower):
+        return ("cloud_alerts", "investigate_allocator", {})
     return None
 
 
@@ -131,6 +143,13 @@ _RDS_CPU_DECISION_TREE = """\
 - **Scenario F (DB causing 5xx)**: rds_cpu high + investigate_alb_5xx_target_5xx shows spike → Root cause: Database overload is causing downstream 5xx errors — HIGH IMPACT, user-facing
 - **Scenario G (Background job / low urgency)**: rds_cpu high + no app_db_errors + investigate_alb_5xx_target_5xx is low/zero → Root cause: Background analytics or batch job consuming CPU, no user impact"""
 
+_RDS_CONNECTIONS_DECISION_TREE = """\
+- **Scenario A (HPA scale-up)**: connections surged + hpa_and_scale shows recent SuccessfulRescale or replica increase → Root cause: Pod autoscaling increased pod count, each new pod opens DB connections. Expected during traffic spikes, will stabilize.
+- **Scenario B (Connection leak / pool exhaustion)**: connections surged + app_conn_errors shows "too many connections" or "FATAL: sorry, too many clients" + no recent scale events → Root cause: Application connection pool leak or misconfiguration. Connections keep growing without being released.
+- **Scenario C (Long-running queries holding connections)**: connections high + pi_wait_events shows Lock or Client:ClientRead dominant → Root cause: Slow/blocked queries holding connections open. Check Performance Insights for the blocking query.
+- **Scenario D (Correlated with CPU spike)**: connections high + rds_cpu high → Root cause: High CPU is causing queries to take longer, which keeps connections open longer. Fix the CPU issue first (see RDS CPU scenarios).
+- **Scenario E (Baseline / normal)**: connections are within normal range for pod count + no errors in app logs → Root cause: False alarm, connections are proportional to running pods. Alert threshold may need adjustment."""
+
 _RDS_REPLICATION_LAG_DECISION_TREE = """\
 - **Scenario A (Stale logical replication slot)**: slot_lag max > 30 days + slot_disk_usage is low/zero + wal_disk_usage stable → Root cause: Inactive logical replication slot (AWS→GCP subscriber disconnected). Slot is not consuming WAL but preventing cleanup. REQUIRES: DBA to drop the stale slot or reconnect the subscriber.
 - **Scenario B (Active slot but falling behind)**: slot_lag is growing (hours to days) + slot_disk_usage is growing + writer_write_iops is high → Root cause: Logical replication subscriber is connected but can't keep up with write volume. Check GCP subscriber health and network.
@@ -156,6 +175,34 @@ _PRODUCER_DECISION_TREE = """\
 - **Scenario D (Recent deployment)**: pod_status shows Running + pod_events shows recent image pull + producer_metric dropped → Root cause: New deployment may have broken producer — check if error started after deploy
 - **Scenario E (Downstream issue)**: pod_status Running + producer_metric > 0 + stream_jobs = 0 + stream_jobs_failed > 0 → Root cause: Producer is creating jobs but allocator is failing to consume them"""
 
+_ALLOCATOR_DECISION_TREE = """\
+- **Scenario A (Stale metric / false alarm)**: pod_status shows all pods Running + stream_jobs > 0 (delta 2m) + ride_created > 0 → Root cause: Allocator IS working, metric is stale. FALSE ALARM.
+- **Scenario B (Pod crash)**: pod_status shows CrashLoopBackOff or high restart count + pod_events shows OOM/BackOff → Root cause: Allocator pod crash-looping
+- **Scenario C (Running but not consuming)**: pod_status Running + stream_jobs = 0 + pod_logs shows errors (Redis/DB/Kafka) → Root cause: Allocator stuck due to dependency failure
+- **Scenario D (Producer down, not allocator)**: pod_status Running + stream_jobs = 0 + stream_jobs_failed = 0 + ride_created dropping → Root cause: No jobs to consume — check if producer is actually creating jobs (this is a producer issue, not allocator)
+- **Scenario E (Partial failure)**: pod_status Running + stream_jobs > 0 but lower than normal + stream_jobs_failed > 0 → Root cause: Allocator partially working but some jobs failing — check error pattern in logs"""
+
+_LOGIN_SUCCESS_DECISION_TREE = """\
+- **Scenario A (OTP request failing)**: auth_by_status shows 500 rate > 0 → Root cause: /v2/auth/ endpoint returning 500, users can't even request OTP. Check BAP logs for the error.
+- **Scenario B (OTP delivery failure)**: auth_by_status 200 rate is normal BUT verify_by_status total dropped to near zero → Root cause: OTP sent successfully but never delivered to user (SMS/WhatsApp provider down). Users can't verify because they never received the OTP. Check OTP provider status.
+- **Scenario C (Verify endpoint broken)**: verify_by_status shows 500 rate > 0 → Root cause: /v2/auth/:authId/verify/ endpoint returning 500, OTP received but verification fails. Check BAP logs and DB health.
+- **Scenario D (Rate limit attack)**: rate_limit_429 >> 16/s baseline (e.g. >50/s) + auth_errors shows rate limit entries → Root cause: Bot traffic flooding auth endpoint, rate limiter blocking legitimate users too.
+- **Scenario E (Database/Redis issue)**: rds_cpu high or auth_errors shows "connection" or "timeout" → Root cause: Customer DB or Redis issue preventing auth token read/write.
+- **Scenario F (BAP pods crashing)**: bap_pods shows CrashLoopBackOff or not all Running → Root cause: BAP app-backend pods are down, all endpoints including auth are affected.
+- **Scenario G (Bad deploy)**: bap_pods shows recent restart + auth_errors shows new error pattern → Root cause: Recent deployment broke the auth flow.
+- **Scenario H (Low traffic noise)**: auth_volume_ratio < 0.1 (traffic 90% below yesterday) + success_rate fluctuating → Root cause: Too few requests at this hour, ratio is unreliable. False alarm.
+- **Scenario I (Normal baseline)**: success_rate > 90% OR success_rate close to success_rate_yesterday → Root cause: Login rate is normal, alert may have fired on a brief transient dip that already recovered."""
+
+_RATIO_DROP_DECISION_TREE = """\
+- **Scenario A (Metrics not flowing)**: search_volume = 0 or ride_volume = 0 → Root cause: Metrics pipeline broken — search_request_count or ride_created_count stopped incrementing. NOT a real business issue. Check if the exporting pods are healthy.
+- **Scenario B (Search 5xx spike)**: search_5xx shows high rate on /protocol/:merchantId/search/ + ratio dropped → Root cause: Search API returning 500s, users can't search → no rides created. Fix the search service.
+- **Scenario C (Allocator dead)**: allocator_jobs = 0 or near 0 + search volume normal + ride volume dropped → Root cause: Allocator is not assigning drivers to searches. Searches succeed but rides never get created. Check allocator pods.
+- **Scenario D (External API failure)**: external_api_errors shows OpenNetwork/Acme gateway returning errors + search_5xx elevated → Root cause: External dependency (OpenNetwork gateway, Acme gateway) is failing, breaking the search→ride flow.
+- **Scenario E (Broad 5xx across services)**: top_5xx shows multiple handlers failing + istio_5xx shows multiple services → Root cause: Shared infrastructure issue (DB, Redis, network) cascading into ride creation failure.
+- **Scenario F (Searches up, rides flat — demand spike without driver supply)**: search_now_vs_yesterday > 1.5 + ride_now_vs_yesterday ~1.0 + no 5xx → Root cause: Traffic surge with insufficient driver supply. Not a system issue — operational/supply problem.
+- **Scenario G (Normal baseline / time of day)**: ratio_by_city similar to ratio_yesterday + search_now_vs_yesterday ~1.0 → Root cause: Ratio is normal for this time of day/week. False alarm or threshold too aggressive.
+- **Scenario H (City-specific issue)**: only 1-2 cities in ratio_by_city below threshold, rest normal → Root cause: Localized issue in specific city — check city-specific external factors, regional service issues."""
+
 _DECISION_TREES: dict[str, str] = {}
 # Map each alert to its decision tree
 for _name in ["NoDriverDrainerRunning", "NoDriverDrainerPodRunning", "NoAppDrainerRunning",
@@ -171,7 +218,23 @@ for _name in ["RDSHighCPU", "RDS_CPU_High", "RDSCPUUtilization",
 for _name in ["RedisHighCPU", "RedisHighMemory", "RedisEvictions",
               "RedisHighConnections", "Redis"]:
     _DECISION_TREES[_name] = _REDIS_DECISION_TREE
+for _name in ["RDSHighConnections", "DriverDBHighConnections", "CustomerDBHighConnections"]:
+    _DECISION_TREES[_name] = _RDS_CONNECTIONS_DECISION_TREE
+for _name in ["RDSReplicationLag", "ReplicationSlotLag", "DriverDBReplicationLag",
+              "CustomerDBReplicationLag", "AuroraReplicaLag"]:
+    _DECISION_TREES[_name] = _RDS_REPLICATION_LAG_DECISION_TREE
 _DECISION_TREES["ProducerNotProducing"] = _PRODUCER_DECISION_TREE
+_CONFIG_FAILURE_DECISION_TREE = """\
+- **Scenario A (Redis cache decode failure — baseline)**: config_failures_by_service shows failures + logs show "Decode Failure for key:CacheHash" with "encountered Null" → Root cause: Config key missing from Redis cache for a specific MerchantOperatingCityId. This is usually BASELINE noise — the config was never set for that city. Check if it's a new city or existing.
+- **Scenario B (Post-deployment config break)**: config_failures increased + recent_deploys shows deploy within 30min → Root cause: New deployment introduced a config schema change that existing cached values don't match
+- **Scenario C (Config service/DB down)**: config_failures spiking rapidly + logs show "connection refused" or "timeout" to config service or DB → Root cause: Config source (DB or config service) is unreachable
+- **Scenario D (Bad config push)**: config_failures spiking + config_changes shows recent configmap/secret update → Root cause: Someone pushed a bad config value
+- **Scenario E (Stable baseline)**: config_failures_1h count is low and stable + same errors yesterday → Root cause: Baseline noise, not a new issue"""
+
+_DECISION_TREES["AllocatorLooksDead"] = _ALLOCATOR_DECISION_TREE
+_DECISION_TREES["SystemConfigParseFailure"] = _CONFIG_FAILURE_DECISION_TREE
+_DECISION_TREES["RideToSearchRatioDown"] = _RATIO_DROP_DECISION_TREE
+_DECISION_TREES["LoginSuccessRate"] = _LOGIN_SUCCESS_DECISION_TREE
 for _name in ["RDSReplicationLag", "ReplicationSlotLag", "DriverDBReplicationLag",
               "CustomerDBReplicationLag", "AuroraReplicaLag"]:
     _DECISION_TREES[_name] = _RDS_REPLICATION_LAG_DECISION_TREE
@@ -191,6 +254,8 @@ def synthesize_fast_rca(llm, checks: dict, alert_name: str) -> dict:
         decision_tree = _RDS_REPLICATION_LAG_DECISION_TREE
     if not decision_tree and ("rds" in alert_name.lower() or ("cpu" in alert_name.lower() and "redis" not in alert_name.lower())):
         decision_tree = _RDS_CPU_DECISION_TREE
+    if not decision_tree and ("ratio" in alert_name.lower() or "search" in alert_name.lower()):
+        decision_tree = _RATIO_DROP_DECISION_TREE
     if not decision_tree and "redis" in alert_name.lower():
         decision_tree = _REDIS_DECISION_TREE
     if not decision_tree:

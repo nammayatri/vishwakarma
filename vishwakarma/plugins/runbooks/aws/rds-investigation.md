@@ -248,6 +248,50 @@ db_query(<connection>, "SELECT pid, now() - query_start AS duration, left(query,
 
 ---
 
+## Step 4B: Deep Query Analysis (ALWAYS DO THIS when PI identifies a culprit query)
+
+When Performance Insights (Step 3) identifies a high-load query, you MUST dig into **why** that query is slow. Don't just report "query X is consuming 40% load" — find out if it's missing an index, doing a sequential scan, or hitting a bloated table.
+
+**4B-a — EXPLAIN ANALYZE the culprit query:**
+Take the tokenized SQL from PI (Step 3a), fill in reasonable parameter values, and run:
+```
+db_query(<connection>, "EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) <the-culprit-query-with-sample-params>")
+```
+Look for:
+- `Seq Scan` on large tables → missing index
+- `Rows Removed by Filter:` huge number → index exists but doesn't cover the WHERE clause
+- `Sort` with `external merge Disk` → not enough work_mem, spilling to disk
+- `Nested Loop` with high actual rows vs estimated → planner misestimate, needs ANALYZE
+- `Buffers: shared read` very high → cold cache, data not in shared_buffers
+
+**4B-b — Check indexes on the culprit table:**
+```
+db_query(<connection>, "SELECT indexname, indexdef FROM pg_indexes WHERE tablename = '<table-from-culprit-query>' ORDER BY indexname")
+```
+
+**4B-c — Check table size and row count:**
+```
+db_query(<connection>, "SELECT relname, pg_size_pretty(pg_total_relation_size(oid)) as total_size, pg_size_pretty(pg_relation_size(oid)) as table_size, pg_size_pretty(pg_indexes_size(oid)) as index_size, reltuples::bigint as estimated_rows FROM pg_class WHERE relname = '<table-from-culprit-query>'")
+```
+
+**4B-d — Check if table stats are stale (planner may be using wrong estimates):**
+```
+db_query(<connection>, "SELECT relname, last_analyze, last_autoanalyze, n_live_tup, n_dead_tup FROM pg_stat_user_tables WHERE relname = '<table-from-culprit-query>'")
+```
+
+**4B-e — Check column statistics for WHERE clause columns:**
+```
+db_query(<connection>, "SELECT attname, n_distinct, most_common_vals, most_common_freqs, correlation FROM pg_stats WHERE tablename = '<table-from-culprit-query>' AND attname IN ('<where-column-1>', '<where-column-2>')")
+```
+
+**Interpretation:**
+- If `Seq Scan` + no matching index for the WHERE clause → **Missing index**. Report which columns need indexing.
+- If index exists but `Seq Scan` still used → Table stats may be stale (run ANALYZE), or query planner estimated index scan as more expensive (check `n_distinct`, `correlation`).
+- If `Index Scan` but still slow → Index is there but query returns too many rows, or table is extremely large. Check if a composite index would help.
+- If `Rows Removed by Filter` >> actual rows → The index doesn't cover the filter. A more selective index is needed.
+
+---
+
 ## Step 5: Check Business Impact (Run in Parallel with Steps 3-4)
 
 **5a — 5xx error rate (Prometheus):**

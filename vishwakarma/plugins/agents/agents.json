@@ -43,18 +43,32 @@
       "runbook": "../runbooks/custom/producer-not-producing.md"
     },
     {
-      "id": "ny-system-alerts",
+      "id": "config-parse-failure",
       "update_date": "2026-03-19",
-      "description": "Investigate SRE Platform system-level alerts: login success rate drop, system config parse failure, Multimodal 5xx errors, Trinetra job failures. Covers: LoginSuccessRate, SystemConfigParseFailure, TrinetraTriggered, Multimodal5xx.",
-      "keywords": ["login", "multimodal", "trinetra", "config", "parse"],
+      "description": "Investigate SystemConfigParseFailure — identifies which service/event is failing, checks if it's Redis cache decode failures (baseline noise) or a real config issue from deployment/config push.",
+      "keywords": ["config", "parse", "configparse", "system_configs_failed"],
       "runbook": "../runbooks/custom/ny-system-alerts.md"
     },
     {
-      "id": "ny-pt-alerts",
-      "update_date": "2026-03-13",
-      "description": "Investigate SRE Platform Public Transit alerts: CMRL API errors, CRIS API errors, PT external API errors, GRPC notifications dropped, GTFS In-Memory Server 5xx, refunds increased. Alert labels: ny-pt-alerts. Covers: CMRLAPIGivingErrors, CrisAPIGivingErrors, PTExternalAPIErrorsIncreased, GRPCDown, GIMS5xx, Refunds increased.",
-      "keywords": ["cmrl", "cris", "grpc", "gtfs", "gims", "refund", "pt-external", "ptexternal", "notification", "public-transit", "public-transport", "external"],
-      "runbook": "../runbooks/custom/ny-pt-alerts.md"
+      "id": "login-success-rate",
+      "update_date": "2026-03-19",
+      "description": "Investigate LoginSuccessRate alert — auth verify success rate dropped. Checks auth handler metrics, OTP delivery, Redis (session cache), DB health, and recent deployments.",
+      "keywords": ["login", "auth", "verify", "otp", "success"],
+      "runbook": "../runbooks/custom/login-success-rate.md"
+    },
+    {
+      "id": "general-alerts",
+      "update_date": "2026-03-19",
+      "description": "General deep investigation for alerts without dedicated fast-RCA: TrinetraTriggered, Multimodal5xx, Protocol5xxErrors, ProtocolExternalAPI5xx, AcmeGateway5xx, OpenNetworkGateway5xx, GRPCDown, GIMS5xx, CMRLAPIGivingErrors, CrisAPIGivingErrors, PTExternalAPIErrorsIncreased, Refunds increased. Covers 5xx errors, external API failures, job failures, and business metric alerts.",
+      "keywords": ["multimodal", "trinetra", "cmrl", "cris", "grpc", "gtfs", "gims", "refund", "pt-external", "ptexternal", "notification", "public-transit", "protocol", "acme", "opennetwork", "sev2", "external"],
+      "runbook": "../runbooks/custom/general-alert-investigation.md"
+    },
+    {
+      "id": "ride-to-search-ratio",
+      "update_date": "2026-03-19",
+      "description": "Investigate RideToSearchRatioDown alert — business metric drop. First verifies metrics are flowing, then checks search/ride pipeline: 5xx on search handlers, allocator health, external API failures (OpenNetwork/Acme/Google Maps), driver supply, and compares with yesterday baseline.",
+      "keywords": ["ratio", "ridetosearch", "conversion", "drop"],
+      "runbook": "../runbooks/custom/ride-to-search-ratio.md"
     },
     {
       "id": "database-investigation",
@@ -64,11 +78,18 @@
       "runbook": "../runbooks/database-investigation.md"
     },
     {
+      "id": "allocator-dead",
+      "update_date": "2026-03-19",
+      "description": "Investigate AllocatorLooksDead alert for ride matching allocator. Determines if allocator is genuinely dead or false alarm, checks dependencies (location-redis, driver RDS, Kafka), compares errors against yesterday's baseline to filter noise.",
+      "keywords": ["allocator", "dead", "stream_jobs"],
+      "runbook": "../runbooks/custom/allocator-dead.md"
+    },
+    {
       "id": "ny-sre-sev2-alerts",
-      "update_date": "2026-03-12",
-      "description": "Investigate SRE Platform SEV2 alerts: Protocol 5xx errors, Acme gateway/registry 5xx, OpenNetwork gateway/registry 5xx, ride-to-search ratio drop, allocator not functioning. Alert labels: alert-ny-sre-sev2. Covers: Protocol5xxErrors, ProtocolExternalAPI5xx, AcmeGateway5xx, OpenNetworkGateway5xx, RideToSearchRatioDown, AllocatorLooksDead.",
-      "keywords": ["protocol", "acme", "opennetwork", "sev2", "allocator", "ride", "search", "ratio"],
-      "runbook": "../runbooks/custom/ny-sre-sev2-alerts.md"
+      "update_date": "2026-03-19",
+      "description": "Fallback for SEV2 alerts not caught by specific runbooks. Uses general investigation methodology.",
+      "keywords": ["sev2"],
+      "runbook": "../runbooks/custom/general-alert-investigation.md"
     }
   ]
 }
