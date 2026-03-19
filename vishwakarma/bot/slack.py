@@ -788,6 +788,14 @@ def start_bot(config: "VishwakarmaConfig") -> None:
             llm = config.make_llm()
             learnings_manager.compact(category, llm.summarize)
 
+            # Update evidence baselines
+            try:
+                from vishwakarma.storage.evidence import mark_evidence_correct
+                mark_evidence_correct(incident_id)
+                log.info(f"[FEEDBACK] Evidence marked correct, baselines updated for {alert_name}")
+            except Exception as e:
+                log.debug(f"[FEEDBACK] Evidence update failed (non-fatal): {e}")
+
             # Extract and save replayable pattern
             pattern_saved = False
             try:

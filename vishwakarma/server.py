@@ -396,6 +396,7 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
         fast_match = match_fast_rca(alert_name)
         fast_rca_result = None
         fast_rca_ts = None
+        fast_checks_raw: dict = {}  # raw check results for evidence extraction
 
         async def _run_fast_rca():
             """Fast RCA: parallel checks → LLM classify → post to Slack."""
@@ -441,6 +442,8 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
                         merged_checks[f"{c_tool}_{k}"] = v
 
                 checks["checks"] = merged_checks
+                nonlocal fast_checks_raw
+                fast_checks_raw = merged_checks  # capture for evidence extraction
                 fast_rca_result = await loop.run_in_executor(
                     None, lambda: synthesize_fast_rca(llm, merged_checks, alert_name)
                 )
@@ -505,6 +508,89 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
             "Use `learnings_list` + `learnings_read` only if you need categories not shown above."
         )
         extra_system_prompt = "\n\n".join(extra_parts) or None
+
+        # ── Evidence-based auto-resolve: compare metrics against learned baselines ──
+        auto_resolved = False
+        evidence_metrics = {}
+        try:
+            from vishwakarma.storage.evidence import (
+                extract_metrics_from_checks, store_evidence,
+                should_auto_resolve, compare_against_baselines,
+            )
+            # Extract numeric metrics from fast RCA raw check results
+            if fast_checks_raw:
+                evidence_metrics = extract_metrics_from_checks(fast_checks_raw)
+
+            if evidence_metrics:
+                # Store evidence snapshot (outcome=pending until ✅/❌)
+                store_evidence(
+                    evidence_id=incident_id,
+                    alert_name=alert_name,
+                    metrics=evidence_metrics,
+                    scenario=fast_rca_result.get("scenario", "") if fast_rca_result else "",
+                    root_cause_type=fast_rca_result.get("root_cause", "")[:100] if fast_rca_result else "",
+                    incident_id=incident_id,
+                )
+                log.info(f"Evidence stored: {len(evidence_metrics)} metrics for {alert_name}")
+
+                # Check if we can auto-resolve
+                can_resolve, reason = should_auto_resolve(
+                    alert_name, evidence_metrics,
+                    fast_rca_confidence=fast_rca_result.get("confidence", "") if fast_rca_result else "",
+                )
+                if can_resolve:
+                    auto_resolved = True
+                    from vishwakarma.core.models import LLMResult, InvestigationMeta
+                    comparison = compare_against_baselines(alert_name, evidence_metrics)
+                    analysis = (
+                        f"## Auto-Resolved: Known Normal Pattern\n\n"
+                        f"**{reason}**\n\n"
+                        f"## Evidence Comparison\n"
+                        f"{comparison['summary']}\n\n"
+                        f"## Metric Details\n"
+                    )
+                    for n in comparison.get("normal", []):
+                        analysis += f"- {n['metric']}: {n['value']} (baseline: {n['baseline_mean']}±{n['baseline_stddev']}, z={n['z_score']})\n"
+                    if fast_rca_result:
+                        analysis += f"\n## Fast RCA Classification\n{json.dumps(fast_rca_result, indent=2)}\n"
+                    analysis += (
+                        f"\n## Resolution\nNo action needed. This alert pattern has been confirmed normal "
+                        f"{comparison.get('sample_count', '?')} times. "
+                        f"Consider adjusting the alert threshold to reduce false alarms."
+                    )
+                    result = LLMResult(
+                        answer=analysis,
+                        tool_outputs=[],
+                        messages=[],
+                        meta=InvestigationMeta(steps=0),
+                    )
+                    log.info(f"Auto-resolved {alert_name}: {reason}")
+
+                    if slack_client and slack_channel_id and ack_ts:
+                        try:
+                            slack_client.chat_postMessage(
+                                channel=slack_channel_id, thread_ts=ack_ts,
+                                text=f":brain: Auto-resolved — all metrics within learned baselines",
+                                blocks=[{"type": "context", "elements": [
+                                    {"type": "mrkdwn", "text": f":brain: _Auto-resolved: {reason[:200]}_"}
+                                ]}],
+                            )
+                        except Exception:
+                            pass
+                else:
+                    # Not auto-resolvable — inject anomaly info into investigation
+                    comparison = compare_against_baselines(alert_name, evidence_metrics)
+                    if comparison.get("anomalies"):
+                        anomaly_text = "## Evidence Memory — Anomalies Detected\n"
+                        anomaly_text += "These metrics are OUTSIDE learned baselines (from confirmed investigations):\n"
+                        for a in comparison["anomalies"]:
+                            anomaly_text += f"- **{a['metric']}** = {a['value']} (baseline: {a['baseline_mean']}±{a['baseline_stddev']}, z-score={a['z_score']})\n"
+                        anomaly_text += "\nFocus investigation on these anomalous metrics first."
+                        extra_parts.append(anomaly_text)
+                        extra_system_prompt = "\n\n".join(extra_parts) or None
+                        log.info(f"Anomalies injected for {alert_name}: {[a['metric'] for a in comparison['anomalies']]}")
+        except Exception as e:
+            log.debug(f"Evidence check failed (non-fatal): {e}")
 
         # ── Pattern replay: check if a confirmed pattern matches ──
         pattern_matched = False
@@ -703,7 +789,7 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
                 meta=InvestigationMeta(steps=tool_count),
             )
 
-        if not pattern_matched:
+        if not auto_resolved and not pattern_matched:
             result = await loop.run_in_executor(None, _run_streaming_investigation)
     except Exception as e:
         log.error(f"Alert investigation failed for {issue.title}: {e}", exc_info=True)
