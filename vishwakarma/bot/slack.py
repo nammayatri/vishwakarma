@@ -386,10 +386,12 @@ def start_bot(config: "VishwakarmaConfig") -> None:
             return
 
         # debug <question> → full investigation + PDF
-        # anything else → simple LLM chat (no tools)
+        # OR auto-detect investigation intent from the question
         is_investigation = question_lower.startswith("debug ")
         if is_investigation:
             question = question[len("debug "):].strip()  # strip "debug " prefix
+        elif not is_investigation:
+            is_investigation = _is_investigation_intent(question)
 
             # If the user replied in a thread, try to fetch the thread's parent message.
             # Amazon Q posts CloudWatch alarms as thread starters — grab the alarm context.
@@ -869,6 +871,68 @@ def start_bot(config: "VishwakarmaConfig") -> None:
     t = threading.Thread(target=_start, daemon=True, name="slack-bot")
     t.start()
     log.info("Slack bot started in background thread")
+
+
+def _is_investigation_intent(question: str) -> bool:
+    """Detect if a question requires a full investigation (tools + PDF) vs simple chat.
+
+    Two-tier detection:
+    1. Fast keyword match for obvious investigation queries
+    2. Pattern-based heuristics for edge cases
+
+    Returns True if investigation mode should be triggered.
+    """
+    q = question.lower().strip()
+
+    # ── Tier 1: Obvious NON-investigation (chat) ──
+    # Greetings, meta questions, short casual messages
+    chat_patterns = [
+        "hi", "hello", "hey", "yo", "sup", "thanks", "thank you", "ok", "okay",
+        "good morning", "good evening", "gm", "who are you", "what are you",
+        "who made you", "help", "status", "what can you do",
+    ]
+    if q.rstrip("!?.") in chat_patterns:
+        return False
+    import re as _re
+    if len(q.split()) <= 2 and not any(kw in q for kw in ["why", "crash", "error", "down", "high", "spike", "fail", "5xx", "lag"]):
+        # But if it contains a UUID, it's likely a ride/booking ID to investigate
+        if not _re.search(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', q):
+            return False
+
+    # ── Tier 2: Obvious investigation keywords ──
+    investigation_keywords = [
+        # Infrastructure issues
+        "why", "crash", "crashing", "error", "errors", "5xx", "500", "502", "503", "504",
+        "down", "not working", "failing", "failed", "timeout", "latency",
+        "high cpu", "high memory", "oom", "killed", "evict",
+        "spike", "surge", "drop", "dropped", "degraded",
+        # Alert names
+        "rds", "redis", "alb", "elb", "drainer", "allocator", "producer",
+        "replication", "connection", "pod", "node",
+        # Investigation verbs
+        "investigate", "check", "look into", "find out", "what happened",
+        "root cause", "diagnose", "troubleshoot", "figure out",
+        # Specific entities
+        "ride", "booking", "payment", "search", "ratio",
+        "login", "auth", "otp",
+    ]
+    # Skip if purely explanatory ("explain X", "what is X", "how does X work")
+    if q.startswith(("explain ", "what is ", "what are ", "how does ", "how do ", "tell me about ")):
+        return False
+    if any(kw in q for kw in investigation_keywords):
+        return True
+
+    # ── Tier 3: UUID/ID patterns (someone pasted a ride/booking ID) ──
+    import re
+    if re.search(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', q):
+        return True
+
+    # ── Tier 4: Pasted JSON, log lines, or error messages ──
+    if any(indicator in q for indicator in ['{"', "stacktrace", "exception", "traceback", "FATAL", "WARN", "ERROR"]):
+        return True
+
+    # Default: not an investigation
+    return False
 
 
 def _contextual_thread_reply(config, question: str, thread_context: str) -> str:
