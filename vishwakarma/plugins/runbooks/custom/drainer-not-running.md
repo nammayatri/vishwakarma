@@ -115,6 +115,13 @@ The drainer processes a queue of DB writes. A single bad record with a fatal SQL
    }
    ```
 
+4. **NOTE:** Drainer logs are NOT in Elasticsearch/Kibana — they are only in pod logs (stern/kubectl logs). Do NOT search ES for drainer errors.
+
+5. If you find the SQL error, identify which **table and column** caused it — search the error message for table names. Then check the column definition:
+   ```
+   db_describe_table(connection="bpp_pg", table="<table-name>")
+   ```
+
 **Common SQL errors:**
 - `sqlState 22003` — integer out of range (column overflow, e.g. Int32 exceeded)
 - `value too long for type character varying` — varchar column overflow
@@ -318,7 +325,30 @@ kubectl get hpa -n atlas | grep -i drainer
 ## If Fast RCA Was Provided
 
 If a Fast RCA result was injected at the top of this investigation:
-1. **Don't repeat the same checks** — the fast RCA already ran pod_status, pod_logs, stop_metric, drain_rate, rds_cpu, pod_events, and redis_health.
-2. **Go deeper** — if Fast RCA said "Scenario B: SQL error", find the exact table/column, search ES for the full stack trace, check if it's a known issue.
-3. **Verify or refute** — if your evidence contradicts the Fast RCA, explain why in your final report.
-4. **Add remediation detail** — Fast RCA gives a one-liner fix; your report should include the full remediation plan.
+1. **Don't repeat Phase 1 checks** — fast RCA already ran pod_status, pod_logs, stop_metric, drain_rate, rds_cpu, pod_events, and redis_health.
+2. **Go deeper based on the scenario:**
+   - **Scenario B (SQL error):** Search ES for the full stack trace, identify the exact table/column, use `db_describe_table` to check column type, check if this is a known recurring issue via `learnings_read`
+   - **Scenario C (DB connectivity):** Run Performance Insights to find top queries, check wait events (IO vs CPU vs locks), check if connections are from drainer or other services
+   - **Scenario D (Redis):** Check all Redis cluster metrics (CPU, memory, evictions, connections), check bandwidth saturation per node
+   - **Scenario E (False alarm):** Run 7-day drain rate baseline, check if the metric is genuinely stale vs transient
+3. **Verify or refute** — if your evidence contradicts Fast RCA, explain why with data.
+4. **Add the full story** — Fast RCA says "what happened". Your report should add "why it happened", "when it started", "how many records are affected", and "complete remediation plan".
+5. **Check recent deployments** — always correlate with deploy times even if Fast RCA didn't mention it.
+
+---
+
+## RCA Report Requirements
+
+Your final report MUST clearly distinguish between **verified facts** and **assumptions**:
+
+### For every claim, state your evidence:
+- **VERIFIED**: "Drainer pods are UP (5/5 Running) but stop_status=1 — SQL error in logs: sqlState 22003 integer out of range on table driver_fee column id" — you have the data
+- **LIKELY**: "This is likely caused by an auto-increment overflow — column is Int32 and nearing max" — strong reasoning but not conclusive
+- **UNVERIFIED ASSUMPTION**: "May be related to recent traffic spike — did not check request volume" — inferring without data
+
+### Structure your conclusion as:
+1. **What happened** (facts: pod state, metric values, error messages, timestamps)
+2. **Why it happened** (verified root cause with evidence, OR "likely cause" with reasoning)
+3. **What was NOT checked** (explicitly list things you couldn't verify)
+4. **Impact** (verified: drain rate at 0 = writes stalled for X minutes. Or "impact not measured")
+5. **Recommended fix** (with confidence level)

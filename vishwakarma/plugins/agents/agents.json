@@ -2,24 +2,31 @@
   "agents": [
     {
       "id": "alb-5xx-investigation",
-      "update_date": "2026-03-12",
-      "description": "Investigate AWS ALB 5xx CloudWatch alarms. Identifies which API endpoints are returning 5xx errors using CloudWatch metrics, then queries Elasticsearch Istio and application logs to find the failing APIs, error messages, and root cause. For alerts: ALB5xxErrors, HTTPCode_Target_5XX_Count, HTTPCode_ELB_5XX_Count.",
+      "update_date": "2026-03-19",
+      "description": "Investigate AWS ALB 5xx alerts. Two-phase: fast RCA identifies the failing service/API/error in ~20s, deep RCA traces full root cause chain with ES logs and dependency checks. Covers: ALB5xxErrors, HTTPCode_Target_5XX_Count, HTTPCode_ELB_5XX_Count, HTTP_ELB_CODE_5XX, Protocol API ALB 5xx.",
       "keywords": ["alb", "5xx", "4xx", "elb", "target", "http", "gateway", "latency", "unhealthy", "ssl"],
-      "runbook": "../runbooks/aws/alb-5xx-investigation.md"
+      "runbook": "../runbooks/custom/alb-5xx-investigation.md"
     },
     {
       "id": "rds-investigation",
-      "update_date": "2026-03-12",
-      "description": "Investigate AWS RDS alerts: high CPU utilization, high database connections, low freeable memory, high IOPS, replication lag. Uses CloudWatch, Performance Insights, slow query logs, and Kubernetes pod logs. For alerts: RDSHighCPU, RDSHighConnections, RDSLowMemory, RDSReplicationLag.",
-      "keywords": ["rds", "cpu", "database", "postgres", "connections", "iops", "replication", "memory", "db", "freeable", "swap", "replica", "writer", "reader"],
+      "update_date": "2026-03-19",
+      "description": "Investigate AWS RDS alerts: high CPU utilization, high database connections, low freeable memory, high IOPS. Uses CloudWatch, Performance Insights, slow query logs, and Kubernetes pod logs. For alerts: RDSHighCPU, RDSHighConnections, RDSLowMemory.",
+      "keywords": ["rds", "database", "postgres", "connections", "iops", "freeable", "swap", "writer"],
       "runbook": "../runbooks/aws/rds-investigation.md"
     },
     {
+      "id": "rds-replication-lag",
+      "update_date": "2026-03-19",
+      "description": "Investigate RDS replication lag alerts: logical replication slot lag (AWS→GCP cross-cloud), Aurora read replica lag, WAL disk growth. Distinguishes stale logical slots (100+ days lag) from Aurora replica lag (<100ms). For alerts: RDSReplicationLag, ReplicationSlotLag, AuroraReplicaLag, OldestReplicationSlotLag.",
+      "keywords": ["replication", "replica", "slot", "lag", "wal", "aurora", "logical"],
+      "runbook": "../runbooks/aws/rds-replication-lag.md"
+    },
+    {
       "id": "redis-investigation",
-      "update_date": "2026-03-12",
-      "description": "Investigate AWS ElastiCache Redis alerts: high CPU, high memory, key evictions, high connections, low cache hit ratio, replication lag. For alerts: RedisHighCPU, RedisHighMemory, RedisEvictions, RedisHighConnections.",
+      "update_date": "2026-03-19",
+      "description": "Investigate AWS ElastiCache Redis alerts: high CPU, high memory, key evictions, high connections, bandwidth saturation, CLUSTERDOWN. Covers: RedisHighCPU, RedisHighMemory, RedisEvictions, RedisHighConnections, Redis Node Memory beyond 90%, ProtocolRedis-CPU.",
       "keywords": ["redis", "elasticache", "cache", "eviction", "bandwidth", "networkbandwidth"],
-      "runbook": "../runbooks/aws/redis-investigation.md"
+      "runbook": "../runbooks/custom/redis-investigation.md"
     },
     {
       "id": "drainer-not-running",
@@ -29,10 +36,17 @@
       "runbook": "../runbooks/custom/drainer-not-running.md"
     },
     {
+      "id": "producer-not-producing",
+      "update_date": "2026-03-19",
+      "description": "Investigate ProducerNotProducing alert for driver job producer. Determines if producer is genuinely down or false alarm (stale metric). Checks pod status, producer metrics, stream jobs counter, and allocator health.",
+      "keywords": ["producer", "producing"],
+      "runbook": "../runbooks/custom/producer-not-producing.md"
+    },
+    {
       "id": "ny-system-alerts",
       "update_date": "2026-03-19",
-      "description": "Investigate SRE Platform system-level alerts: login success rate drop, drainer lag (customer/driver), producer not producing, system config parse failure, Multimodal 5xx errors, Trinetra job failures. Alert labels: ny-system-alerts. Covers: LoginSuccessRate, ProducerNotProducing, DriverDrainerLagIncreasing, SystemConfigParseFailure, TrinetraTriggered, Multimodal5xx.",
-      "keywords": ["login", "producer", "multimodal", "trinetra", "config", "parse"],
+      "description": "Investigate SRE Platform system-level alerts: login success rate drop, system config parse failure, Multimodal 5xx errors, Trinetra job failures. Covers: LoginSuccessRate, SystemConfigParseFailure, TrinetraTriggered, Multimodal5xx.",
+      "keywords": ["login", "multimodal", "trinetra", "config", "parse"],
       "runbook": "../runbooks/custom/ny-system-alerts.md"
     },
     {

@@ -355,7 +355,7 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
         import asyncio as _asyncio
         loop = _asyncio.get_event_loop()
         from vishwakarma.config import load_matching_runbooks
-        from vishwakarma.core.fast_rca import match_fast_rca, synthesize_fast_rca, format_slack_message
+        from vishwakarma.core.fast_rca import match_fast_rca, get_companion_checks, synthesize_fast_rca, format_slack_message
 
         # ── Launch fast RCA + pre-enrichment in parallel ──
         fast_match = match_fast_rca(alert_name)
@@ -372,14 +372,42 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
             if not fast_ts or not fast_ts.enabled:
                 return
             try:
-                check_output = await loop.run_in_executor(
+                # Run primary + companion checks in parallel
+                companions = get_companion_checks(tool_name)
+                primary_future = loop.run_in_executor(
                     None, lambda: fast_ts.execute(tool_name, tool_params)
                 )
-                if check_output.status != ToolStatus.SUCCESS:
+                companion_futures = []
+                for c_toolset, c_tool, c_params in companions:
+                    c_ts = tm.get(c_toolset)
+                    if c_ts and c_ts.enabled:
+                        companion_futures.append(
+                            loop.run_in_executor(
+                                None, lambda ts=c_ts, t=c_tool, p=c_params: ts.execute(t, p)
+                            )
+                        )
+
+                all_outputs = await _asyncio.gather(primary_future, *companion_futures, return_exceptions=True)
+
+                # Merge all check results
+                check_output = all_outputs[0]
+                if isinstance(check_output, Exception) or check_output.status != ToolStatus.SUCCESS:
                     return
                 checks = json.loads(check_output.output) if isinstance(check_output.output, str) else check_output.output
+                merged_checks = dict(checks.get("checks", checks))
+
+                # Merge companion results under prefixed keys
+                for i, (c_toolset, c_tool, c_params) in enumerate(companions):
+                    c_output = all_outputs[i + 1]
+                    if isinstance(c_output, Exception) or c_output.status != ToolStatus.SUCCESS:
+                        continue
+                    c_data = json.loads(c_output.output) if isinstance(c_output.output, str) else c_output.output
+                    for k, v in c_data.get("checks", c_data).items():
+                        merged_checks[f"{c_tool}_{k}"] = v
+
+                checks["checks"] = merged_checks
                 fast_rca_result = await loop.run_in_executor(
-                    None, lambda: synthesize_fast_rca(llm, checks.get("checks", checks), alert_name)
+                    None, lambda: synthesize_fast_rca(llm, merged_checks, alert_name)
                 )
                 # Post to Slack immediately
                 if config.is_slack_configured() and fast_rca_result:
