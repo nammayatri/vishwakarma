@@ -385,20 +385,30 @@ def start_bot(config: "VishwakarmaConfig") -> None:
             threading.Thread(target=run_oracle, daemon=True).start()
             return
 
-        # ── Determine: investigate or chat? ──
-        # 1. "debug X" → always investigate, no questions asked — SKIP thread fetch for speed
-        # 2. Thread reply → fetch thread context, use it to decide + enrich
-        # 3. Auto-detect from keywords/patterns
+        # ── Routing: known commands execute immediately, everything else is chat ──
+        # debug X      → immediate investigation (no thread fetch, no LLM classification)
+        # oracle X     → handled above (line ~166)
+        # costs/status → handled above
+        # learn/forget → handled above
+        # <anything>   → chat: fetch thread context, decide contextual reply vs simple chat
         is_thread_reply = thread_ts and event.get("ts") != thread_ts
-        thread_context = ""
-        thread_text = ""
 
-        # Route: debug prefix = direct investigate (skip thread fetch for speed)
-        is_investigation = question_lower.startswith("debug ")
-        if is_investigation:
+        if question_lower.startswith("debug "):
+            # ── FAST PATH: direct investigation, zero overhead ──
             question = question[len("debug "):].strip()
+            full_question = question
+
+            # Search incident DB for prior context (fast, no thread fetch)
+            prior_ctx = _find_prior_investigation(question)
+            if prior_ctx:
+                full_question = f"{question}\n\n{prior_ctx}"
+
+            log.info(f"[ROUTE] debug → investigate: {question[:80]}")
+            say(text=f":mag: Investigating: *{question[:100]}*...", thread_ts=thread_ts)
         else:
-            # Fetch thread context only for non-debug messages
+            # ── CHAT PATH: fetch thread context, then reply ──
+            thread_context = ""
+            thread_text = ""
             if is_thread_reply and client:
                 try:
                     thread_msgs = client.conversations_replies(
@@ -406,58 +416,12 @@ def start_bot(config: "VishwakarmaConfig") -> None:
                     )
                     messages_list = thread_msgs.get("messages", [])
                     thread_text = "\n".join(m.get("text", "")[:500] for m in messages_list)
-                    # Also grab alarm context from parent message (CloudWatch alarms)
                     thread_context = _fetch_thread_alarm_context(client, channel, thread_ts)
                 except Exception as e:
                     log.debug(f"Thread fetch failed (non-fatal): {e}")
-            # Auto-detect investigation intent
-            is_investigation = _is_investigation_intent(question)
-            # In a thread with investigation context: many messages that look like
-            # investigation keywords ("redis", "root cause") are actually questions
-            # ABOUT the existing investigation, not new investigation requests.
-            # Downgrade to chat if the message is short and asking about thread content.
-            if is_investigation and is_thread_reply and thread_text:
-                has_investigation = any(
-                    kw in thread_text.lower()
-                    for kw in ["fast rca", "root cause", "investigation", "confidence",
-                               "evidence", "deep investigation", "investigation started"]
-                )
-                if has_investigation:
-                    # Thread already has an investigation. Only trigger a NEW investigation
-                    # if the user is clearly requesting one (action verbs + new scope).
-                    action_verbs = ["check", "investigate", "look into", "find out",
-                                    "debug", "diagnose", "troubleshoot", "run", "also check"]
-                    # Urgency signals = new issue being reported, not a question about existing
-                    urgency_signals = ["now", "just started", "just happened", "happening now",
-                                       "currently", "right now", "again", "new"]
-                    has_action = any(v in question.lower() for v in action_verbs)
-                    has_urgency = any(s in question.lower() for s in urgency_signals)
-                    if not has_action and not has_urgency:
-                        # No action verb → user is asking about the existing investigation
-                        is_investigation = False
 
-        if is_investigation:
-            # Build investigation question with thread context
-            if thread_context:
-                full_question = f"{question}\n\n{thread_context}"
-            elif thread_text and is_thread_reply:
-                # Use thread text as context even if no alarm format detected
-                full_question = f"{question}\n\n## Thread Context\n{thread_text[:3000]}"
-            else:
-                full_question = question
+            log.info(f"[ROUTE] chat: {question[:80]}")
 
-            # If no thread context and question references past issues,
-            # search incident DB and attach prior investigation as context
-            if not thread_context and not (thread_text and is_thread_reply):
-                prior_ctx = _find_prior_investigation(question)
-                if prior_ctx:
-                    full_question = f"{question}\n\n{prior_ctx}"
-
-            say(text=f":mag: Investigating: *{question[:100]}*...", thread_ts=thread_ts)
-        else:
-            # Not investigation — contextual reply if in thread, simple chat otherwise
-            # In a thread → always use thread context for the reply
-            # Not in a thread → simple chat
             def run_chat():
                 try:
                     if is_thread_reply and thread_text:
