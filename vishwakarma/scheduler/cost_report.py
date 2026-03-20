@@ -8,8 +8,10 @@ Scheduled runs only post when anomalies are detected (cost spike above threshold
 On-demand runs (via @sage costs) always post the full report.
 """
 import logging
+import math
 import os
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 
 log = logging.getLogger(__name__)
@@ -467,6 +469,233 @@ def _fetch_cost_forecast(region: str = "ap-south-1") -> dict | None:
         return None
 
 
+def _fetch_data_transfer_breakdown(region: str = "ap-south-1") -> list[dict]:
+    """Fetch data transfer costs separately — often the biggest surprise.
+    Groups by USAGE_TYPE filtered to transfer-related types (DataTransfer, NatGateway, etc.).
+    Compares last 2 days vs prior 7 day avg."""
+    import boto3
+
+    ce = boto3.client("ce", region_name=region)
+    end = datetime.now(timezone.utc).date() + timedelta(days=1)
+    start = end - timedelta(days=10)
+
+    # Fetch all USAGE_TYPEs, then filter client-side for transfer-related ones
+    all_results = []
+    next_token = None
+    while True:
+        kwargs = {
+            "TimePeriod": {"Start": start.isoformat(), "End": end.isoformat()},
+            "Granularity": "DAILY",
+            "Metrics": ["UnblendedCost"],
+            "GroupBy": [{"Type": "DIMENSION", "Key": "USAGE_TYPE"}],
+        }
+        if next_token:
+            kwargs["NextPageToken"] = next_token
+        resp = ce.get_cost_and_usage(**kwargs)
+        all_results.extend(resp["ResultsByTime"])
+        next_token = resp.get("NextPageToken")
+        if not next_token:
+            break
+
+    transfer_keywords = {"datatransfer", "natgateway", "bytes", "transfer"}
+
+    # Parse: usage_type -> {date -> cost}
+    usage_by_date = {}
+    dates = []
+    for result in all_results:
+        date = result["TimePeriod"]["Start"]
+        dates.append(date)
+        for group in result["Groups"]:
+            utype = group["Keys"][0]
+            # Filter to transfer-related usage types
+            if not any(kw in utype.lower() for kw in transfer_keywords):
+                continue
+            cost = float(group["Metrics"]["UnblendedCost"]["Amount"])
+            if cost < 0.001:
+                continue
+            usage_by_date.setdefault(utype, {})[date] = cost
+
+    dates_sorted = sorted(set(dates))
+    if len(dates_sorted) < 3:
+        return []
+
+    # Last 2 days vs prior 7 avg
+    recent_dates = dates_sorted[-2:]
+    avg_dates = dates_sorted[:-2]
+
+    breakdown = []
+    for utype, date_costs in usage_by_date.items():
+        yesterday_cost = sum(date_costs.get(d, 0) for d in recent_dates) / max(len(recent_dates), 1)
+        avg_vals = [date_costs.get(d, 0) for d in avg_dates]
+        avg_cost = sum(avg_vals) / max(len(avg_vals), 1)
+        dollar_change = yesterday_cost - avg_cost
+        pct_change = ((yesterday_cost - avg_cost) / avg_cost * 100) if avg_cost > 0 else (100.0 if yesterday_cost > 0 else 0)
+
+        if yesterday_cost >= 0.01 or abs(dollar_change) >= 0.01:
+            breakdown.append({
+                "usage_type": utype,
+                "yesterday_cost": round(yesterday_cost, 2),
+                "avg_cost": round(avg_cost, 2),
+                "dollar_change": round(dollar_change, 2),
+                "pct_change": round(pct_change, 1),
+            })
+
+    breakdown.sort(key=lambda x: -abs(x["dollar_change"]))
+    return breakdown[:15]
+
+
+def _fetch_instance_type_breakdown(service_name: str, region: str = "ap-south-1") -> list[dict]:
+    """For an anomalous service, group by INSTANCE_TYPE to see if new instances appeared.
+    Compares last 2 days vs prior 7 avg. Flags instance types with avg=0 and yesterday>0 as NEW."""
+    import boto3
+
+    ce = boto3.client("ce", region_name=region)
+    end = datetime.now(timezone.utc).date() + timedelta(days=1)
+    start = end - timedelta(days=10)
+
+    all_results = []
+    next_token = None
+    while True:
+        kwargs = {
+            "TimePeriod": {"Start": start.isoformat(), "End": end.isoformat()},
+            "Granularity": "DAILY",
+            "Metrics": ["UnblendedCost"],
+            "Filter": {"Dimensions": {"Key": "SERVICE", "Values": [service_name]}},
+            "GroupBy": [{"Type": "DIMENSION", "Key": "INSTANCE_TYPE"}],
+        }
+        if next_token:
+            kwargs["NextPageToken"] = next_token
+        resp = ce.get_cost_and_usage(**kwargs)
+        all_results.extend(resp["ResultsByTime"])
+        next_token = resp.get("NextPageToken")
+        if not next_token:
+            break
+
+    inst_by_date = {}
+    dates = []
+    for result in all_results:
+        date = result["TimePeriod"]["Start"]
+        dates.append(date)
+        for group in result["Groups"]:
+            itype = group["Keys"][0]
+            cost = float(group["Metrics"]["UnblendedCost"]["Amount"])
+            if cost < 0.001:
+                continue
+            inst_by_date.setdefault(itype, {})[date] = cost
+
+    dates_sorted = sorted(set(dates))
+    if len(dates_sorted) < 3:
+        return []
+
+    recent_dates = dates_sorted[-2:]
+    avg_dates = dates_sorted[:-2]
+
+    breakdown = []
+    for itype, date_costs in inst_by_date.items():
+        yesterday_cost = sum(date_costs.get(d, 0) for d in recent_dates) / max(len(recent_dates), 1)
+        avg_vals = [date_costs.get(d, 0) for d in avg_dates]
+        avg_cost = sum(avg_vals) / max(len(avg_vals), 1)
+        dollar_change = yesterday_cost - avg_cost
+        pct_change = ((yesterday_cost - avg_cost) / avg_cost * 100) if avg_cost > 0 else (100.0 if yesterday_cost > 0 else 0)
+
+        flag = ""
+        if avg_cost < 0.01 and yesterday_cost > 0.01:
+            flag = "NEW INSTANCE"
+
+        if yesterday_cost >= 0.01 or abs(dollar_change) >= 0.01:
+            breakdown.append({
+                "instance_type": itype,
+                "yesterday_cost": round(yesterday_cost, 2),
+                "avg_cost": round(avg_cost, 2),
+                "dollar_change": round(dollar_change, 2),
+                "pct_change": round(pct_change, 1),
+                "flag": flag,
+            })
+
+    breakdown.sort(key=lambda x: -abs(x["dollar_change"]))
+    return breakdown[:15]
+
+
+def _fetch_purchase_type_breakdown(region: str = "ap-south-1") -> dict:
+    """Detect if on-demand spend increased because RI/SP coverage dropped.
+    Compares last 7 days vs prior 7 days grouped by PURCHASE_TYPE."""
+    import boto3
+
+    ce = boto3.client("ce", region_name=region)
+    end = datetime.now(timezone.utc).date() + timedelta(days=1)
+    start = end - timedelta(days=15)
+
+    all_results = []
+    next_token = None
+    while True:
+        kwargs = {
+            "TimePeriod": {"Start": start.isoformat(), "End": end.isoformat()},
+            "Granularity": "DAILY",
+            "Metrics": ["UnblendedCost"],
+            "GroupBy": [{"Type": "DIMENSION", "Key": "PURCHASE_TYPE"}],
+        }
+        if next_token:
+            kwargs["NextPageToken"] = next_token
+        resp = ce.get_cost_and_usage(**kwargs)
+        all_results.extend(resp["ResultsByTime"])
+        next_token = resp.get("NextPageToken")
+        if not next_token:
+            break
+
+    ptype_by_date = {}
+    dates = []
+    for result in all_results:
+        date = result["TimePeriod"]["Start"]
+        dates.append(date)
+        for group in result["Groups"]:
+            ptype = group["Keys"][0]
+            cost = float(group["Metrics"]["UnblendedCost"]["Amount"])
+            ptype_by_date.setdefault(ptype, {})[date] = cost
+
+    dates_sorted = sorted(set(dates))
+    if len(dates_sorted) < 10:
+        return {}
+
+    last_7 = dates_sorted[-7:]
+    prior_7 = dates_sorted[-14:-7]
+
+    result = {"purchase_types": [], "on_demand_pct_increased": False}
+    last_7_total = 0.0
+    prior_7_total = 0.0
+    last_7_on_demand = 0.0
+    prior_7_on_demand = 0.0
+
+    for ptype, date_costs in ptype_by_date.items():
+        last_avg = sum(date_costs.get(d, 0) for d in last_7) / max(len(last_7), 1)
+        prior_avg = sum(date_costs.get(d, 0) for d in prior_7) / max(len(prior_7), 1)
+        dollar_change = last_avg - prior_avg
+        pct_change = ((last_avg - prior_avg) / prior_avg * 100) if prior_avg > 0 else (100.0 if last_avg > 0 else 0)
+
+        last_7_total += last_avg
+        prior_7_total += prior_avg
+        if "on demand" in ptype.lower() or ptype == "":
+            last_7_on_demand += last_avg
+            prior_7_on_demand += prior_avg
+
+        result["purchase_types"].append({
+            "purchase_type": ptype or "(On Demand / Unclassified)",
+            "last_7_avg": round(last_avg, 2),
+            "prior_7_avg": round(prior_avg, 2),
+            "dollar_change": round(dollar_change, 2),
+            "pct_change": round(pct_change, 1),
+        })
+
+    # Detect if on-demand % of total increased
+    last_od_pct = (last_7_on_demand / last_7_total * 100) if last_7_total > 0 else 0
+    prior_od_pct = (prior_7_on_demand / prior_7_total * 100) if prior_7_total > 0 else 0
+    result["last_7_on_demand_pct"] = round(last_od_pct, 1)
+    result["prior_7_on_demand_pct"] = round(prior_od_pct, 1)
+    result["on_demand_pct_increased"] = last_od_pct > prior_od_pct + 2  # 2% threshold
+
+    result["purchase_types"].sort(key=lambda x: -abs(x["dollar_change"]))
+    return result
+
+
 # ── CloudWatch cost driver correlation ──────────────────────────────────────
 
 # Maps CE service names → how to fetch the CloudWatch metrics that explain billing.
@@ -482,7 +711,10 @@ _SERVICE_COST_DRIVERS = {
     "Amazon Relational Database Service": {
         "discover": lambda region: _discover_rds_resources(region),
         "cw_namespace": "AWS/RDS",
-        "metrics": ["DatabaseConnections", "ReadIOPS", "WriteIOPS", "FreeStorageSpace", "CPUUtilization"],
+        "metrics": [
+            "DatabaseConnections", "ReadIOPS", "WriteIOPS", "FreeStorageSpace",
+            "CPUUtilization", "VolumeBytesUsed", "VolumeReadIOPs", "VolumeWriteIOPs",
+        ],
         "stat": "Average",
     },
     "Amazon ElastiCache": {
@@ -501,6 +733,27 @@ _SERVICE_COST_DRIVERS = {
         "discover": lambda region: _discover_nat_resources(region),
         "cw_namespace": "AWS/NATGateway",
         "metrics": ["BytesInFromSource", "BytesOutToDestination"],
+        "stat": "Sum",
+    },
+    "Amazon Simple Storage Service": {
+        "discover": lambda region: _discover_s3_resources(region),
+        "cw_namespace": "AWS/S3",
+        "metrics": ["BucketSizeBytes", "NumberOfObjects"],
+        "stat": "Average",
+    },
+    "Amazon Elastic Kubernetes Service": {
+        # EKS has no direct CloudWatch billing metrics — cost is mostly EC2/Fargate underneath.
+        # Included so the LLM knows we checked; discover returns empty to skip CW fetch.
+        "discover": lambda region: [],
+        "cw_namespace": "AWS/EKS",
+        "metrics": [],
+        "stat": "Average",
+        "note": "EKS costs are driven by underlying EC2/Fargate — check those services for metrics.",
+    },
+    "AWS Data Transfer": {
+        "discover": lambda region: _discover_nat_resources(region),
+        "cw_namespace": "AWS/NATGateway",
+        "metrics": ["BytesInFromSource", "BytesOutToDestination", "ActiveConnectionCount"],
         "stat": "Sum",
     },
 }
@@ -581,6 +834,38 @@ def _discover_nat_resources(region: str) -> list[dict]:
         }
         for n in nats
     ]
+
+
+def _discover_s3_resources(region: str) -> list[dict]:
+    """Discover S3 buckets and return CloudWatch dimension sets.
+    S3 CloudWatch metrics require BucketName + StorageType dimensions."""
+    import boto3
+    client = boto3.client("s3", region_name=region)
+    try:
+        resp = client.list_buckets()
+    except Exception as e:
+        log.warning(f"Failed to list S3 buckets: {e}")
+        return []
+    results = []
+    for bucket in resp.get("Buckets", []):
+        # Get bucket location to filter to our region
+        try:
+            loc = client.get_bucket_location(Bucket=bucket["Name"])
+            bucket_region = loc.get("LocationConstraint") or "us-east-1"
+            if bucket_region != region:
+                continue
+        except Exception:
+            continue
+        results.append({
+            "name": bucket["Name"],
+            "dimensions": [
+                {"Name": "BucketName", "Value": bucket["Name"]},
+                {"Name": "StorageType", "Value": "StandardStorage"},
+            ],
+        })
+    # Cap at 10 buckets — sorted by name for consistency
+    results.sort(key=lambda x: x["name"])
+    return results[:10]
 
 
 def _fetch_cost_driver_metrics(service_name: str, region: str) -> str | None:
@@ -698,10 +983,37 @@ def _format_metric_value(metric_name: str, value: float) -> str:
         return f"{value:.2f}"
 
 
+def _compute_stddev(values: list[float]) -> float:
+    """Compute population standard deviation."""
+    if len(values) < 2:
+        return 0.0
+    mean = sum(values) / len(values)
+    variance = sum((v - mean) ** 2 for v in values) / len(values)
+    return math.sqrt(variance)
+
+
+def _same_weekday_avg(daily_totals: dict, dates_sorted: list[str], target_date: str) -> float | None:
+    """Compute average cost for the same weekday as target_date over baseline period."""
+    from datetime import date as date_cls
+    target_dow = date_cls.fromisoformat(target_date).weekday()
+    # Use baseline dates (exclude last 2 days)
+    baseline = dates_sorted[:-2] if len(dates_sorted) > 2 else dates_sorted
+    same_day_costs = [
+        daily_totals[d] for d in baseline
+        if date_cls.fromisoformat(d).weekday() == target_dow and d in daily_totals
+    ]
+    if len(same_day_costs) >= 2:
+        return sum(same_day_costs) / len(same_day_costs)
+    return None
+
+
 def _format_cost_tables(data: dict, threshold: float) -> tuple[str, list[dict], list[str]]:
     """
     Format cost data as markdown tables for LLM analysis.
     Returns (markdown_text, list_of_anomaly_dicts, list_of_anomaly_strings).
+
+    Anomaly detection uses z-score (> mean + 2*stddev), gradual creep (5 consecutive
+    days above avg), and weekday/weekend awareness.
 
     Each anomaly dict: {type: "daily"|"service", name, cost, avg, pct_change}
     """
@@ -709,6 +1021,11 @@ def _format_cost_tables(data: dict, threshold: float) -> tuple[str, list[dict], 
     avg = data["baseline_avg"]
     anomalies = []        # structured
     anomaly_strs = []     # human-readable
+
+    # Compute stddev over baseline period for z-score detection
+    baseline_dates = data["dates_sorted"][5:-2] if len(data["dates_sorted"]) > 7 else data["dates_sorted"][:-2] if len(data["dates_sorted"]) > 2 else data["dates_sorted"]
+    baseline_values = [daily[d] for d in baseline_dates if d in daily]
+    daily_stddev = _compute_stddev(baseline_values)
 
     # Latest day = yesterday (CE data has ~24h delay), day before = the one before that
     latest = data["dates_sorted"][-1]
@@ -718,43 +1035,76 @@ def _format_cost_tables(data: dict, threshold: float) -> tuple[str, list[dict], 
     dod_change = latest_total - day_before_total
     dod_pct = ((dod_change / day_before_total) * 100) if day_before_total > 0 else 0
 
+    # Weekday-aware average for latest day
+    weekday_avg = _same_weekday_avg(daily, data["dates_sorted"], latest)
+
     # Header with yesterday's date and day-over-day summary
     lines = [f"## AWS Cost Report — {latest} (latest available data)\n"]
     lines.append(f"**Yesterday ({latest}):** ${latest_total:.2f}")
     if day_before:
         lines.append(f"**Day before ({day_before}):** ${day_before_total:.2f}")
         lines.append(f"**Day-over-day change:** {dod_change:+.2f} ({dod_pct:+.1f}%)")
-    lines.append(f"**Baseline avg:** ${avg:.2f}")
+    lines.append(f"**Baseline avg:** ${avg:.2f} (stddev: ${daily_stddev:.2f})")
+    if weekday_avg is not None:
+        from datetime import date as date_cls
+        day_name = date_cls.fromisoformat(latest).strftime("%A")
+        lines.append(f"**Same-weekday ({day_name}) avg:** ${weekday_avg:.2f}")
     lines.append("")
+
+    # Detect gradual creep: 5+ consecutive days above avg
+    last_5 = data["dates_sorted"][-5:] if len(data["dates_sorted"]) >= 5 else []
+    gradual_creep = all(daily.get(d, 0) > avg for d in last_5) if last_5 else False
+    if gradual_creep:
+        creep_excess = sum(daily[d] - avg for d in last_5)
+        lines.append(f"**WARNING: Gradual cost creep detected** — last 5 days ALL above avg (total excess: ${creep_excess:.2f})")
+        anomalies.append({
+            "type": "daily", "name": "gradual_creep_5d",
+            "cost": round(sum(daily[d] for d in last_5) / 5, 2),
+            "avg": avg, "pct_change": round((creep_excess / 5 / avg) * 100, 1) if avg > 0 else 0,
+        })
+        anomaly_strs.append(f"Gradual creep: 5 consecutive days above avg (excess ${creep_excess:.2f} total)")
+        lines.append("")
 
     # Daily totals table
     lines.append("### Daily Totals (last 7 days)")
-    lines.append("| Date       | Total ($) | Day-over-Day | vs Baseline Avg |")
-    lines.append("|------------|-----------|--------------|--------------|")
+    lines.append("| Date       | Total ($) | Day-over-Day | vs Baseline Avg | Z-score |")
+    lines.append("|------------|-----------|--------------|-----------------|---------|")
 
     prev_total = None
     for date in data["dates_sorted"][-7:]:
         total = daily[date]
         pct_avg = ((total - avg) / avg * 100) if avg > 0 else 0
+        z_score = ((total - avg) / daily_stddev) if daily_stddev > 0 else 0
         if prev_total is not None:
             dod = total - prev_total
             dod_p = ((dod / prev_total) * 100) if prev_total > 0 else 0
             dod_str = f"{dod_p:+.1f}%"
         else:
             dod_str = "—"
-        flag = " <-- ANOMALY" if pct_avg > threshold * 100 else ""
-        if pct_avg > threshold * 100:
+        # Z-score anomaly: > mean + 2*stddev (or fall back to threshold % if stddev is tiny)
+        is_zscore_anomaly = z_score > 2.0 and daily_stddev > 0
+        is_threshold_anomaly = pct_avg > threshold * 100
+        is_anomaly = is_zscore_anomaly or is_threshold_anomaly
+        flag = " <-- ANOMALY" if is_anomaly else ""
+        if is_anomaly:
+            reason = f"z={z_score:.1f}" if is_zscore_anomaly else f">{threshold*100:.0f}%"
             anomalies.append({
                 "type": "daily", "name": date, "cost": total,
-                "avg": avg, "pct_change": round(pct_avg, 1),
+                "avg": avg, "pct_change": round(pct_avg, 1), "z_score": round(z_score, 1),
             })
-            anomaly_strs.append(f"{date}: Total ${total:.2f} exceeds Baseline avg ${avg:.2f} by {pct_avg:.1f}%")
-        lines.append(f"| {date} | {total:.2f} | {dod_str} | {pct_avg:+.1f}% |{flag}")
+            anomaly_strs.append(f"{date}: Total ${total:.2f} vs avg ${avg:.2f} ({pct_avg:+.1f}%, {reason})")
+        lines.append(f"| {date} | {total:.2f} | {dod_str} | {pct_avg:+.1f}% | {z_score:+.1f} |{flag}")
         prev_total = total
 
     # Top services — yesterday vs day-before + Baseline avg
     svc_costs = data["service_costs"]
     svc_avgs = data["service_avgs"]
+
+    # Compute per-service stddev for z-score anomaly detection
+    svc_stddevs = {}
+    for svc, date_costs in svc_costs.items():
+        svc_baseline = [date_costs.get(d, 0) for d in baseline_dates]
+        svc_stddevs[svc] = _compute_stddev(svc_baseline)
 
     svc_yesterday = []
     for svc, date_costs in svc_costs.items():
@@ -764,27 +1114,62 @@ def _format_cost_tables(data: dict, threshold: float) -> tuple[str, list[dict], 
     svc_yesterday.sort(key=lambda x: -x[1])
 
     lines.append(f"\n### Top Services — {latest} vs {day_before or 'N/A'}")
-    lines.append("| Service | Yesterday ($) | Day Before ($) | Day-over-Day | Baseline Avg ($) | vs Avg |")
-    lines.append("|---------|---------------|----------------|--------------|---------------|--------|")
+    lines.append("| Service | Yesterday ($) | Day Before ($) | Day-over-Day | Baseline Avg ($) | vs Avg | Z-score |")
+    lines.append("|---------|---------------|----------------|--------------|---------------|--------|---------|")
 
     for svc, cost in svc_yesterday[:15]:
         svc_avg = svc_avgs.get(svc, 0)
+        svc_sd = svc_stddevs.get(svc, 0)
         pct_avg = ((cost - svc_avg) / svc_avg * 100) if svc_avg > 0 else 0
+        z_score = ((cost - svc_avg) / svc_sd) if svc_sd > 0 else 0
         dollar_diff = cost - svc_avg
         # Day-before cost for this service
         db_cost = svc_costs.get(svc, {}).get(day_before, 0) if day_before else 0
         dod_svc = ((cost - db_cost) / db_cost * 100) if db_cost > 0 else 0
         dod_dollar = cost - db_cost
 
-        flag = " <-- ANOMALY" if pct_avg > threshold * 100 and cost >= 1.0 else ""
-        if pct_avg > threshold * 100 and cost >= 1.0:
+        # Z-score or threshold anomaly, minimum $1 cost
+        is_zscore_anomaly = z_score > 2.0 and svc_sd > 0
+        is_threshold_anomaly = pct_avg > threshold * 100
+        is_anomaly = (is_zscore_anomaly or is_threshold_anomaly) and cost >= 1.0
+        flag = " <-- ANOMALY" if is_anomaly else ""
+        if is_anomaly:
+            reason = f"z={z_score:.1f}" if is_zscore_anomaly else f">{threshold*100:.0f}%"
             anomalies.append({
                 "type": "service", "name": svc, "cost": round(cost, 2),
                 "avg": round(svc_avg, 2), "pct_change": round(pct_avg, 1),
-                "dollar_increase": round(dollar_diff, 2),
+                "dollar_increase": round(dollar_diff, 2), "z_score": round(z_score, 1),
             })
-            anomaly_strs.append(f"{svc}: ${cost:.2f} vs avg ${svc_avg:.2f} ({pct_avg:+.1f}%, +${dollar_diff:.2f})")
-        lines.append(f"| {svc} | {cost:.2f} | {db_cost:.2f} | {dod_svc:+.1f}% ({dod_dollar:+.2f}) | {svc_avg:.2f} | {pct_avg:+.1f}% |{flag}")
+            anomaly_strs.append(f"{svc}: ${cost:.2f} vs avg ${svc_avg:.2f} ({pct_avg:+.1f}%, +${dollar_diff:.2f}, {reason})")
+        lines.append(f"| {svc} | {cost:.2f} | {db_cost:.2f} | {dod_svc:+.1f}% ({dod_dollar:+.2f}) | {svc_avg:.2f} | {pct_avg:+.1f}% | {z_score:+.1f} |{flag}")
+
+    # Per-service gradual creep: 5 consecutive days above avg = warning
+    if len(data["dates_sorted"]) >= 5:
+        creep_services = []
+        for svc, date_costs in svc_costs.items():
+            svc_avg = svc_avgs.get(svc, 0)
+            if svc_avg < 1.0:
+                continue
+            last_5_dates = data["dates_sorted"][-5:]
+            if all(date_costs.get(d, 0) > svc_avg for d in last_5_dates):
+                excess = sum(date_costs.get(d, 0) - svc_avg for d in last_5_dates)
+                # Only flag if not already caught as a spike anomaly
+                already_flagged = any(a.get("name") == svc for a in anomalies)
+                if not already_flagged and excess > 1.0:
+                    creep_services.append((svc, svc_avg, excess))
+        if creep_services:
+            lines.append("\n### Gradual Creep Warning — Services Trending Up")
+            lines.append("_5 consecutive days above baseline avg — no single-day spike but costs drifting up._\n")
+            for svc, svc_avg, excess in sorted(creep_services, key=lambda x: -x[2]):
+                lines.append(f"- **{svc}**: avg ${svc_avg:.2f}/day, last 5 days all above avg (excess ${excess:.2f} total)")
+                anomalies.append({
+                    "type": "service", "name": svc, "cost": round(svc_costs[svc].get(latest, 0), 2),
+                    "avg": round(svc_avg, 2),
+                    "pct_change": round((excess / 5 / svc_avg) * 100, 1) if svc_avg > 0 else 0,
+                    "dollar_increase": round(excess / 5, 2),
+                    "gradual_creep": True,
+                })
+                anomaly_strs.append(f"{svc}: Gradual creep — 5 days above avg ${svc_avg:.2f} (excess ${excess:.2f})")
 
     # Cost composition — % of total spend
     total_latest = daily.get(latest, 1)
@@ -884,40 +1269,46 @@ def _analyze_costs(tables_md: str, anomalies: list[dict], anomaly_strs: list[str
             "## Month Outlook\n<projected month total from forecast, whether on track vs last month>\n"
         )
     else:
-        # Anomalies found — deep analysis with 3 layers of data
+        # Anomalies found — deep analysis with 7 layers of data
         anomaly_detail = "\n".join(f"- {a}" for a in anomaly_strs)
         prompt = (
             f"{tables_md}\n\n"
             f"**{len(anomalies)} cost anomalies detected:**\n{anomaly_detail}\n\n"
-            "You have 4 layers of data above for each anomalous service. Use ALL of them — do NOT guess:\n"
+            "You have up to 7 layers of data above. Use ALL available layers — do NOT guess:\n"
             "- **Usage Type Breakdown**: WHAT resource types changed (instance sizes, storage, data transfer)\n"
             "- **Operation Breakdown**: WHAT actions/events are generating charges\n"
             "- **CloudWatch Metrics**: The ACTUAL operational metrics driving the cost (request counts, connections, bytes, IOPS)\n"
+            "- **Instance Type Breakdown**: Whether NEW instance types appeared or existing ones changed size\n"
+            "- **Data Transfer Breakdown**: Cross-AZ, internet egress, NAT Gateway — often the #1 surprise\n"
+            "- **Purchase Type Breakdown**: RI/Savings Plan coverage — did on-demand % increase?\n"
             "- **Month Forecast**: WHERE spending is heading if this continues\n\n"
-            "For EACH anomalous service, connect all 4 layers to tell the full story:\n"
+            "For EACH anomalous service, connect all available layers to tell the full story:\n"
             "1. **What increased in billing**: Cite exact usage types + operations with dollar amounts\n"
             "2. **What caused it operationally**: Use the CloudWatch metrics to explain WHY billing changed. "
             "Examples:\n"
             "   - 'ALB cost +$8/day: LCUUsage increased because RequestCount went from 1.2M to 1.8M/day (+50%), "
             "and ProcessedBytes went from 15GB to 22GB (+47%). This indicates a traffic increase to the cluster.'\n"
-            "   - 'RDS cost +$12/day: A new db.r6g.2xlarge instance appeared (USAGE_TYPE), confirmed by "
-            "CreateDBInstance operation. DatabaseConnections on existing instances also rose from 450 to 620 (+38%), "
+            "   - 'RDS cost +$12/day: A new db.r6g.2xlarge instance appeared in INSTANCE_TYPE breakdown (was $0 baseline), "
+            "confirmed by CreateDBInstance operation. DatabaseConnections on existing instances also rose from 450 to 620 (+38%), "
             "suggesting the new instance was added to handle connection pressure.'\n"
             "   - 'NAT Gateway cost +$5/day: BytesOutToDestination increased from 8GB to 14GB (+75%). "
-            "This means more traffic is flowing through NAT — likely a service making more external API calls.'\n"
+            "Data Transfer Breakdown confirms NatGateway-Bytes charges increased by $3.20/day.'\n"
+            "   - 'On-demand % went from 62% to 71% — a Savings Plan may have expired, causing $X/day more on-demand spend.'\n"
             "3. **Dollar impact**: Daily + projected monthly from forecast data\n"
             "4. **Is this expected?**: Based on the metrics, is this a traffic growth (normal), "
-            "a new resource (needs review), or a potential waste (needs immediate action)?\n"
+            "a new resource (needs review), RI/SP expiry (needs renewal), or a potential waste (needs immediate action)?\n"
             "5. **Action to take**: Specific steps tied to what the data shows\n\n"
             "Format your response as:\n"
             "## Summary\n<2-3 sentences: what spiked, the operational reason why, projected monthly impact>\n\n"
             "## Anomaly Breakdown\n"
             "<For each anomalous service: ### Service Name, then:\n"
-            "**Billing change**: what usage types/operations changed\n"
-            "**Root cause**: CloudWatch metrics that explain the billing change\n"
+            "**Billing change**: what usage types/operations/instance types changed\n"
+            "**Root cause**: CloudWatch metrics + data transfer + purchase type that explain the billing change\n"
             "**Impact**: daily + monthly cost\n"
-            "**Assessment**: expected growth vs waste vs needs investigation\n"
+            "**Assessment**: expected growth vs waste vs RI/SP expiry vs needs investigation\n"
             "**Action**: specific next steps>\n\n"
+            "## Data Transfer Analysis\n<If data transfer costs are significant, analyze the breakdown>\n\n"
+            "## RI/Savings Plan Coverage\n<If on-demand % changed, explain the impact and recommend action>\n\n"
             "## Month Forecast\n<projected total, sustainability assessment>\n\n"
             "## Recommendations\n<prioritized actionable items with expected savings>\n"
         )
@@ -1002,75 +1393,103 @@ def _generate_and_post_inner(config, force: bool = True, channel: str | None = N
         log.info("Cost reporter: no anomalies detected — skipping Slack post")
         return
 
-    # 4. For anomalous services, drill down with USAGE_TYPE + OPERATION breakdowns
+    # 4-7. Parallel drilldowns: USAGE_TYPE, OPERATION, CloudWatch, instance types
+    #       per anomalous service + global fetches (hourly, forecast, data transfer, purchase type)
     anomalous_services = [a["name"] for a in anomalies if a["type"] == "service"]
     usage_breakdowns = {}
     operation_breakdowns = {}
-
-    for svc in anomalous_services:
-        short_name = svc.replace("Amazon ", "").replace("AWS ", "")[:30]
-        _status(f"⚙ `ce:USAGE_TYPE({short_name})`")
-        try:
-            breakdown = _fetch_usage_breakdown(svc, region=cr["region"])
-            if breakdown:
-                usage_breakdowns[svc] = breakdown
-                _status(f"⚙ `ce:USAGE_TYPE({short_name})`  ✓ {len(breakdown)} types")
-        except Exception as e:
-            _status(f"⚙ `ce:USAGE_TYPE({short_name})`  ✗")
-            log.warning(f"Failed to fetch usage breakdown for {svc}: {e}")
-
-        _status(f"⚙ `ce:OPERATION({short_name})`")
-        try:
-            ops = _fetch_operation_breakdown(svc, region=cr["region"])
-            if ops:
-                operation_breakdowns[svc] = ops
-                _status(f"⚙ `ce:OPERATION({short_name})`  ✓ {len(ops)} ops")
-        except Exception as e:
-            _status(f"⚙ `ce:OPERATION({short_name})`  ✗")
-            log.warning(f"Failed to fetch operation breakdown for {svc}: {e}")
-
-    # 5. Fetch CloudWatch metrics
     cloudwatch_drivers = {}
-    for svc in anomalous_services:
-        short_name = svc.replace("Amazon ", "").replace("AWS ", "")[:30]
-        _status(f"⚙ `cloudwatch:metrics({short_name})`")
-        try:
-            metrics_md = _fetch_cost_driver_metrics(svc, region=cr["region"])
-            if metrics_md:
-                cloudwatch_drivers[svc] = metrics_md
-                _status(f"⚙ `cloudwatch:metrics({short_name})`  ✓")
-            else:
-                _status(f"⚙ `cloudwatch:metrics({short_name})`  — no data")
-        except Exception as e:
-            _status(f"⚙ `cloudwatch:metrics({short_name})`  ✗")
-            log.warning(f"Failed to fetch CloudWatch drivers for {svc}: {e}")
-
-    # 6. Fetch hourly today vs yesterday comparison
-    _status("⚙ `ce:GetCostAndUsage(HOURLY, today vs yesterday)`")
+    instance_breakdowns = {}
     hourly = None
-    try:
-        hourly = _fetch_hourly_comparison(region=cr["region"])
-        if hourly:
-            complete = "complete" if hourly["today_complete"] else f"partial ({hourly['today_hours']}h)"
-            _status(f"⚙ `ce:HOURLY`  ✓ today={complete}, ${hourly['today_total_so_far']:.0f} so far")
-    except Exception as e:
-        _status("⚙ `ce:HOURLY`  ✗")
-        log.warning(f"Hourly comparison failed: {e}")
-
-    # 7. Fetch month-end cost forecast
-    _status("⚙ `ce:GetCostForecast`")
     forecast = None
-    try:
-        forecast = _fetch_cost_forecast(region=cr["region"])
-        if forecast:
-            _status(f"⚙ `ce:GetCostForecast`  ✓ ${forecast['forecast_remaining']:.0f} remaining")
-        else:
-            _status("⚙ `ce:GetCostForecast`  — end of month")
-    except Exception as e:
-        _status("⚙ `ce:GetCostForecast`  ✗")
-        log.warning(f"Cost forecast failed: {e}")
+    data_transfer = []
+    purchase_types = {}
 
-    # 6. Build enriched context for LLM
+    _status(f"⚙ `Parallel drilldowns — {len(anomalous_services)} anomalous services + 4 global fetches`")
+
+    # Wrapper functions that return (key, type, result) for identification
+    def _fetch_usage(svc):
+        return ("usage", svc, _fetch_usage_breakdown(svc, region=cr["region"]))
+
+    def _fetch_ops(svc):
+        return ("operation", svc, _fetch_operation_breakdown(svc, region=cr["region"]))
+
+    def _fetch_cw(svc):
+        return ("cloudwatch", svc, _fetch_cost_driver_metrics(svc, region=cr["region"]))
+
+    def _fetch_inst(svc):
+        return ("instance", svc, _fetch_instance_type_breakdown(svc, region=cr["region"]))
+
+    def _fetch_hourly_wrap():
+        return ("hourly", None, _fetch_hourly_comparison(region=cr["region"]))
+
+    def _fetch_forecast_wrap():
+        return ("forecast", None, _fetch_cost_forecast(region=cr["region"]))
+
+    def _fetch_dt_wrap():
+        return ("data_transfer", None, _fetch_data_transfer_breakdown(region=cr["region"]))
+
+    def _fetch_pt_wrap():
+        return ("purchase_type", None, _fetch_purchase_type_breakdown(region=cr["region"]))
+
+    # Build task list: per-service drilldowns + global fetches
+    tasks = []
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        # Per-service drilldowns
+        for svc in anomalous_services:
+            tasks.append(pool.submit(_fetch_usage, svc))
+            tasks.append(pool.submit(_fetch_ops, svc))
+            tasks.append(pool.submit(_fetch_cw, svc))
+            tasks.append(pool.submit(_fetch_inst, svc))
+
+        # Global fetches (always run)
+        tasks.append(pool.submit(_fetch_hourly_wrap))
+        tasks.append(pool.submit(_fetch_forecast_wrap))
+        tasks.append(pool.submit(_fetch_dt_wrap))
+        tasks.append(pool.submit(_fetch_pt_wrap))
+
+        for future in as_completed(tasks):
+            try:
+                kind, svc, result = future.result()
+                if kind == "usage" and result:
+                    usage_breakdowns[svc] = result
+                    short = svc.replace("Amazon ", "").replace("AWS ", "")[:30]
+                    _status(f"⚙ `ce:USAGE_TYPE({short})`  ✓ {len(result)} types")
+                elif kind == "operation" and result:
+                    operation_breakdowns[svc] = result
+                    short = svc.replace("Amazon ", "").replace("AWS ", "")[:30]
+                    _status(f"⚙ `ce:OPERATION({short})`  ✓ {len(result)} ops")
+                elif kind == "cloudwatch" and result:
+                    cloudwatch_drivers[svc] = result
+                    short = svc.replace("Amazon ", "").replace("AWS ", "")[:30]
+                    _status(f"⚙ `cloudwatch:metrics({short})`  ✓")
+                elif kind == "instance" and result:
+                    instance_breakdowns[svc] = result
+                    short = svc.replace("Amazon ", "").replace("AWS ", "")[:30]
+                    _status(f"⚙ `ce:INSTANCE_TYPE({short})`  ✓ {len(result)} types")
+                elif kind == "hourly":
+                    hourly = result
+                    if hourly:
+                        complete = "complete" if hourly["today_complete"] else f"partial ({hourly['today_hours']}h)"
+                        _status(f"⚙ `ce:HOURLY`  ✓ today={complete}, ${hourly['today_total_so_far']:.0f} so far")
+                elif kind == "forecast":
+                    forecast = result
+                    if forecast:
+                        _status(f"⚙ `ce:GetCostForecast`  ✓ ${forecast['forecast_remaining']:.0f} remaining")
+                    else:
+                        _status("⚙ `ce:GetCostForecast`  — end of month")
+                elif kind == "data_transfer":
+                    data_transfer = result or []
+                    if data_transfer:
+                        _status(f"⚙ `ce:DATA_TRANSFER`  ✓ {len(data_transfer)} types")
+                elif kind == "purchase_type":
+                    purchase_types = result or {}
+                    if purchase_types.get("purchase_types"):
+                        _status(f"⚙ `ce:PURCHASE_TYPE`  ✓ {len(purchase_types['purchase_types'])} types")
+            except Exception as e:
+                log.warning(f"Parallel drilldown task failed: {e}")
+
+    # 5. Build enriched context for LLM
     if usage_breakdowns:
         tables_md += "\n\n## Usage Type Breakdown — What Resource Types Are Driving the Spike\n"
         for svc, breakdown in usage_breakdowns.items():
@@ -1122,6 +1541,71 @@ def _generate_and_post_inner(config, force: bool = True, channel: str | None = N
         )
         for svc, metrics_md in cloudwatch_drivers.items():
             tables_md += f"\n### {svc}\n{metrics_md}\n"
+
+    if instance_breakdowns:
+        tables_md += "\n\n## Instance Type Breakdown — New or Changed Instances\n"
+        tables_md += (
+            "_Shows if new instance types appeared or existing ones changed size. "
+            "NEW INSTANCE = this type had $0 cost in baseline period._\n"
+        )
+        for svc, breakdown in instance_breakdowns.items():
+            tables_md += f"\n### {svc}\n"
+            tables_md += "| Instance Type | Yesterday ($) | Baseline Avg ($) | $ Change | % Change | Flag |\n"
+            tables_md += "|---------------|---------------|---------------|----------|----------|------|\n"
+            for item in breakdown:
+                tables_md += (
+                    f"| {item['instance_type']} | {item['yesterday_cost']:.2f} "
+                    f"| {item['avg_cost']:.2f} | {item['dollar_change']:+.2f} "
+                    f"| {item['pct_change']:+.1f}% | {item['flag']} |\n"
+                )
+
+    if data_transfer:
+        tables_md += "\n\n## Data Transfer Breakdown — Often the #1 Surprise Cost\n"
+        tables_md += (
+            "_Data transfer charges across all services. Includes inter-AZ, internet egress, "
+            "NAT Gateway processing, and cross-region transfer._\n"
+        )
+        tables_md += "| Usage Type | Yesterday ($) | Baseline Avg ($) | $ Change | % Change |\n"
+        tables_md += "|------------|---------------|---------------|----------|----------|\n"
+        total_dt_yesterday = 0.0
+        total_dt_avg = 0.0
+        for item in data_transfer:
+            flag = ""
+            if item["dollar_change"] > 0.50:
+                flag = " <-- INCREASE"
+            elif item["avg_cost"] == 0 and item["yesterday_cost"] > 0:
+                flag = " <-- NEW"
+            tables_md += (
+                f"| {item['usage_type']} | {item['yesterday_cost']:.2f} "
+                f"| {item['avg_cost']:.2f} | {item['dollar_change']:+.2f} "
+                f"| {item['pct_change']:+.1f}% |{flag}\n"
+            )
+            total_dt_yesterday += item["yesterday_cost"]
+            total_dt_avg += item["avg_cost"]
+        dt_total_change = total_dt_yesterday - total_dt_avg
+        tables_md += f"\n**Total data transfer: ${total_dt_yesterday:.2f}/day (avg ${total_dt_avg:.2f}, change {dt_total_change:+.2f})**\n"
+
+    if purchase_types and purchase_types.get("purchase_types"):
+        tables_md += "\n\n## Purchase Type Breakdown — RI/Savings Plan Coverage\n"
+        tables_md += (
+            "_Compares last 7 days vs prior 7 days by purchase type. "
+            "If on-demand % increased, RI/SP coverage may have dropped._\n"
+        )
+        tables_md += "| Purchase Type | Last 7d Avg ($) | Prior 7d Avg ($) | $ Change | % Change |\n"
+        tables_md += "|---------------|-----------------|------------------|----------|----------|\n"
+        for item in purchase_types["purchase_types"]:
+            tables_md += (
+                f"| {item['purchase_type']} | {item['last_7_avg']:.2f} "
+                f"| {item['prior_7_avg']:.2f} | {item['dollar_change']:+.2f} "
+                f"| {item['pct_change']:+.1f}% |\n"
+            )
+        tables_md += (
+            f"\n**On-demand % of spend: {purchase_types['last_7_on_demand_pct']:.1f}% "
+            f"(was {purchase_types['prior_7_on_demand_pct']:.1f}%)**"
+        )
+        if purchase_types["on_demand_pct_increased"]:
+            tables_md += " **<-- RI/SP COVERAGE DROP DETECTED**"
+        tables_md += "\n"
 
     if forecast:
         tables_md += (

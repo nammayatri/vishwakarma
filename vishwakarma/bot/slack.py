@@ -1324,6 +1324,7 @@ def _infer_category(alert_name: str, config=None, fact: str = "") -> str:
                 max_tokens=10,
                 temperature=0.0,
                 timeout=15,
+                extra_body={"chat_template_kwargs": {"enable_thinking": False, "thinking": False}},
             )
             cat = (resp.choices[0].message.content or "").strip().lower()
             cat = re.sub(r"[^a-z0-9_-]", "", cat)[:64]

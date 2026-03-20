@@ -27,7 +27,9 @@
                 "elasticloadbalancing:DescribeLoadBalancers",
                 "rds:DescribeDBInstances",
                 "elasticache:DescribeCacheClusters",
-                "ec2:DescribeNatGateways"
+                "ec2:DescribeNatGateways",
+                "s3:ListAllMyBuckets",
+                "s3:GetBucketLocation"
             ],
             "Resource": "*"
         }
