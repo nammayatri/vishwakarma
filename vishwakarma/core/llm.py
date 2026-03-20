@@ -107,16 +107,34 @@ class VishwakarmaLLM:
         if max_output:
             kwargs["max_tokens"] = int(max_output)
 
-        try:
-            response = completion(**kwargs)
-            return self._parse_response(response)
-        except litellm.exceptions.RateLimitError:
-            raise
-        except litellm.exceptions.AuthenticationError:
-            raise
-        except Exception as e:
-            log.error(f"LLM call failed: {e}", exc_info=True)
-            raise
+        # Use fallback chain: try main model first, then fallbacks
+        chain = self._get_main_chain()
+        if len(chain) > 1:
+            try:
+                response = self._call_with_fallback(
+                    models=chain,
+                    messages=messages,
+                    max_tokens=kwargs.get("max_tokens", self.cfg.max_tokens),
+                    temperature=self.cfg.temperature,
+                    timeout=90,  # 90s per model before trying next
+                    tools=tools,
+                    total_budget=self.cfg.timeout,  # total budget across all fallbacks
+                )
+                return self._parse_response(response)
+            except Exception as e:
+                log.error(f"LLM call failed (all fallbacks exhausted): {e}", exc_info=True)
+                raise
+        else:
+            try:
+                response = completion(**kwargs)
+                return self._parse_response(response)
+            except litellm.exceptions.RateLimitError:
+                raise
+            except litellm.exceptions.AuthenticationError:
+                raise
+            except Exception as e:
+                log.error(f"LLM call failed: {e}", exc_info=True)
+                raise
 
     def stream(
         self,
@@ -289,12 +307,17 @@ class VishwakarmaLLM:
                     kwargs["api_base"] = self.cfg.api_base
                 if tools:
                     kwargs["tools"] = tools
+                    kwargs["tool_choice"] = "auto"
                 # Disable reasoning for fast calls (summarize, compress)
                 # Works for GLM-5 (enable_thinking) and Kimi-K2.5 (thinking)
                 if not tools:
                     kwargs["extra_body"] = {
                         "chat_template_kwargs": {"enable_thinking": False, "thinking": False}
                     }
+                # Apply env var overrides (custom providers)
+                max_output = os.environ.get("OVERRIDE_MAX_OUTPUT_TOKEN")
+                if max_output:
+                    kwargs["max_tokens"] = int(max_output)
                 response = completion(**kwargs)
                 if i > 0:
                     log.info(f"Fallback to {model} succeeded (primary failed)")
