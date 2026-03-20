@@ -386,31 +386,30 @@ def start_bot(config: "VishwakarmaConfig") -> None:
             return
 
         # ── Determine: investigate or chat? ──
-        # 1. "debug X" → always investigate, no questions asked
+        # 1. "debug X" → always investigate, no questions asked — SKIP thread fetch for speed
         # 2. Thread reply → fetch thread context, use it to decide + enrich
         # 3. Auto-detect from keywords/patterns
         is_thread_reply = thread_ts and event.get("ts") != thread_ts
         thread_context = ""
         thread_text = ""
 
-        # Fetch thread context if we're in a thread
-        if is_thread_reply and client:
-            try:
-                thread_msgs = client.conversations_replies(
-                    channel=channel, ts=thread_ts, limit=30
-                )
-                messages_list = thread_msgs.get("messages", [])
-                thread_text = "\n".join(m.get("text", "")[:500] for m in messages_list)
-                # Also grab alarm context from parent message (CloudWatch alarms)
-                thread_context = _fetch_thread_alarm_context(client, channel, thread_ts)
-            except Exception as e:
-                log.debug(f"Thread fetch failed (non-fatal): {e}")
-
-        # Route: debug prefix = direct investigate
+        # Route: debug prefix = direct investigate (skip thread fetch for speed)
         is_investigation = question_lower.startswith("debug ")
         if is_investigation:
             question = question[len("debug "):].strip()
         else:
+            # Fetch thread context only for non-debug messages
+            if is_thread_reply and client:
+                try:
+                    thread_msgs = client.conversations_replies(
+                        channel=channel, ts=thread_ts, limit=30
+                    )
+                    messages_list = thread_msgs.get("messages", [])
+                    thread_text = "\n".join(m.get("text", "")[:500] for m in messages_list)
+                    # Also grab alarm context from parent message (CloudWatch alarms)
+                    thread_context = _fetch_thread_alarm_context(client, channel, thread_ts)
+                except Exception as e:
+                    log.debug(f"Thread fetch failed (non-fatal): {e}")
             # Auto-detect investigation intent
             is_investigation = _is_investigation_intent(question)
             # In a thread with investigation context: many messages that look like
