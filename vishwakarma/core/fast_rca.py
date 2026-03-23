@@ -323,30 +323,16 @@ def synthesize_fast_rca(llm, checks: dict, alert_name: str) -> dict:
     prompt = f"""{alert_name}.{threshold_line} Data: {checks_text}. Compare current vs yesterday_*. If within 20% of yesterday=normal, else=incident. Reply with ONLY this JSON, no explanation: {{"root_cause":"FILL: 1 sentence","confidence":"FILL: HIGH or MEDIUM or LOW","scenario":"FILL: H if normal else A-G","impact":"FILL: 1 sentence","suggested_fix":"FILL: 1 sentence","evidence_summary":"FILL: key numbers"}}"""
 
     try:
-        # Use fast_model for synthesis — faster and better at following JSON format
-        from litellm import completion as _completion
-        model = llm.cfg.fast_model or llm._get_main_chain()[0]
-        kwargs = {
-            "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 4096,
-            "temperature": 0.0,
-            "timeout": 60,
-            "stream": True,
-            "num_retries": 1,
-            # Disable reasoning so model returns clean JSON
-            "extra_body": {"chat_template_kwargs": {"enable_thinking": False, "thinking": False}},
-        }
-        if llm.cfg.api_key:
-            kwargs["api_key"] = llm.cfg.api_key
-        if llm.cfg.api_base:
-            kwargs["api_base"] = llm.cfg.api_base
-
-        raw = ""
-        for chunk in _completion(**kwargs):
-            delta = chunk.choices[0].delta.content or ""
-            raw += delta
-        raw = raw.strip()
+        # Use fast_model with fallback chain — non-streaming for compatibility with all models
+        response = llm._call_with_fallback(
+            models=llm._get_fast_chain(),
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=4096,
+            temperature=0.0,
+            timeout=60,
+            total_budget=90,
+        )
+        raw = (response.choices[0].message.content or "").strip()
         log.info(f"Fast RCA synthesis response: len={len(raw)}, preview={raw[:100]}")
         # Strip reasoning preamble and extract JSON — models often wrap JSON in text
         import re
