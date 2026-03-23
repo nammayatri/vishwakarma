@@ -225,6 +225,12 @@ class VishwakarmaConfig:
         self.port: int = int(_env("VK_PORT", str(srv.get("port", 5050))))
         self.max_steps: int = int(_env("VK_MAX_STEPS", str(raw.get("max_steps", 40))))
 
+        # Sub-agent parallel investigation (for broad alerts without runbooks)
+        self.sub_agents_enabled: bool = _env(
+            "VK_SUB_AGENTS_ENABLED",
+            str(raw.get("sub_agents_enabled", True)),
+        ).lower() in ("true", "1", "yes")
+
         # Slack bot
         slack = raw.get("slack", {})
         self.slack_bot_token: str | None = _env("SLACK_BOT_TOKEN", slack.get("bot_token"))
@@ -378,6 +384,7 @@ class VishwakarmaConfig:
             "host": self.host,
             "port": self.port,
             "max_steps": self.max_steps,
+            "sub_agents_enabled": self.sub_agents_enabled,
             "db_path": self.db_path,
             "slack": "configured" if self.is_slack_configured() else "not configured",
             "bash_rules": self.bash_rules.to_dict(),

@@ -49,6 +49,8 @@ INVESTIGATION_PHASES = """\
 - Mark all independent tasks as `in_progress` and execute them immediately in the same response
 - Update status `in_progress` → `completed` as each step finishes
 
+**PRE-FETCHED DATA:** If pre-fetched investigation data is provided, use it directly — do NOT re-run those commands. Start your investigation from where the pre-fetched data leaves off. These checks were already collected and their results are ready for analysis.
+
 **RUNBOOK TAKES PRECEDENCE:** If a runbook is provided, follow it. Do NOT default to generic Kubernetes RECON if the runbook says to start with AWS CLI or metrics.
 
 **HYPOTHESIS CHECKPOINT:** After completing the first 2 steps of any investigation, pause and state:

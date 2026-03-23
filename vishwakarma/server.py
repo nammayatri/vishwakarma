@@ -502,6 +502,16 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
                 "If your evidence contradicts it, explain why in your final RCA."
             )
 
+        # Inject fast RCA raw check data so LLM doesn't re-run these commands
+        if fast_checks_raw:
+            speculative_ctx = (
+                "## Pre-fetched Investigation Data (already collected — use directly, do NOT re-run these commands)\n\n"
+            )
+            for check_name, check_result in fast_checks_raw.items():
+                result_str = str(check_result)[:1500]
+                speculative_ctx += f"### {check_name}\n```\n{result_str}\n```\n\n"
+            extra_parts.append(speculative_ctx)
+
         extra_parts.append(
             "## Learned Knowledge\n"
             "Relevant facts from past incidents are pre-injected above (if any). "
@@ -677,6 +687,82 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
         except Exception as e:
             log.debug(f"Pattern check failed (non-fatal): {e}")
 
+        # ── Sub-agent parallel investigation for broad alerts ──
+        # When no runbook matched and sub-agents are enabled, spawn parallel
+        # domain-specific sub-agents to gather data before the main loop.
+        sub_agent_findings_text = None
+        if (not auto_resolved and not pattern_matched
+                and not matched_runbooks and config.sub_agents_enabled):
+            try:
+                from vishwakarma.core.sub_agents import run_sub_agents, select_domains, format_sub_agent_findings
+                from vishwakarma.core.tools import ToolExecutor
+
+                labels = issue.labels or {}
+                namespace = (
+                    labels.get("namespace")
+                    or labels.get("kubernetes_namespace")
+                    or labels.get("exported_namespace")
+                    or "atlas"
+                )
+                domains = select_domains(alert_name, labels)
+
+                if domains:
+                    log.info(f"Launching sub-agents for {alert_name}: {domains}")
+                    if slack_client and slack_channel_id and ack_ts:
+                        try:
+                            slack_client.chat_postMessage(
+                                channel=slack_channel_id, thread_ts=ack_ts,
+                                text=f":mag: Launching {len(domains)} parallel sub-agents: {', '.join(d.upper() for d in domains)}",
+                                blocks=[{"type": "context", "elements": [
+                                    {"type": "mrkdwn", "text": f":mag: _Launching {len(domains)} parallel sub-agents: {', '.join(d.upper() for d in domains)}_"}
+                                ]}],
+                            )
+                        except Exception:
+                            pass
+
+                    # Build a ToolExecutor from the toolset manager for sub-agents
+                    sub_executor = ToolExecutor(toolsets=tm.active_toolsets())
+
+                    findings = await loop.run_in_executor(
+                        None,
+                        lambda: run_sub_agents(
+                            alert_context=question,
+                            namespace=namespace,
+                            domains=domains,
+                            llm_config=config.llm,
+                            toolset_manager=sub_executor,
+                        ),
+                    )
+
+                    if findings:
+                        sub_agent_findings_text = format_sub_agent_findings(findings)
+                        log.info(f"Sub-agents returned {len(findings)} domain findings for {alert_name}")
+
+                        if slack_client and slack_channel_id and ack_ts:
+                            try:
+                                domain_statuses = []
+                                for domain, summary in findings.items():
+                                    # Extract STATUS line from findings
+                                    status = "unknown"
+                                    for line in summary.split("\n"):
+                                        if line.strip().upper().startswith("STATUS:"):
+                                            status = line.split(":", 1)[1].strip().lower()
+                                            break
+                                    emoji = ":white_check_mark:" if status == "healthy" else ":warning:" if status == "degraded" else ":x:" if status == "critical" else ":grey_question:"
+                                    domain_statuses.append(f"{emoji} *{domain.upper()}*: {status}")
+                                status_text = "\n".join(domain_statuses)
+                                slack_client.chat_postMessage(
+                                    channel=slack_channel_id, thread_ts=ack_ts,
+                                    text=f"Sub-agent results:\n{status_text}",
+                                    blocks=[{"type": "context", "elements": [
+                                        {"type": "mrkdwn", "text": f":brain: _Sub-agent parallel scan complete:_\n{status_text}"}
+                                    ]}],
+                                )
+                            except Exception:
+                                pass
+            except Exception as e:
+                log.warning(f"Sub-agent investigation failed (non-fatal, continuing with main investigation): {e}")
+
         # ── Streaming investigation with real-time Slack updates ──
         # Same style as the Slack "debug" path: small context blocks,
         # real-time tool call start/result, yellow status message.
@@ -715,6 +801,7 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
                 question=question,
                 runbooks=matched_runbooks or None,
                 extra_system_prompt=extra_system_prompt,
+                pre_investigation_findings=sub_agent_findings_text,
             ):
                 etype = event.get("type", "")
 

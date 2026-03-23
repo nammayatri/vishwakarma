@@ -143,7 +143,11 @@ class VishwakarmaLLM:
     ) -> Generator[dict, None, None]:
         """
         Stream LLM response events.
-        Yields dicts with type: text_delta | tool_call_delta | done
+        Yields dicts with type: text_delta | tool_call_complete | tool_calls | analysis_done
+
+        tool_call_complete is emitted as soon as an individual tool call's
+        arguments form valid JSON, allowing the caller to start execution
+        before the full LLM response is finished (streaming tool overlap).
         """
         kwargs: dict[str, Any] = {
             "model": self.cfg.model,
@@ -180,6 +184,7 @@ class VishwakarmaLLM:
 
         collected_content = ""
         collected_tool_calls: dict[int, dict] = {}
+        emitted_complete: set[int] = set()  # indices already yielded as tool_call_complete
 
         for chunk in response:
             delta = chunk.choices[0].delta if chunk.choices else None
@@ -207,7 +212,29 @@ class VishwakarmaLLM:
                         if tc.function.arguments:
                             collected_tool_calls[idx]["function"]["arguments"] += tc.function.arguments
 
-        # Emit complete tool calls
+                    # Early completion detection: if this tool call has a
+                    # name, an id, and its arguments parse as valid JSON,
+                    # emit it immediately so the engine can start execution
+                    # while the LLM is still generating.
+                    if idx not in emitted_complete:
+                        entry = collected_tool_calls[idx]
+                        fn = entry["function"]
+                        if fn["name"] and entry["id"] and fn["arguments"]:
+                            try:
+                                json.loads(fn["arguments"])
+                                # Valid JSON — this tool call is complete
+                                emitted_complete.add(idx)
+                                yield {
+                                    "type": "tool_call_complete",
+                                    "id": entry["id"],
+                                    "name": fn["name"],
+                                    "arguments": fn["arguments"],
+                                    "index": idx,
+                                }
+                            except (json.JSONDecodeError, ValueError):
+                                pass  # arguments still incomplete, keep accumulating
+
+        # Emit the final batch event (backward compatibility + catch-all)
         tool_calls = list(collected_tool_calls.values())
         if tool_calls:
             yield {"type": "tool_calls", "tool_calls": tool_calls, "content": collected_content}

@@ -41,6 +41,7 @@ log = logging.getLogger(__name__)
 
 DEFAULT_MAX_STEPS = 40
 CHECKPOINT_STEP = 20  # inject a reflection prompt at this step to force RCA-or-continue decision
+MAX_TOOL_OUTPUT = 8000  # chars — outputs above this get compressed via fast_model
 
 
 class InvestigationEngine:
@@ -65,6 +66,117 @@ class InvestigationEngine:
         self.all_toolsets = all_toolsets  # includes disabled ones — shown to LLM
         self.knowledge = knowledge        # site-specific knowledge base (from /data/knowledge.md)
 
+    def _compress_tool_outputs(
+        self, executed: dict[str, tuple[ToolOutput, str]]
+    ) -> dict[str, tuple[ToolOutput, str]]:
+        """
+        Batch-compress large tool outputs to save LLM calls.
+
+        - 0 large outputs → no-op
+        - 1 large output  → single summarize call (same as before)
+        - 2+ large outputs → ONE batched summarize call, parsed back per tool
+
+        Falls back to individual compression if batch parsing fails.
+        """
+        # Identify which outputs need compression
+        large: list[tuple[str, str]] = []  # (call_id, tool_name)
+        for cid, (output, content) in executed.items():
+            if len(content) > MAX_TOOL_OUTPUT:
+                large.append((cid, output.tool_name))
+
+        if not large:
+            return executed
+
+        # Single large output — direct summarize (no batching overhead)
+        if len(large) == 1:
+            cid, tool_name = large[0]
+            output, content = executed[cid]
+            compressed = self.llm.summarize(
+                f"You are helping investigate an infrastructure incident. "
+                f"Compress the following {tool_name} output to the 20 most relevant lines. "
+                f"Preserve: error messages, stack traces, anomalous values, lines that differ from baseline, "
+                f"the LAST 5 lines of the output (errors often appear at the end), and exact timestamps. "
+                f"Remove: repetitive healthy/normal entries only.\n\n"
+                f"{content}"
+            )
+            executed[cid] = (output, compressed)
+            return executed
+
+        # 2+ large outputs — batch into one LLM call
+        log.info(f"Batch-compressing {len(large)} large tool outputs in one LLM call")
+
+        batch_prompt = (
+            "You are helping investigate an infrastructure incident. "
+            "Compress each of the following tool outputs to the 20 most relevant lines each.\n"
+            "Preserve: error messages, stack traces, anomalous values, lines that differ from baseline, "
+            "the LAST 5 lines of each output (errors often appear at the end), and exact timestamps.\n"
+            "Remove: repetitive healthy/normal entries only.\n\n"
+            "Return compressed output for each tool, separated by '### Tool N:' headers "
+            "(matching the numbers below).\n\n"
+        )
+        for i, (cid, tool_name) in enumerate(large, 1):
+            _, content = executed[cid]
+            # Cap each tool's raw output to avoid blowing up the summarize prompt
+            batch_prompt += f"### Tool {i}: {tool_name}\n```\n{content[:12000]}\n```\n\n"
+
+        try:
+            batch_response = self.llm.summarize(batch_prompt)
+            parsed = self._parse_batch_compression(batch_response, len(large))
+
+            if parsed and len(parsed) == len(large):
+                for i, (cid, _) in enumerate(large):
+                    output, _ = executed[cid]
+                    executed[cid] = (output, parsed[i])
+                return executed
+            else:
+                log.warning(
+                    "Batch compression returned %d sections (expected %d) — "
+                    "falling back to individual compression",
+                    len(parsed) if parsed else 0, len(large),
+                )
+        except Exception as e:
+            log.warning(f"Batch compression failed: {e} — falling back to individual compression")
+
+        # Fallback: compress each individually
+        for cid, tool_name in large:
+            output, content = executed[cid]
+            compressed = self.llm.summarize(
+                f"You are helping investigate an infrastructure incident. "
+                f"Compress the following {tool_name} output to the 20 most relevant lines. "
+                f"Preserve: error messages, stack traces, anomalous values, lines that differ from baseline, "
+                f"the LAST 5 lines of the output (errors often appear at the end), and exact timestamps. "
+                f"Remove: repetitive healthy/normal entries only.\n\n"
+                f"{content}"
+            )
+            executed[cid] = (output, compressed)
+
+        return executed
+
+    @staticmethod
+    def _parse_batch_compression(response: str, expected: int) -> list[str] | None:
+        """
+        Parse a batched compression response into individual tool outputs.
+        Expects sections delimited by '### Tool N:' headers.
+        Returns a list of compressed strings, or None on parse failure.
+        """
+        import re
+        # Split on ### Tool N: headers (with optional tool name after the colon)
+        parts = re.split(r"###\s*Tool\s+\d+\s*:[^\n]*\n", response)
+        # First element is preamble (before first header) — discard it
+        sections = [p.strip() for p in parts[1:] if p.strip()]
+
+        if len(sections) != expected:
+            return None
+
+        # Strip code fences if the LLM wrapped its output in them
+        cleaned = []
+        for s in sections:
+            s = re.sub(r"^```[^\n]*\n?", "", s)
+            s = re.sub(r"\n?```\s*$", "", s)
+            cleaned.append(s.strip())
+
+        return cleaned
+
     def investigate(
         self,
         question: str,
@@ -80,6 +192,7 @@ class InvestigationEngine:
         sections_off: set[Section] | None = None,
         response_schema: dict | None = None,
         on_progress: Callable[[dict], None] | None = None,
+        pre_investigation_findings: str | None = None,
     ) -> LLMResult:
         """
         Run a full investigation and return the result.
@@ -87,6 +200,9 @@ class InvestigationEngine:
 
         on_progress: optional callback fired at investigation milestones.
           Events: step_start, tool_calls, compaction, checkpoint, hypothesis, complete.
+
+        pre_investigation_findings: optional text from sub-agent parallel investigation.
+          Injected as a user message before the main loop so the LLM starts with data.
         """
         start_time = time.time()
         guard = LoopGuard()
@@ -123,6 +239,15 @@ class InvestigationEngine:
             images=images,
             files=files,
         )
+
+        # Inject sub-agent findings before the main loop starts.
+        # This gives the main LLM a head start with parallel investigation data.
+        if pre_investigation_findings:
+            messages.append({
+                "role": "user",
+                "content": pre_investigation_findings,
+            })
+            log.info("Injected sub-agent pre-investigation findings into messages")
 
         tools = self.executor.openai_tools()
         _MAX_LLM_RETRIES = 3
@@ -277,8 +402,8 @@ class InvestigationEngine:
 
                 to_execute.append((call_id, tool_name, params))
 
-            # Execute approved tools in parallel
-            def _run_tool(call_id: str, tool_name: str, params: dict, tool_idx: int = 0) -> tuple[str, ToolOutput, str]:
+            # Execute approved tools in parallel (compression happens AFTER, in batch)
+            def _run_tool(call_id: str, tool_name: str, params: dict, tool_idx: int = 0) -> tuple[str, str, ToolOutput, str]:
                 # Describe the call briefly (first param value, truncated)
                 desc = next(iter(params.values()), "") if params else ""
                 desc = str(desc)[:60].replace("\n", " ")
@@ -292,17 +417,7 @@ class InvestigationEngine:
                     content = f"No data returned. Command: {output.invocation}"
                 else:
                     content = str(output.output) if output.output is not None else ""
-                # Compress large outputs to avoid wasting context window
-                if len(content) > 8000:
-                    content = self.llm.summarize(
-                        f"You are helping investigate an infrastructure incident. "
-                        f"Compress the following {tool_name} output to the 20 most relevant lines. "
-                        f"Preserve: error messages, stack traces, anomalous values, lines that differ from baseline, "
-                        f"the LAST 5 lines of the output (errors often appear at the end), and exact timestamps. "
-                        f"Remove: repetitive healthy/normal entries only.\n\n"
-                        f"{content}"
-                    )
-                return call_id, output, content
+                return call_id, tool_name, output, content
 
             executed: dict[str, tuple[ToolOutput, str]] = {}
             if to_execute:
@@ -313,8 +428,11 @@ class InvestigationEngine:
                         tool_call_counter += 1
                         futures[pool.submit(_run_tool, cid, tname, tparams, tool_call_counter)] = cid
                     for future in as_completed(futures):
-                        cid, output, content = future.result()
+                        cid, tname, output, content = future.result()
                         executed[cid] = (output, content)
+
+                # Batch-compress large tool outputs (saves LLM calls when multiple are large)
+                executed = self._compress_tool_outputs(executed)
 
             # Append messages in original tool-call order
             for tc in response.tool_calls:
@@ -384,10 +502,16 @@ class InvestigationEngine:
         approval_decisions: list[ApprovalDecision] | None = None,
         bash_always_allow: bool = False,
         bash_always_deny: bool = False,
+        pre_investigation_findings: str | None = None,
     ) -> Generator[dict, None, None]:
         """
         Stream investigation events as they happen.
         Yields dicts suitable for SSE streaming.
+
+        Uses streaming tool overlap: tools are dispatched for execution as
+        soon as their arguments are fully received from the LLM stream,
+        while the LLM continues generating remaining tool calls or text.
+        This reduces wall-clock time when the LLM emits multiple tool calls.
         """
         guard = LoopGuard()
         compactions = 0
@@ -410,176 +534,245 @@ class InvestigationEngine:
             images=images,
         )
 
+        # Inject sub-agent findings before the main loop starts.
+        if pre_investigation_findings:
+            messages.append({
+                "role": "user",
+                "content": pre_investigation_findings,
+            })
+            log.info("Injected sub-agent pre-investigation findings into streaming messages")
+
         tools = self.executor.openai_tools()
         _MAX_LLM_RETRIES = 3
 
         checkpoint_injected_stream = False
 
-        for step in range(self.max_steps):
-            # Checkpoint: at step 20, force the LLM to decide RCA-or-continue
-            if step == CHECKPOINT_STEP and not checkpoint_injected_stream:
-                checkpoint_injected_stream = True
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        f"**Investigation Checkpoint (step {step}):** "
-                        "You have gathered significant data. Pause and evaluate:\n"
-                        "1. What is your current best hypothesis for the root cause?\n"
-                        "2. Do you have enough evidence to write the final RCA now?\n"
-                        "   - If YES → write the complete RCA immediately (Root Cause / Confidence / Evidence Chain / Immediate Fix / Prevention).\n"
-                        "   - If NO → state in one sentence exactly what is still missing, then continue investigating.\n\n"
-                        "Be decisive. Do not re-run tools you have already run."
-                    ),
-                })
+        # Build approval prefixes once (used across all steps)
+        approved_stream_prefixes: set[str] = set()
+        if approval_decisions:
+            for d in approval_decisions:
+                for prefix in d.remember_prefix:
+                    approved_stream_prefixes.add(prefix)
 
-            messages, did_compact = compact_messages(messages, llm=self.llm)
-            if did_compact:
-                compactions += 1
-                guard.reset()  # Allow retries after compaction — history is gone
-                yield {"type": "compaction", "step": step}
+        def _check_tool_allowed(
+            call_id: str, tool_name: str, params: dict
+        ) -> tuple[bool, str | None]:
+            """
+            Run LoopGuard + bash/approval checks for a single tool call.
+            Returns (allowed, block_reason). block_reason is None if allowed.
+            """
+            allowed, reason = guard.is_allowed(tool_name, params, all_stream_tool_outputs)
+            if not allowed:
+                return False, reason
 
-            # Stream from LLM with retry — retries do NOT consume step budget
-            collected_content = ""
-            collected_tool_calls = []
-            llm_ok = False
-            for _attempt in range(_MAX_LLM_RETRIES):
+            if tool_name in ("bash", "run_command", "execute_command"):
+                cmd = params.get("command", "")
+                if bash_always_deny:
+                    return False, f"Bash command denied by policy: {cmd}"
+                if not bash_always_allow:
+                    auto_approved = any(cmd.startswith(p) for p in approved_stream_prefixes)
+                    if not auto_approved and require_approval:
+                        decision = decisions.get(call_id)
+                        if decision is None or not decision.approved:
+                            return False, f"Bash command requires approval: {cmd}"
+                        for prefix in decision.remember_prefix:
+                            approved_stream_prefixes.add(prefix)
+            elif require_approval:
+                decision = decisions.get(call_id)
+                if decision is None or not decision.approved:
+                    return False, f"Tool call requires approval: {tool_name}"
+
+            return True, None
+
+        def _run_stream_tool(call_id: str, tool_name: str, params: dict):
+            output = self.executor.execute(tool_name, params)
+            output.tool_call_id = call_id
+            output.params = params
+            if output.status == ToolStatus.ERROR:
+                content = f"Error: {output.error}\nCommand: {output.invocation}"
+            elif output.status == ToolStatus.NO_DATA:
+                content = f"No data. Command: {output.invocation}"
+            else:
+                content = str(output.output) if output.output is not None else ""
+            return call_id, tool_name, output, content
+
+        # Persistent executor for streaming tool overlap — tools start while
+        # the LLM is still generating subsequent tool calls or text.
+        overlap_pool = ThreadPoolExecutor(max_workers=16)
+
+        try:
+            for step in range(self.max_steps):
+                # Checkpoint: at step 20, force the LLM to decide RCA-or-continue
+                if step == CHECKPOINT_STEP and not checkpoint_injected_stream:
+                    checkpoint_injected_stream = True
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            f"**Investigation Checkpoint (step {step}):** "
+                            "You have gathered significant data. Pause and evaluate:\n"
+                            "1. What is your current best hypothesis for the root cause?\n"
+                            "2. Do you have enough evidence to write the final RCA now?\n"
+                            "   - If YES → write the complete RCA immediately (Root Cause / Confidence / Evidence Chain / Immediate Fix / Prevention).\n"
+                            "   - If NO → state in one sentence exactly what is still missing, then continue investigating.\n\n"
+                            "Be decisive. Do not re-run tools you have already run."
+                        ),
+                    })
+
+                messages, did_compact = compact_messages(messages, llm=self.llm)
+                if did_compact:
+                    compactions += 1
+                    guard.reset()  # Allow retries after compaction — history is gone
+                    yield {"type": "compaction", "step": step}
+
+                # Stream from LLM with retry — retries do NOT consume step budget
                 collected_content = ""
                 collected_tool_calls = []
-                try:
-                    for chunk in self.llm.stream(messages, tools=tools or None):
-                        chunk_type = chunk.get("type")
-                        yield chunk
+                # Overlap state: tools dispatched during streaming
+                overlap_futures: dict[str, Any] = {}     # call_id -> Future
+                overlap_dispatched: set[str] = set()      # call_ids already submitted
+                overlap_blocked: dict[str, str] = {}      # call_id -> block reason (from early check)
 
-                        if chunk_type == "text_delta":
-                            collected_content += chunk.get("content", "")
-                        elif chunk_type in ("tool_calls", "analysis_done"):
-                            collected_content = chunk.get("content", collected_content)
-                            collected_tool_calls = chunk.get("tool_calls", [])
-                    llm_ok = True
-                    break  # success
-                except Exception as llm_err:
-                    log.warning("LLM stream error on step %d (attempt %d/%d): %s",
-                                step, _attempt + 1, _MAX_LLM_RETRIES, llm_err)
-                    yield {"type": "status", "message": f"LLM error (attempt {_attempt + 1}/{_MAX_LLM_RETRIES}): {type(llm_err).__name__}"}
+                llm_ok = False
+                for _attempt in range(_MAX_LLM_RETRIES):
+                    collected_content = ""
+                    collected_tool_calls = []
+                    overlap_futures = {}
+                    overlap_dispatched = set()
+                    overlap_blocked = {}
+                    try:
+                        for chunk in self.llm.stream(messages, tools=tools or None):
+                            chunk_type = chunk.get("type")
 
-            if not llm_ok:
-                yield {"type": "done", "content": f"Investigation failed after {_MAX_LLM_RETRIES} LLM retries: {llm_err}", "messages": messages}
-                return
+                            if chunk_type == "tool_call_complete":
+                                # A tool call's arguments are fully received — start
+                                # execution immediately while stream continues
+                                tc_id = chunk["id"]
+                                tc_name = chunk["name"]
+                                try:
+                                    tc_params = json.loads(chunk["arguments"])
+                                except Exception:
+                                    tc_params = {}
 
-            if not collected_tool_calls:
-                # Append only the assistant message — user message is already in messages
-                # from build_messages() and must not be duplicated
-                messages.append({"role": "assistant", "content": collected_content})
-                yield {"type": "done", "content": collected_content, "messages": messages}
-                return
-
-            # Sanitise tool call arguments — the LLM may truncate JSON if it
-            # hits max_output_tokens mid-tool-call.  LiteLLM's Gemini fallback
-            # will crash if invalid JSON is stored in conversation history.
-            for tc in collected_tool_calls:
-                raw_args = tc.get("function", {}).get("arguments", "{}")
-                try:
-                    json.loads(raw_args)  # validate
-                except Exception:
-                    log.warning(
-                        "Truncated tool-call arguments for %s — replacing with {}",
-                        tc.get("function", {}).get("name", "?"),
-                    )
-                    tc["function"]["arguments"] = "{}"
-
-            # Add assistant turn
-            messages.append({
-                "role": "assistant",
-                "content": collected_content,
-                "tool_calls": collected_tool_calls,
-            })
-
-            # Execute tools — parallel if multiple calls
-            parsed: list[tuple[str, str, dict]] = []  # (call_id, tool_name, params)
-            stream_blocked: dict[str, str] = {}
-
-            approved_stream_prefixes: set[str] = set()
-            if approval_decisions:
-                for d in approval_decisions:
-                    for prefix in d.remember_prefix:
-                        approved_stream_prefixes.add(prefix)
-
-            for tc in collected_tool_calls:
-                tool_name = tc["function"]["name"]
-                try:
-                    params = json.loads(tc["function"]["arguments"])
-                except Exception:
-                    params = {}
-                call_id = tc["id"]
-
-                allowed, reason = guard.is_allowed(tool_name, params, all_stream_tool_outputs)
-                if not allowed:
-                    stream_blocked[call_id] = reason
-                    continue
-
-                # Bash allow/deny
-                if tool_name in ("bash", "run_command", "execute_command"):
-                    cmd = params.get("command", "")
-                    if bash_always_deny:
-                        stream_blocked[call_id] = f"Bash command denied by policy: {cmd}"
-                        continue
-                    if not bash_always_allow:
-                        auto_approved = any(cmd.startswith(p) for p in approved_stream_prefixes)
-                        if not auto_approved and require_approval:
-                            decision = decisions.get(call_id)
-                            if decision is None or not decision.approved:
-                                stream_blocked[call_id] = f"Bash command requires approval: {cmd}"
+                                allowed, block_reason = _check_tool_allowed(tc_id, tc_name, tc_params)
+                                if not allowed:
+                                    overlap_blocked[tc_id] = block_reason
+                                    log.debug("Overlap: blocked %s (%s) — %s", tc_name, tc_id, block_reason)
+                                else:
+                                    tool_call_counter += 1
+                                    desc = next(iter(tc_params.values()), "") if tc_params else ""
+                                    desc = str(desc)[:60].replace("\n", " ")
+                                    log.info(f"Overlap: starting tool #{tool_call_counter} [bold]{tc_name}[/bold]: {desc}")
+                                    overlap_dispatched.add(tc_id)
+                                    future = overlap_pool.submit(_run_stream_tool, tc_id, tc_name, tc_params)
+                                    overlap_futures[tc_id] = future
+                                    yield {"type": "tool_started", "tool": tc_name, "params": tc_params, "overlap": True}
+                                # Don't forward tool_call_complete to caller — it's internal
                                 continue
-                            for prefix in decision.remember_prefix:
-                                approved_stream_prefixes.add(prefix)
-                elif require_approval:
-                    decision = decisions.get(call_id)
-                    if decision is None or not decision.approved:
-                        stream_blocked[call_id] = f"Tool call requires approval: {tool_name}"
+
+                            # Forward other events to the caller
+                            yield chunk
+
+                            if chunk_type == "text_delta":
+                                collected_content += chunk.get("content", "")
+                            elif chunk_type in ("tool_calls", "analysis_done"):
+                                collected_content = chunk.get("content", collected_content)
+                                collected_tool_calls = chunk.get("tool_calls", [])
+
+                        llm_ok = True
+                        break  # success
+                    except Exception as llm_err:
+                        # Cancel any overlap futures from this failed attempt
+                        for f in overlap_futures.values():
+                            f.cancel()
+                        overlap_futures.clear()
+                        overlap_dispatched.clear()
+                        overlap_blocked.clear()
+                        log.warning("LLM stream error on step %d (attempt %d/%d): %s",
+                                    step, _attempt + 1, _MAX_LLM_RETRIES, llm_err)
+                        yield {"type": "status", "message": f"LLM error (attempt {_attempt + 1}/{_MAX_LLM_RETRIES}): {type(llm_err).__name__}"}
+
+                if not llm_ok:
+                    yield {"type": "done", "content": f"Investigation failed after {_MAX_LLM_RETRIES} LLM retries: {llm_err}", "messages": messages}
+                    return
+
+                if not collected_tool_calls:
+                    # No tool calls — LLM is done. Cancel any stray overlap futures
+                    # (shouldn't happen, but defensive).
+                    for f in overlap_futures.values():
+                        f.cancel()
+                    messages.append({"role": "assistant", "content": collected_content})
+                    yield {"type": "done", "content": collected_content, "messages": messages}
+                    return
+
+                # Sanitise tool call arguments — the LLM may truncate JSON if it
+                # hits max_output_tokens mid-tool-call.  LiteLLM's Gemini fallback
+                # will crash if invalid JSON is stored in conversation history.
+                for tc in collected_tool_calls:
+                    raw_args = tc.get("function", {}).get("arguments", "{}")
+                    try:
+                        json.loads(raw_args)  # validate
+                    except Exception:
+                        log.warning(
+                            "Truncated tool-call arguments for %s — replacing with {}",
+                            tc.get("function", {}).get("name", "?"),
+                        )
+                        tc["function"]["arguments"] = "{}"
+
+                # Add assistant turn
+                messages.append({
+                    "role": "assistant",
+                    "content": collected_content,
+                    "tool_calls": collected_tool_calls,
+                })
+
+                # Dispatch any tool calls that weren't started during overlap
+                # (e.g., arguments were incomplete at stream time, or tool_call_complete
+                # event wasn't emitted for some provider reason).
+                stream_blocked: dict[str, str] = dict(overlap_blocked)  # start with overlap blocks
+                n_early = len(overlap_dispatched)  # count before fallback adds more
+
+                for tc in collected_tool_calls:
+                    tool_name = tc["function"]["name"]
+                    try:
+                        params = json.loads(tc["function"]["arguments"])
+                    except Exception:
+                        params = {}
+                    call_id = tc["id"]
+
+                    # Skip if already dispatched or already blocked during overlap
+                    if call_id in overlap_dispatched or call_id in overlap_blocked:
                         continue
 
-                parsed.append((call_id, tool_name, params))
+                    # Fallback: run safety checks and dispatch now
+                    allowed, block_reason = _check_tool_allowed(call_id, tool_name, params)
+                    if not allowed:
+                        stream_blocked[call_id] = block_reason
+                        continue
 
-            # Log tool count and emit start events
-            log.info(f"The AI requested {len(parsed)} tool call(s).")
-            for call_id, tool_name, params in parsed:
-                tool_call_counter += 1
-                desc = next(iter(params.values()), "") if params else ""
-                desc = str(desc)[:60].replace("\n", " ")
-                log.info(f"Running tool #{tool_call_counter} [bold]{tool_name}[/bold]: {desc}")
-                yield {"type": "tool_call_start", "tool": tool_name, "params": params}
+                    tool_call_counter += 1
+                    desc = next(iter(params.values()), "") if params else ""
+                    desc = str(desc)[:60].replace("\n", " ")
+                    log.info(f"Fallback dispatch: tool #{tool_call_counter} [bold]{tool_name}[/bold]: {desc}")
+                    overlap_dispatched.add(call_id)
+                    future = overlap_pool.submit(_run_stream_tool, call_id, tool_name, params)
+                    overlap_futures[call_id] = future
+                    yield {"type": "tool_call_start", "tool": tool_name, "params": params}
 
-            def _run_stream_tool(call_id: str, tool_name: str, params: dict):
-                output = self.executor.execute(tool_name, params)
-                output.tool_call_id = call_id
-                output.params = params
-                if output.status == ToolStatus.ERROR:
-                    content = f"Error: {output.error}\nCommand: {output.invocation}"
-                elif output.status == ToolStatus.NO_DATA:
-                    content = f"No data. Command: {output.invocation}"
-                else:
-                    content = str(output.output) if output.output is not None else ""
-                if len(content) > 8000:
-                    content = self.llm.summarize(
-                        f"You are helping investigate an infrastructure incident. "
-                        f"Compress the following {tool_name} output to the 20 most relevant lines. "
-                        f"Preserve: error messages, stack traces, anomalous values, lines that differ from baseline, "
-                        f"the LAST 5 lines of the output (errors often appear at the end), and exact timestamps. "
-                        f"Remove: repetitive healthy/normal entries only.\n\n"
-                        f"{content}"
-                    )
-                return call_id, tool_name, output, content
+                n_total = len(collected_tool_calls)
+                n_blocked = len(stream_blocked)
+                n_dispatched = len(overlap_futures)
+                n_fallback = n_dispatched - n_early
+                log.info(
+                    f"Step {step + 1}: {n_total} tool call(s), "
+                    f"{n_dispatched} dispatched ({n_early} via overlap, {n_fallback} fallback), "
+                    f"{n_blocked} blocked"
+                )
 
-            stream_results: dict[str, tuple[str, Any, str]] = {}
-            if parsed:
-                workers = min(16, len(parsed))
-                with ThreadPoolExecutor(max_workers=workers) as pool:
-                    futures = {
-                        pool.submit(_run_stream_tool, cid, tname, tparams): cid
-                        for cid, tname, tparams in parsed
-                    }
-                    for future in as_completed(futures):
-                        cid, tool_name, output, content = future.result()
+                # Wait for all dispatched tools to complete
+                stream_results: dict[str, tuple[str, Any, str]] = {}
+                for call_id, future in overlap_futures.items():
+                    try:
+                        cid, tool_name, output, content = future.result(timeout=300)
                         stream_results[cid] = (tool_name, output, content)
                         all_stream_tool_outputs.append(output)
                         yield {
@@ -588,14 +781,29 @@ class InvestigationEngine:
                             "status": output.status,
                             "invocation": output.invocation,
                         }
+                    except Exception as tool_err:
+                        log.error(f"Tool execution failed for {call_id}: {tool_err}")
+                        stream_blocked[call_id] = f"Tool execution error: {tool_err}"
 
-            # Append messages in original order
-            for tc in collected_tool_calls:
-                call_id = tc["id"]
-                if call_id in stream_blocked:
-                    messages.append({"role": "tool", "tool_call_id": call_id, "content": stream_blocked[call_id]})
-                elif call_id in stream_results:
-                    _, output, content = stream_results[call_id]
-                    messages.append({"role": "tool", "tool_call_id": call_id, "content": content})
+                # Batch-compress large tool outputs
+                if stream_results:
+                    as_executed = {cid: (output, content) for cid, (_, output, content) in stream_results.items()}
+                    as_executed = self._compress_tool_outputs(as_executed)
+                    for cid in stream_results:
+                        tname_orig = stream_results[cid][0]
+                        output_orig = as_executed[cid][0]
+                        content_new = as_executed[cid][1]
+                        stream_results[cid] = (tname_orig, output_orig, content_new)
 
-        yield {"type": "max_steps_reached", "steps": self.max_steps, "messages": messages}
+                # Append messages in original order
+                for tc in collected_tool_calls:
+                    call_id = tc["id"]
+                    if call_id in stream_blocked:
+                        messages.append({"role": "tool", "tool_call_id": call_id, "content": stream_blocked[call_id]})
+                    elif call_id in stream_results:
+                        _, output, content = stream_results[call_id]
+                        messages.append({"role": "tool", "tool_call_id": call_id, "content": content})
+
+            yield {"type": "max_steps_reached", "steps": self.max_steps, "messages": messages}
+        finally:
+            overlap_pool.shutdown(wait=False)
