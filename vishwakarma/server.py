@@ -380,7 +380,7 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
                     {"type": "divider"},
                     {
                         "type": "context",
-                        "elements": [{"type": "mrkdwn", "text": ":hourglass_flowing_sand: _Investigation in progress — fast RCA + full RCA with PDF will follow in this thread..._"}],
+                        "elements": [{"type": "mrkdwn", "text": ":hourglass_flowing_sand: _Investigation in progress — full RCA with PDF will follow in this thread..._"}],
                     },
                 ]
                 resp = slack_client.chat_postMessage(
