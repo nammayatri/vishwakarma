@@ -1,5 +1,6 @@
 litellm>=1.40.0
 openai>=1.30.0
+tenacity>=8.2.0
 
 # Server
 fastapi>=0.115.0
