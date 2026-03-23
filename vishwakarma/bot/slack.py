@@ -886,6 +886,14 @@ def start_bot(config: "VishwakarmaConfig") -> None:
             learnings_manager.compact(category, llm.summarize)
             log.info(f"[FEEDBACK] ❌ Correction appended to learnings[{category}]: {fact[:80]}")
 
+            # After saving correction to learnings, invalidate matching patterns
+            try:
+                from vishwakarma.storage.patterns import invalidate_patterns_for_incident
+                invalidate_patterns_for_incident(incident_id)
+                log.info(f"[FEEDBACK] Invalidated patterns linked to incident {incident_id}")
+            except Exception as e:
+                log.warning(f"[FEEDBACK] Pattern invalidation failed (non-fatal): {e}")
+
             # Update the original feedback message
             if channel_id and msg_ts:
                 client.chat_update(

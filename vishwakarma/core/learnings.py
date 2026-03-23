@@ -5,9 +5,14 @@ Stored at /data/learnings/{category}.md on PVC.
 import os
 import re
 import logging
+import time
 from datetime import datetime
 
 log = logging.getLogger(__name__)
+
+# In-memory cache: category -> (timestamp, content)
+_learnings_cache: dict[str, tuple[float, str]] = {}
+_CACHE_TTL = 300  # 5 minutes
 
 # Default categories created on first run
 _DEFAULT_CATEGORIES = ["rds", "redis", "drainer", "kubernetes", "networking", "general"]
@@ -83,12 +88,19 @@ class LearningsManager:
                 f.write(f"# {cat.capitalize()} Learnings\n")
 
     def get(self, category: str) -> str:
-        """Return the full content of a category file."""
+        """Return the full content of a category file (cached with TTL)."""
         cat = category.lower().strip()
+        now = time.time()
+        if cat in _learnings_cache:
+            ts, content = _learnings_cache[cat]
+            if now - ts < _CACHE_TTL:
+                return content
         fpath = self._file(cat)
         try:
             with open(fpath, "r", encoding="utf-8") as f:
-                return f.read()
+                content = f.read()
+            _learnings_cache[cat] = (now, content)
+            return content
         except FileNotFoundError:
             return f"# {cat.capitalize()} Learnings\n"
         except OSError as e:
@@ -102,6 +114,7 @@ class LearningsManager:
         try:
             with open(fpath, "w", encoding="utf-8") as f:
                 f.write(content)
+            _learnings_cache.pop(cat, None)
         except OSError as e:
             log.error(f"Could not write learnings file {fpath}: {e}")
             raise
@@ -114,6 +127,7 @@ class LearningsManager:
         try:
             with open(fpath, "a", encoding="utf-8") as f:
                 f.write(line)
+            _learnings_cache.pop(cat, None)
         except OSError as e:
             log.error(f"Could not append to learnings file {fpath}: {e}")
             raise
@@ -141,6 +155,7 @@ class LearningsManager:
             try:
                 with open(fpath, "w", encoding="utf-8") as f:
                     f.writelines(kept)
+                _learnings_cache.pop(cat, None)
             except OSError as e:
                 log.error(f"Could not write learnings file {fpath}: {e}")
                 return 0
@@ -234,14 +249,11 @@ class LearningsManager:
 
         parts: list[str] = []
         for cat in matched_categories:
-            fpath = self._file(cat)
-            try:
-                with open(fpath, "r", encoding="utf-8") as f:
-                    lines = f.readlines()
-            except (FileNotFoundError, OSError):
+            content = self.get(cat)
+            if not content:
                 continue
 
-            facts = [l.rstrip() for l in lines if l.strip().startswith("- ")]
+            facts = [l.rstrip() for l in content.splitlines() if l.strip().startswith("- ")]
             if facts:
                 header = f"## Learned Facts ({cat})"
                 parts.append(header + "\n" + "\n".join(facts))

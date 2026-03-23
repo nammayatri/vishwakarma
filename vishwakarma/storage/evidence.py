@@ -13,6 +13,7 @@ No LLM involved in validation — pure statistical comparison.
 import json
 import logging
 import math
+import random
 import re
 import time
 from typing import Any
@@ -182,6 +183,19 @@ def extract_metrics_from_checks(checks: dict) -> dict[str, float]:
 
 # ── Evidence Storage ──────────────────────────────────────────────────────────
 
+def cleanup_stale_evidence(max_age_days: int = 7) -> int:
+    """Delete pending evidence snapshots older than max_age_days."""
+    conn = _get_conn()
+    cutoff = time.time() - (max_age_days * 86400)
+    with _lock:
+        cursor = conn.execute(
+            "DELETE FROM evidence_snapshots WHERE outcome = 'pending' AND created_at < ?",
+            (cutoff,),
+        )
+        conn.commit()
+    return cursor.rowcount
+
+
 def store_evidence(
     evidence_id: str,
     alert_name: str,
@@ -202,6 +216,12 @@ def store_evidence(
              json.dumps(metrics), outcome, incident_id, time.time()),
         )
         conn.commit()
+
+    # Periodic cleanup (1% chance per call)
+    if random.random() < 0.01:
+        deleted = cleanup_stale_evidence()
+        if deleted:
+            log.info(f"[EVIDENCE] Cleaned up {deleted} stale pending snapshots")
 
 
 def mark_evidence_correct(incident_id: str) -> None:
@@ -236,6 +256,31 @@ def mark_evidence_wrong(incident_id: str) -> None:
 
 # ── Baseline Computation ──────────────────────────────────────────────────────
 
+def _compute_robust_stats(values: list[float]) -> tuple[float, float, float, float]:
+    """Compute mean/stddev with IQR-based outlier removal."""
+    if len(values) < 3:
+        mean = sum(values) / len(values) if values else 0
+        return mean, 0.0, min(values, default=0), max(values, default=0)
+
+    sorted_vals = sorted(values)
+    q1_idx = len(sorted_vals) // 4
+    q3_idx = 3 * len(sorted_vals) // 4
+    q1 = sorted_vals[q1_idx]
+    q3 = sorted_vals[q3_idx]
+    iqr = q3 - q1
+    lower = q1 - 1.5 * iqr
+    upper = q3 + 1.5 * iqr
+
+    filtered = [v for v in sorted_vals if lower <= v <= upper]
+    if len(filtered) < 2:
+        filtered = sorted_vals  # fallback if too aggressive
+
+    mean = sum(filtered) / len(filtered)
+    variance = sum((v - mean) ** 2 for v in filtered) / len(filtered)
+    stddev = math.sqrt(variance)
+    return mean, stddev, min(filtered), max(filtered)
+
+
 def _update_baselines(alert_name: str) -> None:
     """Recompute baselines from all correct evidence snapshots for this alert."""
     conn = _get_conn()
@@ -257,18 +302,16 @@ def _update_baselines(alert_name: str) -> None:
             if isinstance(v, (int, float)):
                 all_metrics.setdefault(k, []).append(v)
 
-    # Compute mean and stddev for each metric
+    # Compute mean and stddev for each metric (with IQR outlier removal)
     now = time.time()
     with _lock:
         for metric_name, values in all_metrics.items():
             if len(values) < 2:
                 continue
+            mean, stddev, min_val, max_val = _compute_robust_stats(values)
+            if stddev == 0:
+                stddev = 0.01  # avoid zero stddev
             n = len(values)
-            mean = sum(values) / n
-            variance = sum((v - mean) ** 2 for v in values) / (n - 1)
-            stddev = math.sqrt(variance) if variance > 0 else 0.01  # avoid zero stddev
-            min_val = min(values)
-            max_val = max(values)
 
             conn.execute(
                 "INSERT OR REPLACE INTO learned_baselines "

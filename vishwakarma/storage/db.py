@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS oracle_sessions (
 CREATE INDEX IF NOT EXISTS idx_incidents_source ON incidents(source);
 CREATE INDEX IF NOT EXISTS idx_incidents_status ON incidents(status);
 CREATE INDEX IF NOT EXISTS idx_incidents_created ON incidents(created_at);
+CREATE INDEX IF NOT EXISTS idx_incidents_source_created ON incidents(source, created_at);
 CREATE INDEX IF NOT EXISTS idx_oracle_sessions_updated ON oracle_sessions(updated_at);
 """
 

@@ -24,6 +24,12 @@ from vishwakarma.storage.db import _get_conn, _lock
 
 log = logging.getLogger(__name__)
 
+
+def _keyword_matches(keyword: str, text: str) -> bool:
+    """Word-boundary keyword match — 'Running' won't match 'NotRunning'."""
+    pattern = r'\b' + re.escape(keyword) + r'\b'
+    return bool(re.search(pattern, text, re.IGNORECASE))
+
 # ── Schema (added to main DB) ────────────────────────────────────────────────
 
 PATTERNS_SCHEMA = """
@@ -172,6 +178,19 @@ def mark_pattern_wrong(alert_name: str, root_cause_type: str) -> None:
         conn.commit()
 
 
+def invalidate_patterns_for_incident(incident_id: str) -> int:
+    """Mark patterns linked to this incident as 'wrong'.
+    Called when user marks an RCA as incorrect."""
+    conn = _get_conn()
+    with _lock:
+        cursor = conn.execute(
+            "UPDATE rca_patterns SET status = 'wrong' WHERE last_incident_id = ? AND status = 'active'",
+            (incident_id,),
+        )
+        conn.commit()
+    return cursor.rowcount
+
+
 # ── Available tools (for extraction prompt) ───────────────────────────────────
 
 AVAILABLE_TOOLS = """
@@ -282,6 +301,14 @@ def replay_pattern(
     if not steps:
         return None
 
+    # ── Pre-check: don't replay when fast RCA has LOW confidence + unknown scenario ──
+    if fast_rca_result:
+        fast_confidence = fast_rca_result.get("confidence", "").upper()
+        fast_scenario = fast_rca_result.get("scenario", "")
+        if fast_confidence == "LOW" and fast_scenario in ("unknown", "H", ""):
+            log.info(f"Pattern skip: fast RCA confidence LOW with scenario='{fast_scenario}' — too uncertain for replay")
+            return {"matched": False, "reason": "fast RCA confidence too low for pattern replay"}
+
     # ── Pre-check: cross-reference with fast RCA ──
     # If fast RCA already classified this as a different root cause type, skip replay
     if fast_rca_result:
@@ -327,15 +354,14 @@ def replay_pattern(
             })
             all_output_text += f"\n(error: {e})"
 
-    # ── Deterministic keyword validation ──
-    output_lower = all_output_text.lower()
+    # ── Deterministic keyword validation (word-boundary matching) ──
 
     # Check verification keywords (must appear)
     keywords = pattern.get("verification_keywords", [])
     keywords_found = []
     keywords_missing = []
     for kw in keywords:
-        if kw.lower() in output_lower:
+        if _keyword_matches(kw, all_output_text):
             keywords_found.append(kw)
         else:
             keywords_missing.append(kw)
@@ -344,7 +370,7 @@ def replay_pattern(
     anti_keywords = pattern.get("verification_anti_keywords", [])
     anti_found = []
     for akw in anti_keywords:
-        if akw.lower() in output_lower:
+        if _keyword_matches(akw, all_output_text):
             anti_found.append(akw)
 
     # ── Decision logic ──
