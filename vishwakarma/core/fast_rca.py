@@ -348,27 +348,38 @@ def synthesize_fast_rca(llm, checks: dict, alert_name: str) -> dict:
             raw += delta
         raw = raw.strip()
         log.info(f"Fast RCA synthesis response: len={len(raw)}, preview={raw[:100]}")
-        # Strip reasoning preamble and extract JSON
+        # Strip reasoning preamble and extract JSON — models often wrap JSON in text
         import re
-        # Try multiple extraction strategies
-        # Strategy 1: Find JSON block containing "root_cause" (handles nested reasoning text)
-        json_match = re.search(r'\{"root_cause".*?"evidence_summary"\s*:\s*"[^"]*"\s*\}', raw, re.DOTALL)
-        if not json_match:
-            # Strategy 2: Find last JSON object in the response (reasoning models put JSON at the end)
-            all_jsons = list(re.finditer(r'\{[^{}]{20,}\}', raw))
-            if all_jsons:
-                json_match = all_jsons[-1]
-        if not json_match:
-            # Strategy 3: Find anything that looks like our expected JSON
-            json_match = re.search(r'\{[^{}]*"root_cause"[^}]*\}', raw, re.DOTALL)
-        if json_match:
-            raw = json_match.group()
-        # Strip markdown fences if present
-        if raw.startswith("```"):
-            raw = raw.split("\n", 1)[1] if "\n" in raw else raw[3:]
-            if raw.endswith("```"):
-                raw = raw[:-3]
-            raw = raw.strip()
+        # Strip markdown fences
+        raw = re.sub(r'```json\s*', '', raw)
+        raw = re.sub(r'```\s*', '', raw)
+        # Strategy 1: Find JSON by matching balanced braces containing "root_cause"
+        # Walk through string to find the outermost { } containing our key
+        extracted = None
+        for m in re.finditer(r'\{', raw):
+            start = m.start()
+            depth = 0
+            for i in range(start, len(raw)):
+                if raw[i] == '{':
+                    depth += 1
+                elif raw[i] == '}':
+                    depth -= 1
+                    if depth == 0:
+                        candidate = raw[start:i+1]
+                        if '"root_cause"' in candidate:
+                            try:
+                                result = json.loads(candidate)
+                                if "root_cause" in result:
+                                    extracted = result
+                                    break
+                            except json.JSONDecodeError:
+                                pass
+                        break
+            if extracted:
+                break
+        if extracted:
+            return extracted
+        # Strategy 2: Fallback — try json.loads on the whole thing
         return json.loads(raw)
     except (json.JSONDecodeError, Exception) as e:
         log.warning(f"Fast RCA synthesis failed ({type(e).__name__}): {e}")
