@@ -320,7 +320,7 @@ def synthesize_fast_rca(llm, checks: dict, alert_name: str) -> dict:
     # Inject alert-specific threshold so LLM knows what actually triggers the alarm
     threshold_hint = _ALERT_THRESHOLDS.get(alert_name, "")
     threshold_line = f" Alert threshold: {threshold_hint}." if threshold_hint else ""
-    prompt = f"""{alert_name}.{threshold_line} Data: {checks_text}. Compare current vs yesterday_*. If within 20% of yesterday=normal, else=incident. Fill ALL values in this JSON: {{"root_cause":"FILL: what is wrong or Normal load","confidence":"FILL: high or medium or low","scenario":"FILL: H if normal else A-G","impact":"FILL: user impact or No user impact","suggested_fix":"FILL: action or No action needed","evidence_summary":"FILL: key numbers from data"}}"""
+    prompt = f"""{alert_name}.{threshold_line} Data: {checks_text}. Compare current vs yesterday_*. If within 20% of yesterday=normal, else=incident. Reply with ONLY this JSON, no explanation: {{"root_cause":"FILL: 1 sentence","confidence":"FILL: HIGH or MEDIUM or LOW","scenario":"FILL: H if normal else A-G","impact":"FILL: 1 sentence","suggested_fix":"FILL: 1 sentence","evidence_summary":"FILL: key numbers"}}"""
 
     try:
         # Use fast_model for synthesis — faster and better at following JSON format
@@ -329,7 +329,7 @@ def synthesize_fast_rca(llm, checks: dict, alert_name: str) -> dict:
         kwargs = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 2048,
+            "max_tokens": 4096,
             "temperature": 0.0,
             "timeout": 60,
             "stream": True,
