@@ -323,19 +323,18 @@ def synthesize_fast_rca(llm, checks: dict, alert_name: str) -> dict:
     prompt = f"""{alert_name}.{threshold_line} Data: {checks_text}. Compare current vs yesterday_*. If within 20% of yesterday=normal, else=incident. Fill ALL values in this JSON: {{"root_cause":"FILL: what is wrong or Normal load","confidence":"FILL: high or medium or low","scenario":"FILL: H if normal else A-G","impact":"FILL: user impact or No user impact","suggested_fix":"FILL: action or No action needed","evidence_summary":"FILL: key numbers from data"}}"""
 
     try:
-        # Use streaming to avoid timeout while model is producing tokens
+        # Use fast_model for synthesis — faster and better at following JSON format
         from litellm import completion as _completion
-        model = llm._get_main_chain()[0]
+        model = llm.cfg.fast_model or llm._get_main_chain()[0]
         kwargs = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": 2048,
             "temperature": 0.0,
-            "timeout": 120,
+            "timeout": 60,
             "stream": True,
             "num_retries": 1,
-            # Force JSON output + disable reasoning
-            "response_format": {"type": "json_object"},
+            # Disable reasoning so model returns clean JSON
             "extra_body": {"chat_template_kwargs": {"enable_thinking": False, "thinking": False}},
         }
         if llm.cfg.api_key:

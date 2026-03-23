@@ -665,7 +665,7 @@ class InvestigationEngine:
                                     overlap_dispatched.add(tc_id)
                                     future = overlap_pool.submit(_run_stream_tool, tc_id, tc_name, tc_params)
                                     overlap_futures[tc_id] = future
-                                    yield {"type": "tool_started", "tool": tc_name, "params": tc_params, "overlap": True}
+                                    yield {"type": "tool_call_start", "tool": tc_name, "params": tc_params, "overlap": True}
                                 # Don't forward tool_call_complete to caller — it's internal
                                 continue
 
