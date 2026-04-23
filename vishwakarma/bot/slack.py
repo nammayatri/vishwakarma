@@ -428,7 +428,8 @@ def start_bot(config: "VishwakarmaConfig") -> None:
                         reply = _contextual_thread_reply(config, question, thread_text)
                     else:
                         reply = _simple_chat(config, question)
-                    say(text=reply, thread_ts=thread_ts)
+                    from vishwakarma.utils.slack_format import md_to_slack
+                    say(text=md_to_slack(reply), thread_ts=thread_ts)
                 except Exception as e:
                     log.error(f"Chat failed: {e}", exc_info=True)
                     say(text=f"❌ {str(e)[:200]}", thread_ts=thread_ts)
@@ -650,9 +651,18 @@ def start_bot(config: "VishwakarmaConfig") -> None:
             return
 
         # Case 2: Amazon Q CloudWatch alarm in a channel
-        # Skip thread replies to avoid duplicate investigations
-        if event.get("thread_ts") and event.get("thread_ts") != event.get("ts"):
-            return
+        # Thread replies: only process if within 30 min of the parent message.
+        # Beyond 30 min, the thread is assumed to be old/cold follow-up chatter.
+        thread_ts = event.get("thread_ts")
+        event_ts = event.get("ts")
+        if thread_ts and thread_ts != event_ts:
+            try:
+                gap_min = (float(event_ts) - float(thread_ts)) / 60.0
+            except (TypeError, ValueError):
+                return
+            if gap_min > 30:
+                log.info(f"[CLOUDWATCH] Skipping thread reply — parent is {gap_min:.1f} min old (>30 min cutoff)")
+                return
 
         # Only process bot messages
         if not event.get("bot_id") and event.get("subtype") != "bot_message":
