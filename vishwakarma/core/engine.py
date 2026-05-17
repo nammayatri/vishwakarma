@@ -137,9 +137,10 @@ class InvestigationEngine:
         except Exception as e:
             log.warning(f"Batch compression failed: {e} — falling back to individual compression")
 
-        # Fallback: compress each individually
-        for cid, tool_name in large:
-            output, content = executed[cid]
+        # Fallback: compress each individually, in parallel.
+        # Sequential compression of N large outputs would block the engine
+        # for N × ~8s; parallelizing keeps the step short.
+        def _compress_one(cid: str, tool_name: str, content: str) -> tuple[str, str]:
             compressed = self.llm.summarize(
                 f"You are helping investigate an infrastructure incident. "
                 f"Compress the following {tool_name} output to the 20 most relevant lines. "
@@ -148,7 +149,20 @@ class InvestigationEngine:
                 f"Remove: repetitive healthy/normal entries only.\n\n"
                 f"{content}"
             )
-            executed[cid] = (output, compressed)
+            return cid, compressed
+
+        with ThreadPoolExecutor(max_workers=min(len(large), 8)) as ex:
+            futures = [
+                ex.submit(_compress_one, cid, tool_name, executed[cid][1])
+                for cid, tool_name in large
+            ]
+            for f in as_completed(futures):
+                try:
+                    cid, compressed = f.result()
+                    output, _ = executed[cid]
+                    executed[cid] = (output, compressed)
+                except Exception as e:
+                    log.warning(f"Individual compression failed: {e}")
 
         return executed
 

@@ -30,6 +30,7 @@ Example config.yaml:
         allow: [aws, stern, kubectl]
         block: [rm, wget, curl, dd]
 """
+import functools
 import logging
 import os
 from pathlib import Path
@@ -456,6 +457,34 @@ def _load_runbooks(extra: list[str]) -> list[str]:
     return runbooks
 
 
+@functools.lru_cache(maxsize=1)
+def _load_agents_catalog() -> tuple[list[dict], Path] | tuple[None, None]:
+    """Load and cache agents.json. Returns (agents_list, parent_dir) or (None, None)."""
+    import json
+    agents_path = Path(__file__).parent / "plugins" / "agents" / "agents.json"
+    if not agents_path.exists():
+        return None, None
+    try:
+        return json.loads(agents_path.read_text())["agents"], agents_path.parent
+    except Exception as e:
+        log.warning(f"Could not load agents.json: {e}")
+        return None, None
+
+
+@functools.lru_cache(maxsize=64)
+def _load_runbook_content(runbook_path_str: str) -> str | None:
+    """Load and cache a runbook file's content."""
+    runbook_path = Path(runbook_path_str)
+    if not runbook_path.exists():
+        return None
+    try:
+        content = runbook_path.read_text(encoding="utf-8").strip()
+        return f"# Runbook: {runbook_path.stem}\n\n{content}"
+    except Exception as e:
+        log.warning(f"Could not load runbook {runbook_path}: {e}")
+        return None
+
+
 def load_matching_runbooks(alert_name: str, llm=None) -> list[str]:
     """
     Find the runbook(s) relevant to this alert.
@@ -465,32 +494,19 @@ def load_matching_runbooks(alert_name: str, llm=None) -> list[str]:
     2. Fallback: if no keyword match, ask the LLM to classify from the agents.json catalog
        (one cheap classification call). If LLM also finds no match, investigate without runbook.
     """
-    import json
-
-    agents_path = Path(__file__).parent / "plugins" / "agents" / "agents.json"
-
-    if not agents_path.exists():
-        return []
-
-    try:
-        agents = json.loads(agents_path.read_text())["agents"]
-    except Exception as e:
-        log.warning(f"Could not load agents.json: {e}")
+    agents, agents_parent = _load_agents_catalog()
+    if agents is None:
         return []
 
     alert_lower = alert_name.lower()
 
     def _load_runbook_for_entry(entry: dict) -> str | None:
         runbook_ref = entry.get("runbook", "")
-        runbook_path = (agents_path.parent / runbook_ref).resolve()
-        if runbook_path.exists():
-            try:
-                content = runbook_path.read_text(encoding="utf-8").strip()
-                log.info(f"Matched runbook '{entry['id']}' for alert '{alert_name}'")
-                return f"# Runbook: {runbook_path.stem}\n\n{content}"
-            except Exception as e:
-                log.warning(f"Could not load runbook {runbook_path}: {e}")
-        return None
+        runbook_path = (agents_parent / runbook_ref).resolve()
+        rb = _load_runbook_content(str(runbook_path))
+        if rb:
+            log.info(f"Matched runbook '{entry['id']}' for alert '{alert_name}'")
+        return rb
 
     # ── Stage 1: keyword match ────────────────────────────────────────────────
     matched = []
