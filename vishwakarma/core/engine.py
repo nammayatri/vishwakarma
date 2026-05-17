@@ -428,8 +428,14 @@ class InvestigationEngine:
                         tool_call_counter += 1
                         futures[pool.submit(_run_tool, cid, tname, tparams, tool_call_counter)] = cid
                     for future in as_completed(futures):
-                        cid, tname, output, content = future.result()
-                        executed[cid] = (output, content)
+                        try:
+                            cid, tname, output, content = future.result(timeout=150)
+                            executed[cid] = (output, content)
+                        except Exception as tool_err:
+                            cid = futures[future]
+                            err_repr = f"{type(tool_err).__name__}: {tool_err}" if str(tool_err) else type(tool_err).__name__
+                            log.error(f"Tool execution failed for {cid}: {err_repr}")
+                            blocked[cid] = f"Tool execution error: {err_repr}"
 
                 # Batch-compress large tool outputs (saves LLM calls when multiple are large)
                 executed = self._compress_tool_outputs(executed)
@@ -633,6 +639,7 @@ class InvestigationEngine:
                 overlap_blocked: dict[str, str] = {}      # call_id -> block reason (from early check)
 
                 llm_ok = False
+                last_llm_err: Exception | None = None
                 for _attempt in range(_MAX_LLM_RETRIES):
                     collected_content = ""
                     collected_tool_calls = []
@@ -680,7 +687,8 @@ class InvestigationEngine:
 
                         llm_ok = True
                         break  # success
-                    except Exception as llm_err:
+                    except Exception as e:
+                        last_llm_err = e  # Python clears `e` after except; capture it
                         # Cancel any overlap futures from this failed attempt
                         for f in overlap_futures.values():
                             f.cancel()
@@ -688,11 +696,11 @@ class InvestigationEngine:
                         overlap_dispatched.clear()
                         overlap_blocked.clear()
                         log.warning("LLM stream error on step %d (attempt %d/%d): %s",
-                                    step, _attempt + 1, _MAX_LLM_RETRIES, llm_err)
-                        yield {"type": "status", "message": f"LLM error (attempt {_attempt + 1}/{_MAX_LLM_RETRIES}): {type(llm_err).__name__}"}
+                                    step, _attempt + 1, _MAX_LLM_RETRIES, e)
+                        yield {"type": "status", "message": f"LLM error (attempt {_attempt + 1}/{_MAX_LLM_RETRIES}): {type(e).__name__}"}
 
                 if not llm_ok:
-                    yield {"type": "done", "content": f"Investigation failed after {_MAX_LLM_RETRIES} LLM retries: {llm_err}", "messages": messages}
+                    yield {"type": "done", "content": f"Investigation failed after {_MAX_LLM_RETRIES} LLM retries: {last_llm_err}", "messages": messages}
                     return
 
                 if not collected_tool_calls:
@@ -772,7 +780,7 @@ class InvestigationEngine:
                 stream_results: dict[str, tuple[str, Any, str]] = {}
                 for call_id, future in overlap_futures.items():
                     try:
-                        cid, tool_name, output, content = future.result(timeout=300)
+                        cid, tool_name, output, content = future.result(timeout=150)
                         stream_results[cid] = (tool_name, output, content)
                         all_stream_tool_outputs.append(output)
                         yield {
@@ -782,8 +790,9 @@ class InvestigationEngine:
                             "invocation": output.invocation,
                         }
                     except Exception as tool_err:
-                        log.error(f"Tool execution failed for {call_id}: {tool_err}")
-                        stream_blocked[call_id] = f"Tool execution error: {tool_err}"
+                        err_repr = f"{type(tool_err).__name__}: {tool_err}" if str(tool_err) else type(tool_err).__name__
+                        log.error(f"Tool execution failed for {call_id}: {err_repr}")
+                        stream_blocked[call_id] = f"Tool execution error: {err_repr}"
 
                 # Batch-compress large tool outputs
                 if stream_results:

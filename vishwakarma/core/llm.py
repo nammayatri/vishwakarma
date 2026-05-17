@@ -149,44 +149,71 @@ class VishwakarmaLLM:
         arguments form valid JSON, allowing the caller to start execution
         before the full LLM response is finished (streaming tool overlap).
         """
-        kwargs: dict[str, Any] = {
-            "model": self.cfg.model,
-            "messages": messages,
-            "temperature": self.cfg.temperature,
-            "timeout": self.cfg.timeout,
-            "stream": True,
-        }
-        if self.cfg.api_key:
-            kwargs["api_key"] = self.cfg.api_key
-        if self.cfg.api_base:
-            kwargs["api_base"] = self.cfg.api_base
-        if self.cfg.api_version:
-            kwargs["api_version"] = self.cfg.api_version
-        if self.cfg.max_tokens:
-            kwargs["max_tokens"] = self.cfg.max_tokens
-        if tools:
-            kwargs["tools"] = tools
-            kwargs["tool_choice"] = "auto"
-
         # Apply env var overrides (same as complete())
         max_content = os.environ.get("OVERRIDE_MAX_CONTENT_SIZE")
         max_output = os.environ.get("OVERRIDE_MAX_OUTPUT_TOKEN")
         if max_content:
             litellm.max_input_tokens = int(max_content)  # type: ignore
-        if max_output:
-            kwargs["max_tokens"] = int(max_output)
 
-        try:
-            response = completion(**kwargs)
-        except Exception as e:
-            log.error(f"LLM stream call failed: {e}", exc_info=True)
-            raise
+        # Try main + model_fallbacks for stream initialization.
+        # Once chunks flow we commit to that model; mid-stream failures bubble up
+        # and get retried by the engine's outer retry loop.
+        chain = self._get_main_chain()
+        last_err: Exception | None = None
+        response = None
+        for i, model in enumerate(chain):
+            kwargs: dict[str, Any] = {
+                "model": model,
+                "messages": messages,
+                "temperature": self.cfg.temperature,
+                "timeout": self.cfg.timeout,
+                "stream": True,
+                "num_retries": 0,
+            }
+            if self.cfg.api_key:
+                kwargs["api_key"] = self.cfg.api_key
+            if self.cfg.api_base:
+                kwargs["api_base"] = self.cfg.api_base
+            if self.cfg.api_version:
+                kwargs["api_version"] = self.cfg.api_version
+            if self.cfg.max_tokens:
+                kwargs["max_tokens"] = self.cfg.max_tokens
+            if max_output:
+                kwargs["max_tokens"] = int(max_output)
+            if tools:
+                kwargs["tools"] = tools
+                kwargs["tool_choice"] = "auto"
+
+            try:
+                response = completion(**kwargs)
+                if i > 0:
+                    log.info(f"Stream fallback to {model} succeeded (primary failed)")
+                break
+            except Exception as e:
+                last_err = e
+                log.warning(
+                    f"Stream init failed on {model} ({type(e).__name__}: {str(e)[:80]}); "
+                    f"{'falling back to next' if i < len(chain) - 1 else 'no more fallbacks'}"
+                )
+
+        if response is None:
+            log.error(f"LLM stream call failed (all fallbacks exhausted): {last_err}", exc_info=True)
+            raise last_err  # type: ignore
 
         collected_content = ""
         collected_tool_calls: dict[int, dict] = {}
         emitted_complete: set[int] = set()  # indices already yielded as tool_call_complete
 
+        # Wall-clock guard for the stream consumption. litellm's `timeout` only
+        # covers initial connection — once chunks start flowing, a gateway that
+        # stalls mid-stream would hang the loop forever. Cap total stream time
+        # at cfg.timeout (default 300s).
+        stream_deadline = time.time() + max(60, self.cfg.timeout)
         for chunk in response:
+            if time.time() > stream_deadline:
+                raise TimeoutError(
+                    f"Stream consumption exceeded {self.cfg.timeout}s — upstream stalled mid-response"
+                )
             delta = chunk.choices[0].delta if chunk.choices else None
             if not delta:
                 continue
@@ -326,7 +353,7 @@ class VishwakarmaLLM:
                     "temperature": temperature,
                     "max_tokens": max_tokens,
                     "timeout": remaining,
-                    "num_retries": 1,  # max 1 retry per model in the chain
+                    "num_retries": 0,  # no per-model retry — fall through to next model fast
                 }
                 if self.cfg.api_key:
                     kwargs["api_key"] = self.cfg.api_key

@@ -14,6 +14,7 @@ This toolset handles the configured allow/block lists.
 """
 import logging
 import os
+import queue as _queue
 import re
 import shlex
 import subprocess
@@ -57,7 +58,25 @@ class PersistentShell:
             env={**os.environ, "PS1": "", "TERM": "dumb"},
         )
         self._lock = threading.Lock()
+        # Single persistent reader thread that funnels every stdout line
+        # into self._line_q. run() drains this queue with a wall-clock
+        # deadline so a stuck command can't hang the worker thread.
+        self._line_q: _queue.Queue = _queue.Queue()
+        self._reader_th = threading.Thread(
+            target=self._reader_loop, daemon=True,
+        )
+        self._reader_th.start()
         log.debug("Persistent shell started (PID %d)", self._proc.pid)
+
+    def _reader_loop(self):
+        try:
+            while True:
+                line = self._proc.stdout.readline()
+                self._line_q.put(line)
+                if not line:  # EOF — shell died
+                    break
+        except Exception as ex:
+            self._line_q.put(("__EXC__", ex))
 
     @property
     def alive(self) -> bool:
@@ -82,27 +101,62 @@ class PersistentShell:
 
         with self._lock:
             try:
+                # Drain any stale lines from a previous timed-out call so we
+                # don't read its leftover output as ours.
+                while not self._line_q.empty():
+                    try:
+                        self._line_q.get_nowait()
+                    except _queue.Empty:
+                        break
+
                 self._proc.stdin.write(wrapped)
                 self._proc.stdin.flush()
 
-                # Read until delimiter
-                stdout_lines = []
+                # Drain lines from the persistent reader thread until we hit
+                # our delimiter, or the wall-clock deadline expires.
+                stdout_lines: list[str] = []
                 exit_code = 0
                 deadline = time.monotonic() + timeout
+                timed_out = False
+                got_delimiter = False
 
-                while time.monotonic() < deadline:
-                    line = self._proc.stdout.readline()
-                    if not line:
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        timed_out = True
+                        break
+                    try:
+                        item = self._line_q.get(timeout=remaining)
+                    except _queue.Empty:
+                        timed_out = True
+                        break
+                    if isinstance(item, tuple) and item and item[0] == "__EXC__":
+                        # Reader thread crashed — treat as shell death
+                        break
+                    line = item
+                    if not line:  # EOF
                         break
                     if line.startswith(delimiter):
                         exit_code = int(line[len(delimiter):].strip() or "0")
+                        got_delimiter = True
                         break
                     stdout_lines.append(line)
-                else:
-                    # Timeout — kill and restart
-                    self._proc.kill()
+
+                if timed_out:
+                    # Kill the stuck shell process so the next call gets a
+                    # fresh one via PersistentShell.get(). Reader thread is
+                    # daemon and will exit on its own.
+                    try:
+                        self._proc.kill()
+                    except Exception:
+                        pass
                     self._proc = None
                     return 124, "".join(stdout_lines), f"Command timed out after {timeout}s"
+
+                if not got_delimiter:
+                    # EOF without delimiter — shell died mid-command.
+                    self._proc = None
+                    return 1, "".join(stdout_lines), "Persistent shell died mid-command"
 
                 stdout = "".join(stdout_lines)
 
