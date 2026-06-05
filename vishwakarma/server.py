@@ -68,14 +68,20 @@ def _mount_console_spa(app: FastAPI) -> None:
     fallback (client-side routes → index.html). No-op when the bundle
     hasn't been built — the API still works without the UI.
     """
+    import os
     from pathlib import Path
     from fastapi.responses import FileResponse
 
-    dist = Path(__file__).parent.parent / "web" / "dist"
-    index = dist / "index.html"
-    if not index.exists():
+    candidates = [
+        Path(os.environ.get("VK_CONSOLE_DIST", "")),       # explicit override
+        Path(__file__).parent.parent / "web" / "dist",      # repo checkout
+        Path("/app/web/dist"),                              # container layout
+    ]
+    dist = next((c for c in candidates if c and (c / "index.html").exists()), None)
+    if dist is None:
         log.info("Console UI bundle not found (web/dist) — /console disabled")
         return
+    index = dist / "index.html"
 
     @app.get("/console", include_in_schema=False)
     @app.get("/console/{path:path}", include_in_schema=False)
@@ -422,7 +428,6 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
         import asyncio as _asyncio
         loop = _asyncio.get_event_loop()
         from vishwakarma.config import load_matching_runbooks
-        from vishwakarma.core.fast_rca import match_fast_rca, get_companion_checks, synthesize_fast_rca, format_slack_message
 
         # ── Post immediate acknowledgment to Slack ──
         ack_ts = None
@@ -458,97 +463,14 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
             except Exception as e:
                 log.warning(f"Slack ack failed (non-fatal): {e}")
 
-        # ── Launch fast RCA + pre-enrichment in parallel ──
-        fast_match = match_fast_rca(alert_name)
-        fast_rca_result = None
-        fast_rca_ts = None
-        fast_checks_raw: dict = {}  # raw check results for evidence extraction
-
-        async def _run_fast_rca():
-            """Fast RCA: parallel checks → LLM classify → post to Slack."""
-            nonlocal fast_rca_result, fast_rca_ts
-            if not fast_match:
-                return
-            toolset_name, tool_name, tool_params = fast_match
-            fast_ts = tm.get(toolset_name)
-            if not fast_ts or not fast_ts.enabled:
-                return
-            try:
-                # Run primary + companion checks in parallel
-                companions = get_companion_checks(tool_name)
-                primary_future = loop.run_in_executor(
-                    None, lambda: fast_ts.execute(tool_name, tool_params)
-                )
-                companion_futures = []
-                for c_toolset, c_tool, c_params in companions:
-                    c_ts = tm.get(c_toolset)
-                    if c_ts and c_ts.enabled:
-                        companion_futures.append(
-                            loop.run_in_executor(
-                                None, lambda ts=c_ts, t=c_tool, p=c_params: ts.execute(t, p)
-                            )
-                        )
-
-                all_outputs = await _asyncio.gather(primary_future, *companion_futures, return_exceptions=True)
-
-                # Merge all check results
-                check_output = all_outputs[0]
-                if isinstance(check_output, Exception) or check_output.status != ToolStatus.SUCCESS:
-                    return
-                checks = json.loads(check_output.output) if isinstance(check_output.output, str) else check_output.output
-                merged_checks = dict(checks.get("checks", checks))
-
-                # Merge companion results under prefixed keys
-                for i, (c_toolset, c_tool, c_params) in enumerate(companions):
-                    c_output = all_outputs[i + 1]
-                    if isinstance(c_output, Exception) or c_output.status != ToolStatus.SUCCESS:
-                        continue
-                    c_data = json.loads(c_output.output) if isinstance(c_output.output, str) else c_output.output
-                    for k, v in c_data.get("checks", c_data).items():
-                        merged_checks[f"{c_tool}_{k}"] = v
-
-                checks["checks"] = merged_checks
-                nonlocal fast_checks_raw
-                fast_checks_raw = merged_checks  # capture for evidence extraction
-                fast_rca_result = await loop.run_in_executor(
-                    None, lambda: synthesize_fast_rca(llm, merged_checks, alert_name)
-                )
-                # Post to Slack immediately — as thread reply under ack message
-                if config.is_slack_configured() and fast_rca_result:
-                    slack_text = format_slack_message(fast_rca_result, issue.title)
-                    try:
-                        if slack_client and slack_channel_id:
-                            resp = slack_client.chat_postMessage(
-                                channel=slack_channel_id,
-                                text=slack_text,
-                                thread_ts=ack_ts,
-                            )
-                            fast_rca_ts = resp["ts"]
-                        else:
-                            from vishwakarma.plugins.relays.slack.plugin import SlackDestination
-                            dest = SlackDestination({"token": config.slack_bot_token})
-                            channel = os.environ.get("SLACK_CHANNEL", "#sre-alerts")
-                            resp = dest._get_client().chat_postMessage(
-                                channel=dest._resolve_channel_id(channel),
-                                text=slack_text,
-                            )
-                            fast_rca_ts = resp["ts"]
-                    except Exception as e:
-                        log.warning(f"Fast RCA Slack post failed: {e}")
-                    log.info(f"Fast RCA posted for {alert_name} in {checks.get('elapsed_seconds', '?')}s")
-            except Exception as e:
-                log.warning(f"Fast RCA failed for {alert_name}: {e}")
-
-        # Run fast RCA and all 4 pre-enrichment tasks in parallel
-        fast_rca_future = _run_fast_rca()
+        # Run the 4 pre-enrichment tasks in parallel
         prefetch_future = loop.run_in_executor(None, _prefetch_alert_context, issue)
         prior_future = loop.run_in_executor(None, _build_prior_context, issue)
         entities_future = loop.run_in_executor(None, _extract_alert_entities, issue, llm)
         runbooks_future = loop.run_in_executor(None, load_matching_runbooks, alert_name, llm)
 
-        # Wait for all to complete (fast RCA + 4 pre-enrichment tasks)
-        _, prefetch_ctx, prior_ctx, entities_ctx, matched_runbooks = await _asyncio.gather(
-            fast_rca_future, prefetch_future, prior_future, entities_future, runbooks_future
+        prefetch_ctx, prior_ctx, entities_ctx, matched_runbooks = await _asyncio.gather(
+            prefetch_future, prior_future, entities_future, runbooks_future
         )
 
         # Pre-inject learnings relevant to this alert
@@ -558,26 +480,6 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
         # Merge all pre-investigation context into extra_system_prompt
         extra_parts = [p for p in [entities_ctx, prefetch_ctx, prior_ctx, learnings_ctx] if p]
 
-        # Inject fast RCA as starting context for deep investigation
-        if fast_rca_result:
-            extra_parts.insert(0,
-                "## Fast RCA (preliminary, posted to Slack)\n"
-                f"{json.dumps(fast_rca_result, indent=2)}\n"
-                "Verify or refute this preliminary finding with deeper investigation. "
-                "If it's correct, focus on root cause chain and remediation details. "
-                "If your evidence contradicts it, explain why in your final RCA."
-            )
-
-        # Inject fast RCA raw check data so LLM doesn't re-run these commands
-        if fast_checks_raw:
-            speculative_ctx = (
-                "## Pre-fetched Investigation Data (already collected — use directly, do NOT re-run these commands)\n\n"
-            )
-            for check_name, check_result in fast_checks_raw.items():
-                result_str = str(check_result)[:1500]
-                speculative_ctx += f"### {check_name}\n```\n{result_str}\n```\n\n"
-            extra_parts.append(speculative_ctx)
-
         extra_parts.append(
             "## Learned Knowledge\n"
             "Relevant facts from past incidents are pre-injected above (if any). "
@@ -585,88 +487,11 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
         )
         extra_system_prompt = "\n\n".join(extra_parts) or None
 
-        # ── Evidence-based auto-resolve: compare metrics against learned baselines ──
+        # Fast-RCA and its evidence-driven auto-resolve were removed —
+        # preliminary classifications were too often wrong. Every alert now
+        # gets the full investigation (pattern replay below still short-cuts
+        # CONFIRMED patterns, which are human-validated).
         auto_resolved = False
-        evidence_metrics = {}
-        try:
-            from vishwakarma.storage.evidence import (
-                extract_metrics_from_checks, store_evidence,
-                should_auto_resolve, compare_against_baselines,
-            )
-            # Extract numeric metrics from fast RCA raw check results
-            if fast_checks_raw:
-                evidence_metrics = extract_metrics_from_checks(fast_checks_raw)
-
-            if evidence_metrics:
-                # Store evidence snapshot (outcome=pending until ✅/❌)
-                store_evidence(
-                    evidence_id=incident_id,
-                    alert_name=alert_name,
-                    metrics=evidence_metrics,
-                    scenario=fast_rca_result.get("scenario", "") if fast_rca_result else "",
-                    root_cause_type=fast_rca_result.get("root_cause", "")[:100] if fast_rca_result else "",
-                    incident_id=incident_id,
-                )
-                log.info(f"Evidence stored: {len(evidence_metrics)} metrics for {alert_name}")
-
-                # Check if we can auto-resolve
-                can_resolve, reason = should_auto_resolve(
-                    alert_name, evidence_metrics,
-                    fast_rca_confidence=fast_rca_result.get("confidence", "") if fast_rca_result else "",
-                )
-                if can_resolve:
-                    auto_resolved = True
-                    from vishwakarma.core.models import LLMResult, InvestigationMeta
-                    comparison = compare_against_baselines(alert_name, evidence_metrics)
-                    analysis = (
-                        f"## Auto-Resolved: Known Normal Pattern\n\n"
-                        f"**{reason}**\n\n"
-                        f"## Evidence Comparison\n"
-                        f"{comparison['summary']}\n\n"
-                        f"## Metric Details\n"
-                    )
-                    for n in comparison.get("normal", []):
-                        analysis += f"- {n['metric']}: {n['value']} (baseline: {n['baseline_mean']}±{n['baseline_stddev']}, z={n['z_score']})\n"
-                    if fast_rca_result:
-                        analysis += f"\n## Fast RCA Classification\n{json.dumps(fast_rca_result, indent=2)}\n"
-                    analysis += (
-                        f"\n## Resolution\nNo action needed. This alert pattern has been confirmed normal "
-                        f"{comparison.get('sample_count', '?')} times. "
-                        f"Consider adjusting the alert threshold to reduce false alarms."
-                    )
-                    result = LLMResult(
-                        answer=analysis,
-                        tool_outputs=[],
-                        messages=[],
-                        meta=InvestigationMeta(steps=0),
-                    )
-                    log.info(f"Auto-resolved {alert_name}: {reason}")
-
-                    if slack_client and slack_channel_id and ack_ts:
-                        try:
-                            slack_client.chat_postMessage(
-                                channel=slack_channel_id, thread_ts=ack_ts,
-                                text=f":brain: Auto-resolved — all metrics within learned baselines",
-                                blocks=[{"type": "context", "elements": [
-                                    {"type": "mrkdwn", "text": f":brain: _Auto-resolved: {reason[:200]}_"}
-                                ]}],
-                            )
-                        except Exception:
-                            pass
-                else:
-                    # Not auto-resolvable — inject anomaly info into investigation
-                    comparison = compare_against_baselines(alert_name, evidence_metrics)
-                    if comparison.get("anomalies"):
-                        anomaly_text = "## Evidence Memory — Anomalies Detected\n"
-                        anomaly_text += "These metrics are OUTSIDE learned baselines (from confirmed investigations):\n"
-                        for a in comparison["anomalies"]:
-                            anomaly_text += f"- **{a['metric']}** = {a['value']} (baseline: {a['baseline_mean']}±{a['baseline_stddev']}, z-score={a['z_score']})\n"
-                        anomaly_text += "\nFocus investigation on these anomalous metrics first."
-                        extra_parts.append(anomaly_text)
-                        extra_system_prompt = "\n\n".join(extra_parts) or None
-                        log.info(f"Anomalies injected for {alert_name}: {[a['metric'] for a in comparison['anomalies']]}")
-        except Exception as e:
-            log.debug(f"Evidence check failed (non-fatal): {e}")
 
         # ── Pattern replay: check if a confirmed pattern matches ──
         pattern_matched = False
@@ -694,7 +519,7 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
                         pass
 
                 validation = await loop.run_in_executor(
-                    None, lambda: replay_pattern(best, engine.executor, llm, question, fast_rca_result=fast_rca_result)
+                    None, lambda: replay_pattern(best, engine.executor, llm, question)
                 )
                 if validation and validation.get("matched") and validation.get("confidence") in ("high", "medium"):
                     pattern_matched = True
@@ -1037,7 +862,7 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
                 severity=issue.severity,
                 pdf_path=pdf_path,
                 incident_id=incident_id,
-                thread_ts=ack_ts or fast_rca_ts,
+                thread_ts=ack_ts,
             )
             slack_ts = resp.get("ts")
         except Exception as e:

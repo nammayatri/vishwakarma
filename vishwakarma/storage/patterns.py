@@ -286,7 +286,6 @@ def replay_pattern(
     executor,
     llm=None,  # only used as fallback if keyword check is ambiguous
     alert_context: str = "",
-    fast_rca_result: dict | None = None,
 ) -> dict | None:
     """Replay a pattern's investigation steps and validate deterministically.
 
@@ -300,32 +299,6 @@ def replay_pattern(
     steps = pattern.get("investigation_steps", [])
     if not steps:
         return None
-
-    # ── Pre-check: don't replay when fast RCA has LOW confidence + unknown scenario ──
-    if fast_rca_result:
-        fast_confidence = fast_rca_result.get("confidence", "").upper()
-        fast_scenario = fast_rca_result.get("scenario", "")
-        if fast_confidence == "LOW" and fast_scenario in ("unknown", "H", ""):
-            log.info(f"Pattern skip: fast RCA confidence LOW with scenario='{fast_scenario}' — too uncertain for replay")
-            return {"matched": False, "reason": "fast RCA confidence too low for pattern replay"}
-
-    # ── Pre-check: cross-reference with fast RCA ──
-    # If fast RCA already classified this as a different root cause type, skip replay
-    if fast_rca_result:
-        fast_scenario = fast_rca_result.get("scenario", "").lower()
-        pattern_type = pattern.get("root_cause_type", "").lower()
-        # Map fast RCA scenarios to pattern types for cross-check
-        scenario_type_map = {
-            "a": "missing_index", "b": "bad_deploy", "c": "autovacuum",
-            "d": "connection_pool", "e": "replication_lag", "f": "db_5xx",
-            "g": "background_job", "h": "normal_load",
-        }
-        fast_type = scenario_type_map.get(fast_scenario, "")
-        if fast_type and fast_type != pattern_type and fast_rca_result.get("confidence") == "high":
-            log.info(f"Pattern skip: fast RCA says '{fast_type}' (HIGH), pattern is '{pattern_type}'")
-            return {"matched": False, "confidence": "low",
-                    "root_cause": f"Fast RCA classified as {fast_type}, not {pattern_type}",
-                    "evidence": "Cross-check with fast RCA", "differences": "Different classification"}
 
     # ── Execute pattern steps ──
     all_output_text = ""

@@ -4,6 +4,15 @@ WORKDIR /build
 COPY requirements.txt .
 RUN pip install --no-cache-dir --user -r requirements.txt
 
+# ── Console UI build stage ────────────────────────────────────────────────────
+FROM --platform=linux/amd64 node:20-slim AS webbuilder
+
+WORKDIR /web
+COPY web/package.json web/package-lock.json ./
+RUN npm ci
+COPY web/ ./
+RUN npm run build
+
 FROM --platform=linux/amd64 python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1
@@ -60,6 +69,9 @@ ENV PATH=/root/.local/bin:$PATH
 # Copy application
 COPY vishwakarma/ ./vishwakarma/
 COPY pyproject.toml .
+
+# Console UI bundle (served at /console)
+COPY --from=webbuilder /web/dist ./web/dist
 
 # Install the package itself (no deps — already installed above)
 RUN pip install --no-cache-dir --no-deps .

@@ -70,18 +70,19 @@ def fixture_repo(tmp_path_factory):
 @pytest.fixture(scope="module")
 def toolset(fixture_repo, tmp_path_factory) -> CodeAnalystToolset:
     repo_dir = tmp_path_factory.mktemp("repos")
-    return CodeAnalystToolset({
+    ts = CodeAnalystToolset({
         "repo_dir": str(repo_dir),
         "default_branch": "main",
         "repos": [{"name": "app", "url": str(fixture_repo["origin"]), "branch": "main"}],
     })
-
-
-def test_repo_sync_clones_then_ffs(toolset, fixture_repo):
-    out = toolset.execute("repo_sync", {"repo": "app"})
+    # Initial clone here so every test is self-sufficient (no ordering deps).
+    out = ts.execute("repo_sync", {"repo": "app"})
     assert out.status == ToolStatus.SUCCESS, out.error
     assert "Cloned app" in str(out.output)
+    return ts
 
+
+def test_repo_sync_ffs_new_commits(toolset, fixture_repo):
     # New commit on origin → sync fast-forwards
     origin = fixture_repo["origin"]
     (origin / "new_file.txt").write_text("post-clone change\n")

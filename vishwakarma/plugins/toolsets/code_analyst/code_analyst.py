@@ -310,8 +310,18 @@ class CodeAnalystToolset(Toolset):
         repo = params["repo"]
         ts = params["timestamp"]
         hours = int(params.get("window_hours") or 24)
+        # Compute the window in Python — git approxidate parsing of
+        # "<ts> +N hours" is ambiguous (can read +N as a timezone offset).
+        from datetime import datetime, timedelta
+        raw = ts.strip().replace("Z", "+00:00")
+        try:
+            center = datetime.fromisoformat(raw)
+        except ValueError:
+            raise ValueError(f"timestamp must be ISO8601, got {ts!r}")
+        since = (center - timedelta(hours=hours)).isoformat()
+        until = (center + timedelta(hours=hours)).isoformat()
         args = [
-            "log", f"--since={ts} -{hours} hours", f"--until={ts} +{hours} hours",
+            "log", f"--since={since}", f"--until={until}",
             "--date=iso", "--pretty=format:%h %ad %an  %s", "--no-merges",
         ]
         if params.get("path"):
