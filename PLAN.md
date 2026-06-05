@@ -4,9 +4,14 @@
 >
 > - **Branch:** `argus` (created from `ny-vishwakarma` @ 07f5fe9, v1.1.23 in prod)
 > - **Current milestone:** Milestone 1 = Phase 0 (Postgres+pgvector, Memorystore dedup, durable `investigations` table, SQLite history migration) + Phase 1 (Tier-1 code-analyst toolset)
-> - **Status:** NOT STARTED — plan committed, implementation next
-> - **Next step:** Phase 0 — `storage/db.py` Postgres connection layer behind the existing function API
-> - **Done so far:** (nothing yet — update this list as work lands)
+> - **Status:** Phase 0 COMPLETE — Phase 1 (code_analyst toolset) next
+> - **Next step:** Phase 1 — `plugins/toolsets/code_analyst/` (repo cache, git blame/log, deploy_diff, ast-grep, stacktrace_to_source)
+> - **Done so far:**
+>   - Phase 0 ✅ dual-backend storage (`storage/db.py` — SQLite default + Postgres via `VK_PG_DSN`/`storage.dsn`, PGConnection adapter translates `?`→`%s`, conditional pgvector)
+>   - Phase 0 ✅ durable investigations (`storage/investigations.py` — create/claim/checkpoint/resume/orphan-reap/attempt-budget; engine checkpoints each step via `stream_investigate(incident_id=…)`)
+>   - Phase 0 ✅ Redis dedup (`storage/dedup.py` — SETNX+TTL via `VK_REDIS_URL`, in-memory fallback; replaced `_active_fingerprints` in server.py)
+>   - Phase 0 ✅ migration (`storage/migrate.py` + `vk migrate-db --from … --to …`, idempotent)
+>   - Phase 0 ✅ tests (`tests/test_storage_phase0.py` — 9 passing: parity, lifecycle, races, TTL, migration)
 > - **Key context to re-load after compaction:** read this whole file; prod deployment is untouched single-pod v1.1.23 on EKS `monitoring` ns; all architectural decisions are final (see "Confirmed decisions" + "Resolved in discussion"); never touch prod infra without asking the user.
 
 ## Context

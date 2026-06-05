@@ -207,7 +207,12 @@ def set_dedup(fingerprint: str, incident_id: str, window_seconds: int = 300) -> 
     expires = time.time() + window_seconds
     with _lock:
         conn.execute(
-            "INSERT OR REPLACE INTO dedup_state (fingerprint, incident_id, expires_at) VALUES (?,?,?)",
+            """
+            INSERT INTO dedup_state (fingerprint, incident_id, expires_at) VALUES (?,?,?)
+            ON CONFLICT(fingerprint) DO UPDATE SET
+              incident_id = excluded.incident_id,
+              expires_at  = excluded.expires_at
+            """,
             (fingerprint, incident_id, expires),
         )
         conn.commit()

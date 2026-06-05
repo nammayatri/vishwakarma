@@ -42,3 +42,6 @@ prompt-toolkit>=3.0.47
 kubernetes>=30.1.0
 boto3>=1.34.0
 psycopg2-binary>=2.9.9
+
+# Control plane (multi-pod dedup + job streams)
+redis>=5.0.0

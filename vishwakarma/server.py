@@ -23,11 +23,11 @@ import uuid
 from collections.abc import AsyncGenerator
 from typing import Any
 
-# In-memory set of fingerprints currently being investigated.
-# Skip only if investigation is RUNNING — clear immediately on completion.
-# Matches Holmes behavior: no time-based window.
-_active_fingerprints: set[str] = set()
-_active_fingerprints_lock = threading.Lock()
+# Fingerprints currently being investigated — Redis-backed when storage.redis_url
+# is configured (multi-pod safe), in-memory fallback otherwise.
+# Skip only if investigation is RUNNING — released on completion; the Redis TTL
+# self-clears leaked locks if a pod dies mid-investigation.
+from vishwakarma.storage import dedup as _dedup
 
 # Global concurrency limit — max simultaneous investigations.
 # Alerts beyond this limit queue and wait rather than running in parallel.
@@ -94,7 +94,8 @@ def create_app(config=None) -> FastAPI:
     @app.on_event("startup")
     async def startup():
         from vishwakarma.storage.db import init_db
-        init_db(config.db_path)
+        init_db(config.db_path, dsn=config.pg_dsn)
+        _dedup.init_dedup(config.redis_url)
         from vishwakarma.core.learnings import LearningsManager
         _state["learnings"] = LearningsManager()
         _state["toolset_manager"] = config.make_toolset_manager()
@@ -244,13 +245,12 @@ def create_app(config=None) -> FastAPI:
         for issue in issues:
             fingerprint = alert_fingerprint(issue.labels)
 
-            # Skip only if an investigation for this alert is currently running (Holmes pattern)
-            with _active_fingerprints_lock:
-                if fingerprint in _active_fingerprints:
-                    log.info(f"Alert deduplicated (investigation in progress): {issue.title}")
-                    triggered.append({"title": issue.title, "status": "deduplicated"})
-                    continue
-                _active_fingerprints.add(fingerprint)
+            # Skip only if an investigation for this alert is currently running
+            # (Holmes pattern). Atomic across pods when Redis is configured.
+            if not _dedup.try_acquire(fingerprint):
+                log.info(f"Alert deduplicated (investigation in progress): {issue.title}")
+                triggered.append({"title": issue.title, "status": "deduplicated"})
+                continue
 
             incident_id = str(uuid.uuid4())
 
@@ -797,11 +797,27 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
                 except Exception as e:
                     log.warning(f"Status message failed: {e}")
 
+            # Durable job: create + claim so the conversation checkpoints to
+            # the investigations table at every step (crash-resumable).
+            try:
+                from vishwakarma.storage.investigations import (
+                    create_investigation, claim_investigation,
+                )
+                import socket
+                create_investigation(
+                    incident_id,
+                    alert_key=issue.labels.get("alertname") or issue.title,
+                )
+                claim_investigation(incident_id, worker_id=socket.gethostname())
+            except Exception as inv_err:
+                log.warning(f"Durable-job setup failed (continuing without): {inv_err}")
+
             for event in engine.stream_investigate(
                 question=question,
                 runbooks=matched_runbooks or None,
                 extra_system_prompt=extra_system_prompt,
                 pre_investigation_findings=sub_agent_findings_text,
+                incident_id=incident_id,
             ):
                 etype = event.get("type", "")
 
@@ -867,6 +883,13 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
                 except Exception:
                     pass
 
+            # Durable job: terminal state
+            try:
+                from vishwakarma.storage.investigations import finish_investigation
+                finish_investigation(incident_id, "done")
+            except Exception:
+                pass
+
             # Build a result-like object for the rest of the flow
             from vishwakarma.core.models import LLMResult, InvestigationMeta
             return LLMResult(
@@ -880,9 +903,13 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
             result = await loop.run_in_executor(None, _run_streaming_investigation)
     except Exception as e:
         log.error(f"Alert investigation failed for {issue.title}: {e}", exc_info=True)
+        try:
+            from vishwakarma.storage.investigations import finish_investigation
+            finish_investigation(incident_id, "failed")
+        except Exception:
+            pass
         if fingerprint:
-            with _active_fingerprints_lock:
-                _active_fingerprints.discard(fingerprint)
+            _dedup.release(fingerprint)
         return
 
     analysis = result.answer or "(no analysis)"
@@ -959,8 +986,7 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
 
     # Release the dedup lock — next firing of this alert will trigger a fresh investigation
     if fingerprint:
-        with _active_fingerprints_lock:
-            _active_fingerprints.discard(fingerprint)
+        _dedup.release(fingerprint)
         log.info(f"Investigation complete for {issue.title} — dedup lock released")
 
 

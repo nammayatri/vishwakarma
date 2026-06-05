@@ -245,6 +245,13 @@ class VishwakarmaConfig:
         self.db_path: str = _env(
             "VK_DB_PATH", storage.get("db_path", "/data/vishwakarma.db")
         )
+        # Postgres DSN — when set, storage uses the shared control-plane
+        # Postgres instead of local SQLite (multi-pod safe).
+        # e.g. postgresql://vk:pass@10.x.y.z:5432/vishwakarma
+        self.pg_dsn: str = _env("VK_PG_DSN", storage.get("dsn", "")) or ""
+        # Control-plane Redis (dedup + job streams). Empty = in-process fallbacks.
+        # e.g. redis://10.x.y.z:6379/0
+        self.redis_url: str = _env("VK_REDIS_URL", storage.get("redis_url", "")) or ""
 
         # Custom certificate
         self.certificate: str | None = _env("CERTIFICATE", raw.get("certificate"))

@@ -209,9 +209,14 @@ def store_evidence(
     conn = _get_conn()
     with _lock:
         conn.execute(
-            "INSERT OR REPLACE INTO evidence_snapshots "
+            "INSERT INTO evidence_snapshots "
             "(id, alert_name, scenario, root_cause_type, metrics, outcome, incident_id, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(id) DO UPDATE SET "
+            "  alert_name = excluded.alert_name, scenario = excluded.scenario, "
+            "  root_cause_type = excluded.root_cause_type, metrics = excluded.metrics, "
+            "  outcome = excluded.outcome, incident_id = excluded.incident_id, "
+            "  created_at = excluded.created_at",
             (evidence_id, alert_name, scenario, root_cause_type,
              json.dumps(metrics), outcome, incident_id, time.time()),
         )
@@ -314,9 +319,13 @@ def _update_baselines(alert_name: str) -> None:
             n = len(values)
 
             conn.execute(
-                "INSERT OR REPLACE INTO learned_baselines "
+                "INSERT INTO learned_baselines "
                 "(alert_name, metric_name, mean, stddev, min_val, max_val, sample_count, last_updated) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(alert_name, metric_name) DO UPDATE SET "
+                "  mean = excluded.mean, stddev = excluded.stddev, "
+                "  min_val = excluded.min_val, max_val = excluded.max_val, "
+                "  sample_count = excluded.sample_count, last_updated = excluded.last_updated",
                 (alert_name, metric_name, mean, stddev, min_val, max_val, n, now),
             )
         conn.commit()

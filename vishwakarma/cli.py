@@ -192,7 +192,7 @@ def oracle(
         from vishwakarma.storage.queries import list_oracle_sessions
         from vishwakarma.storage.db import init_db
         import datetime
-        init_db(cfg.db_path)
+        init_db(cfg.db_path, dsn=cfg.pg_dsn)
         rows = list_oracle_sessions(limit=20)
         if not rows:
             typer.echo("No oracle sessions found.")
@@ -409,7 +409,7 @@ def incidents_list(
     cfg = _load_config(config)
     from vishwakarma.storage.db import init_db
     from vishwakarma.storage.queries import list_incidents
-    init_db(cfg.db_path)
+    init_db(cfg.db_path, dsn=cfg.pg_dsn)
     incidents = list_incidents(source=source, status=status, limit=limit)
 
     if not incidents:
@@ -447,7 +447,7 @@ def incidents_show(
     cfg = _load_config(config)
     from vishwakarma.storage.db import init_db
     from vishwakarma.storage.queries import get_incident
-    init_db(cfg.db_path)
+    init_db(cfg.db_path, dsn=cfg.pg_dsn)
     inc = get_incident(incident_id)
     if not inc:
         console.print(f"[red]Incident {incident_id} not found[/red]")
@@ -473,7 +473,7 @@ def incidents_search(
     cfg = _load_config(config)
     from vishwakarma.storage.db import init_db
     from vishwakarma.storage.queries import search_incidents
-    init_db(cfg.db_path)
+    init_db(cfg.db_path, dsn=cfg.pg_dsn)
     results = search_incidents(query, limit=limit)
     if not results:
         console.print(f"[yellow]No incidents matching '{query}'[/yellow]")
@@ -490,7 +490,7 @@ def incidents_stats(
     cfg = _load_config(config)
     from vishwakarma.storage.db import init_db
     from vishwakarma.storage.queries import get_stats
-    init_db(cfg.db_path)
+    init_db(cfg.db_path, dsn=cfg.pg_dsn)
     stats = get_stats()
     console.print(f"Total incidents: [bold]{stats['total']}[/bold]")
     console.print("\nBy status:")
@@ -499,6 +499,33 @@ def incidents_stats(
     console.print("\nBy source:")
     for k, v in stats.get("by_source", {}).items():
         console.print(f"  {k}: {v}")
+
+
+# ── vk migrate-db ─────────────────────────────────────────────────────────────
+
+@app.command("migrate-db")
+def migrate_db(
+    from_db: str = typer.Option(..., "--from", help="Source SQLite path, e.g. /data/vishwakarma.db"),
+    to_dsn: str = typer.Option(..., "--to", help="Target Postgres DSN, e.g. postgresql://vk:pass@host:5432/vishwakarma"),
+):
+    """Migrate incident history from SQLite to the control-plane Postgres.
+
+    Idempotent (upserts by primary key) — safe to re-run. dedup_state is
+    not migrated (ephemeral; Redis owns it in the new topology).
+    """
+    from vishwakarma.storage.migrate import migrate_sqlite_to_postgres
+    if not Path(from_db).exists():
+        console.print(f"[red]Source DB not found: {from_db}[/red]")
+        raise typer.Exit(1)
+    console.print(f"Migrating [bold]{from_db}[/bold] → postgres...")
+    counts = migrate_sqlite_to_postgres(from_db, to_dsn)
+    table = Table(title="Migration Result")
+    table.add_column("Table")
+    table.add_column("Rows", justify="right")
+    for t, n in counts.items():
+        table.add_row(t, str(n))
+    console.print(table)
+    console.print("[green]Migration complete (idempotent — safe to re-run).[/green]")
 
 
 # ── vk serve ──────────────────────────────────────────────────────────────────

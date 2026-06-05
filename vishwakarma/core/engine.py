@@ -523,6 +523,7 @@ class InvestigationEngine:
         bash_always_allow: bool = False,
         bash_always_deny: bool = False,
         pre_investigation_findings: str | None = None,
+        incident_id: str | None = None,
     ) -> Generator[dict, None, None]:
         """
         Stream investigation events as they happen.
@@ -532,8 +533,22 @@ class InvestigationEngine:
         soon as their arguments are fully received from the LLM stream,
         while the LLM continues generating remaining tool calls or text.
         This reduces wall-clock time when the LLM emits multiple tool calls.
+
+        When incident_id is provided, the conversation is checkpointed to the
+        investigations table at each step boundary so a crashed/killed run can
+        be resumed from the last step by another worker (durable jobs).
         """
         guard = LoopGuard()
+
+        def _checkpoint(step_no: int) -> None:
+            if not incident_id:
+                return
+            try:
+                from vishwakarma.storage.investigations import checkpoint_investigation
+                checkpoint_investigation(incident_id, messages=messages, step=step_no)
+            except Exception as cp_err:
+                # Checkpointing must never break a live investigation.
+                log.warning(f"Checkpoint failed for {incident_id} at step {step_no}: {cp_err}")
         compactions = 0
         tool_call_counter = 0
         all_stream_tool_outputs: list[ToolOutput] = []
@@ -723,6 +738,7 @@ class InvestigationEngine:
                     for f in overlap_futures.values():
                         f.cancel()
                     messages.append({"role": "assistant", "content": collected_content})
+                    _checkpoint(step + 1)
                     yield {"type": "done", "content": collected_content, "messages": messages}
                     return
 
@@ -826,6 +842,10 @@ class InvestigationEngine:
                     elif call_id in stream_results:
                         _, output, content = stream_results[call_id]
                         messages.append({"role": "tool", "tool_call_id": call_id, "content": content})
+
+                # Durable-job checkpoint: conversation + step persisted so a
+                # crashed run resumes from here instead of restarting.
+                _checkpoint(step + 1)
 
             yield {"type": "max_steps_reached", "steps": self.max_steps, "messages": messages}
         finally:
