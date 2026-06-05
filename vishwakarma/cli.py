@@ -563,6 +563,57 @@ def serve(
     )
 
 
+# ── vk serve-orchestrator / serve-executor (multi-pod topology) ───────────────
+
+@app.command("serve-orchestrator")
+def serve_orchestrator(
+    config: Optional[str] = typer.Option(None, "--config", "-c"),
+    host: Optional[str] = typer.Option(None, "--host"),
+    port: Optional[int] = typer.Option(None, "--port"),
+):
+    """Start the orchestrator: webhook → dedup → cloud-route → enqueue.
+
+    Investigations run on the per-cloud executors (vk serve-executor).
+    Requires storage.redis_url (job stream) — Postgres strongly recommended.
+    """
+    import uvicorn
+    cfg = _load_config(config)
+    cfg.role = "orchestrator"
+
+    from vishwakarma.utils.log import setup_logging
+    setup_logging()
+
+    # Orchestrator owns the Slack bot (mentions also become jobs) and there
+    # is exactly one of it — same Socket Mode model as today.
+    from vishwakarma.bot.slack import start_bot
+    start_bot(cfg)
+
+    from vishwakarma.server import create_app
+    fastapi_app = create_app(cfg)
+    uvicorn.run(fastapi_app, host=host or cfg.host, port=port or cfg.port, log_config=None)
+
+
+@app.command("serve-executor")
+def serve_executor(
+    cloud: str = typer.Option(..., "--cloud", help="Which cloud this executor pool serves: aws | gcp"),
+    config: Optional[str] = typer.Option(None, "--config", "-c"),
+):
+    """Start a per-cloud executor: consume jobs → investigate → post results.
+
+    Deploy inside the cloud it serves (EKS for aws, GKE for gcp) so toolsets
+    can reach that cloud's VPC-internal databases/Redis/cluster.
+    """
+    cfg = _load_config(config)
+    cfg.role = "executor"
+    cfg.executor_cloud = cloud
+
+    from vishwakarma.utils.log import setup_logging
+    setup_logging()
+
+    from vishwakarma.executor import run_executor
+    run_executor(cfg, cloud)
+
+
 # ── vk version + config ───────────────────────────────────────────────────────
 
 @app.command()

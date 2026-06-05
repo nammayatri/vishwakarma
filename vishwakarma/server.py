@@ -106,12 +106,19 @@ def create_app(config=None) -> FastAPI:
             seed_from_files()
         except Exception as seed_err:
             log.warning(f"Runbook seeding failed (file-based matching still works): {seed_err}")
+        # Orchestrator topology: connect the job stream (requires Redis)
+        if getattr(config, "role", "") == "orchestrator":
+            from vishwakarma.core.jobstream import init_jobstream
+            if not config.redis_url:
+                raise RuntimeError("orchestrator role requires storage.redis_url")
+            init_jobstream(config.redis_url)
+
         from vishwakarma.core.learnings import LearningsManager
         _state["learnings"] = LearningsManager()
         _state["toolset_manager"] = config.make_toolset_manager()
         _state["toolset_manager"].check_all()
 
-        log.info("Vishwakarma server ready")
+        log.info(f"Vishwakarma server ready (role={getattr(config, 'role', '') or 'all-in-one'})")
 
     # ── /healthz ──────────────────────────────────────────────────────────────
 
@@ -264,7 +271,25 @@ def create_app(config=None) -> FastAPI:
 
             incident_id = str(uuid.uuid4())
 
-            # Background investigation
+            if getattr(config, "role", "") == "orchestrator":
+                # Orchestrator topology: route to the cloud whose executors can
+                # reach this alert's data plane, enqueue, done. Executors run
+                # the investigation (including Slack ack) and release dedup.
+                import json as _json
+                from vishwakarma.core.cloud_router import route_issue
+                from vishwakarma.core import jobstream
+                cloud = route_issue(issue, default_cloud=config.default_cloud)
+                jobstream.enqueue(cloud, {
+                    "incident_id": incident_id,
+                    "fingerprint": fingerprint,
+                    "cloud": cloud,
+                    "issue": _json.loads(issue.model_dump_json()),
+                })
+                triggered.append({"title": issue.title, "status": "queued",
+                                  "cloud": cloud, "incident_id": incident_id})
+                continue
+
+            # All-in-one topology (vk serve): investigate in-process
             asyncio.create_task(
                 _run_alert_investigation(config, _state, issue, incident_id, fingerprint)
             )

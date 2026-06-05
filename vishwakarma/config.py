@@ -253,6 +253,15 @@ class VishwakarmaConfig:
         # e.g. redis://10.x.y.z:6379/0
         self.redis_url: str = _env("VK_REDIS_URL", storage.get("redis_url", "")) or ""
 
+        # Topology role — set by the serve entrypoints, not usually by YAML:
+        #   ''             all-in-one (vk serve; today's single-pod behavior)
+        #   'orchestrator' webhook+route+enqueue only (vk serve-orchestrator)
+        #   'executor'     consume+investigate only (vk serve-executor)
+        self.role: str = _env("VK_ROLE", raw.get("role", "")) or ""
+        orch = raw.get("orchestrator", {})
+        self.default_cloud: str = _env("VK_DEFAULT_CLOUD", orch.get("default_cloud", "aws"))
+        self.executor_cloud: str = _env("VK_EXECUTOR_CLOUD", raw.get("executor", {}).get("cloud", "")) or ""
+
         # Embeddings provider (semantic RAG). Unset = keyword-only matching.
         emb = raw.get("embeddings", {})
         self.embeddings_api_base: str = _env("VK_EMBEDDINGS_API_BASE", emb.get("api_base", "")) or ""

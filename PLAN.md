@@ -4,8 +4,8 @@
 >
 > - **Branch:** `argus` (created from `ny-vishwakarma` @ 07f5fe9, v1.1.23 in prod)
 > - **Current milestone:** Milestone 1 = Phase 0 (Postgres+pgvector, Memorystore dedup, durable `investigations` table, SQLite history migration) + Phase 1 (Tier-1 code-analyst toolset)
-> - **Status:** MILESTONE 2 COMPLETE (Phase 2 RAG) — next: Phase 3 (OpenCode CodeAgent adapter + fix gate)
-> - **Next step:** Phase 3 — `core/code_agent.py` session adapter (start/send/end against OpenCode server), code_session_* tools, fix-confidence gate. Also pending: ask Acme to enable an embeddings model on the gateway team (none today — RAG runs keyword-only until then); verify repo_sync against the real monorepo
+> - **Status:** MILESTONE 4a (Phase 4 dispatch) COMPLETE — orchestrator/executor topology working. Next: 4b (Argus/Sage bot split + @mre trigger) or Phase-3 PR path (blocked on GitHub App).
+> - **Next step:** Phase 4b — second Slack app (Argus), `bot/slack.py` split: Argus handler (@mre subteam-mention match + noise filter → enqueue), Sage unchanged. Pending externals: **Argus Slack app registration**; GitHub App (PR path); Acme embeddings model; update user's global ~/.config/opencode key (old blocked key); verify repo_sync against real monorepo; provision Cloud SQL + Memorystore (GCP) for the real deployment
 > - **Done so far:**
 >   - Phase 0 ✅ dual-backend storage (`storage/db.py` — SQLite default + Postgres via `VK_PG_DSN`/`storage.dsn`, PGConnection adapter translates `?`→`%s`, conditional pgvector)
 >   - Phase 0 ✅ durable investigations (`storage/investigations.py` — create/claim/checkpoint/resume/orphan-reap/attempt-budget; engine checkpoints each step via `stream_investigate(incident_id=…)`)
@@ -20,6 +20,14 @@
 >   - Phase 2 ✅ runbook tables + CRUD (`storage/runbooks.py` — normalize_alert_key, map upsert, hit/miss auto-demote, seed_from_files: 13 prod runbooks import cleanly)
 >   - Phase 2 ✅ hybrid matcher (`core/runbook_match.py` — exact-map/keyword/vector → RRF → LLM rerank >3 candidates; wired into `load_matching_runbooks` with file fallback) + `runbook_search` tool
 >   - Phase 2 ✅ tests (`tests/test_rag_phase2.py` — 12 passing; full suite 31)
+>   - Phase 3 ✅ OpenCode probed (1.4.3: POST /session, blocking /session/{id}/message → {info,parts}; agent 'plan'=read-only, 'build'=edit; cwd-scoped servers; provider key via {env:VK_GATEWAY_KEY}, never on disk)
+>   - Phase 3 ✅ CodeAgent adapter (`core/code_agent.py` — start(repo,mode)/send/end; edit mode = isolated worktree on argus/fix-* branch, diff collected, worktree cleaned; per-send timeout + session wall-clock budget; transcript checkpointable)
+>   - Phase 3 ✅ code_session toolset (`plugins/toolsets/code_session/` — start/send/end tools; read always, edit behind allow_edit config; repo allow-list)
+>   - Phase 3 ✅ tests (`tests/test_code_agent.py` — 9 fake-backend + 1 REAL OpenCode integration passing via Acme gateway; full suite 40)
+>   - Phase 4a ✅ cloud router (`core/cloud_router.py` — explicit label > single-cloud signals > both > default)
+>   - Phase 4a ✅ job stream (`core/jobstream.py` — Redis Streams vk:jobs:{aws,gcp}, group 'executors', enqueue/consume/ack, XAUTOCLAIM stale recovery, both fan-out, depth/pending metrics)
+>   - Phase 4a ✅ topology entrypoints (`vk serve-orchestrator` — webhook→dedup→route→enqueue, owns Slack bot; `vk serve-executor --cloud aws|gcp` — consume→reuse _do_investigation→ack, idempotent re-delivery via investigations table, SIGTERM-graceful; `vk serve` unchanged all-in-one)
+>   - Phase 4a ✅ tests (`tests/test_phase4_dispatch.py` — 12 passing: router variants, stream isolation/fan-out/stale-claim, executor job handling + duplicate-drop + bad-payload-drop; full suite 52)
 > - **Key context to re-load after compaction:** read this whole file; prod deployment is untouched single-pod v1.1.23 on EKS `monitoring` ns; all architectural decisions are final (see "Confirmed decisions" + "Resolved in discussion"); never touch prod infra without asking the user.
 
 ## Context
