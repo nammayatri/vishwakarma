@@ -1,0 +1,47 @@
+# AWS executor pool — runs in EKS, reaches AWS-side RDS/Redis/cluster.
+# Scale replicas with load; each pod is one consumer in the 'executors' group.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: argus-executor-aws
+  namespace: argus
+  labels: { app: argus-executor-aws }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: argus-executor-aws }
+  template:
+    metadata:
+      labels: { app: argus-executor-aws }
+    spec:
+      terminationGracePeriodSeconds: 120   # finish the current job step
+      containers:
+        - name: executor
+          image: CHANGE_ME/vishwakarma:latest-argus
+          command: ["vk", "serve-executor", "--cloud", "aws", "--config", "/etc/argus/config.yaml"]
+          envFrom:
+            - secretRef: { name: argus-secrets }
+          env:
+            - name: VK_CONFIG
+              value: /etc/argus/config.yaml
+          volumeMounts:
+            - { name: config, mountPath: /etc/argus }
+            - { name: data, mountPath: /data }
+          resources:
+            requests: { cpu: 500m, memory: 1Gi }
+            limits: { cpu: "2", memory: 4Gi }
+      volumes:
+        - name: config
+          configMap: { name: argus-config }
+        - name: data
+          persistentVolumeClaim: { claimName: argus-executor-aws-data }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: argus-executor-aws-data
+  namespace: argus
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests: { storage: 50Gi }   # repo cache + learnings + PDFs

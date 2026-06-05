@@ -1,0 +1,65 @@
+# COPY to configmap.yaml and edit the endpoints for your site.
+# Secrets (tokens, DSNs, keys) come from argus-secrets env vars, NOT here.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argus-config
+  namespace: argus
+data:
+  config.yaml: |
+    llm:
+      model: openai/open-large
+      fast_model: openai/open-fast
+      api_base: https://llm-gateway.example.com
+      fast_fallbacks:
+        - openai/glm-latest
+        - openai/minimaxai/minimax-m2
+      model_fallbacks:
+        - openai/minimaxai/minimax-m2
+      max_tokens: 65536
+      temperature: 0.0
+      timeout: 300
+
+    cluster_name: my-cluster
+    max_steps: 40
+
+    orchestrator:
+      default_cloud: aws
+
+    ui:
+      auth_disabled: false
+      admin_tokens: []     # set via separate secret-backed config in prod
+      reader_tokens: []
+
+    toolsets:
+      bash:
+        enabled: true
+        config:
+          safe_mode: false
+          allow: [aws, kubectl, stern, gcloud]
+          block: [rm, wget, curl]
+      prometheus:
+        enabled: true
+        config:
+          url: http://vmselect.monitoring:8481/select/0/prometheus
+      elasticsearch:
+        enabled: false
+      database:
+        enabled: false
+      todo:
+        enabled: true
+      learnings:
+        enabled: true
+      runbooks:
+        enabled: true
+      code_analyst:
+        enabled: true
+        config:
+          repo_dir: /data/repos
+          default_branch: main
+          repos:
+            - name: backend
+              url: https://github.com/your-org/your-backend.git
+              branch: main
+      code_session:
+        enabled: false   # enable once OpenCode is in the image + repos configured

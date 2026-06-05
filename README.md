@@ -16,6 +16,32 @@
 
 ---
 
+## 👁 Argus — the multi-cloud evolution
+
+The `argus` topology scales Vishwakarma horizontally across clouds and adds
+code-level root-causing:
+
+- **Two run modes** — all-in-one `vk serve` (zero deps, SQLite — start here)
+  or orchestrator + per-cloud executor pools over Redis Streams
+  (`vk serve-orchestrator` / `vk serve-executor --cloud aws|gcp`).
+- **Durable investigations** — every step checkpointed; pod dies → another
+  executor resumes from the last step.
+- **Code intelligence** — `code_analyst` (blame / deploy diff / stacktrace→
+  source) + conversational **OpenCode sessions** for deep tracing and
+  (gated) fix-writing in isolated worktrees.
+- **Two Slack bots** — Sage chats; **Argus** triggers a full RCA whenever
+  the team tags `@mre` (zero workflow change) or `@Argus`.
+- **DB-backed runbooks** with hybrid retrieval (exact-map + keyword + vector
+  → RRF → rerank), self-curating via ✅/❌ feedback.
+- **Web console** at `/console` — live investigations (SSE), incident
+  history, runbook studio, fleet view. Admin/reader RBAC.
+
+Deep dive: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) · security model:
+[docs/SECURITY.md](docs/SECURITY.md) · k8s manifests:
+[k8s/argus/](k8s/argus/) · build status: [PLAN.md](PLAN.md)
+
+---
+
 ## 🗺️ Architecture Overview
 
 ```mermaid

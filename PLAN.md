@@ -4,8 +4,8 @@
 >
 > - **Branch:** `argus` (created from `ny-vishwakarma` @ 07f5fe9, v1.1.23 in prod)
 > - **Current milestone:** Milestone 1 = Phase 0 (Postgres+pgvector, Memorystore dedup, durable `investigations` table, SQLite history migration) + Phase 1 (Tier-1 code-analyst toolset)
-> - **Status:** MILESTONE 5b (console frontend) COMPLETE — full React console built & served at /console. ALL core phases done except: Phase-3 PR path (GitHub App), Phase 6 (OSS hardening), deployment.
-> - **Next step:** Phase 6 (OSS hardening: strip NY data, Helm chart, README) OR deployment prep (Docker image with node build stage + shadow deploy) OR Phase-3 PR finish when GitHub App exists. Build the UI in Docker: `cd web && npm ci && npm run build` before the Python stage. Pending externals: **Argus Slack app registration**; GitHub App; Acme embeddings model; ~/.config/opencode old key; repo_sync vs real monorepo; Cloud SQL + Memorystore (GCP)
+> - **Status:** PHASE 6a COMPLETE + fast-RCA REMOVED (user decision: it was mostly incorrect; -641 lines; auto-resolve gone too — every alert gets the full investigation; pattern replay of human-confirmed patterns kept). Roadmap code-complete except Phase-3 PR path.
+> - **Next step:** shadow deployment (build image, provision Cloud SQL + Memorystore, apply k8s/argus/ manifests, test channel) OR Phase-3 PR finish when GitHub App exists. NOTE: deployment uses plain YAML in k8s/argus/ — NO Helm (user decision). Pending externals: **Argus Slack app registration**; GitHub App; Acme embeddings model; ~/.config/opencode old key; repo_sync vs real monorepo; Cloud SQL + Memorystore (GCP)
 > - **Done so far:**
 >   - Phase 0 ✅ dual-backend storage (`storage/db.py` — SQLite default + Postgres via `VK_PG_DSN`/`storage.dsn`, PGConnection adapter translates `?`→`%s`, conditional pgvector)
 >   - Phase 0 ✅ durable investigations (`storage/investigations.py` — create/claim/checkpoint/resume/orphan-reap/attempt-budget; engine checkpoints each step via `stream_investigate(incident_id=…)`)
@@ -33,6 +33,10 @@
 >   - Phase 5a ✅ event bus (`core/eventbus.py` — in-process + Redis pub/sub vk:events, no double-delivery, slow-subscriber drop; published from server stream loop + executor)
 >   - Phase 5a ✅ console API (`ui/console_api.py` @ /api/console — overview, investigations list/detail w/ checkpointed transcript, incidents search (LIKE+semantic), runbook studio CRUD/mappings/dry-run, feedback → evidence+runbook counters, fixes (awaiting_fix_review), fleet (queue depth/pending, executor heartbeats, orphans), SSE /events w/ keepalive + incident filter; RBAC admin/reader via X-VK-Token, auth_disabled dev default)
 >   - Phase 5a ✅ tests (`tests/test_console_api.py` — 12 passing; full suite 77)
+>   - Phase 6 ✅ fast-RCA REMOVED (core/fast_rca.py deleted; server auto-resolve path gone; patterns.replay_pattern cleaned)
+>   - Phase 6a ✅ Dockerfile node build stage (web → /app/web/dist); SPA mount resolves repo/container/env layouts
+>   - Phase 6a ✅ k8s/argus/ plain-YAML manifests (orchestrator Recreate-strategy, executor-{aws,gcp} pools, configmap+secrets examples, shadow-mode README) — NO Helm per user
+>   - Phase 6a ✅ docs (docs/ARCHITECTURE.md — topology+flow+durability; docs/SECURITY.md — threat model; LICENSE Apache-2.0; README Argus section)
 >   - Phase 5b ✅ console frontend (`web/` — Vite+React+TS+Tailwind dark theme, base /console/; pages: Dashboard, Investigations + live SSE detail w/ checkpointed transcript, Incidents search/detail w/ ✅/❌ feedback, Runbook studio (editor/dry-run/mappings), Fixes queue, Fleet (queues/executors/orphans), Settings (token). Typed api client w/ X-VK-Token. Served by server.py `_mount_console_spa` at /console with SPA fallback + traversal-safe assets; builds clean: 74KB gzip)
 > - **Key context to re-load after compaction:** read this whole file; prod deployment is untouched single-pod v1.1.23 on EKS `monitoring` ns; all architectural decisions are final (see "Confirmed decisions" + "Resolved in discussion"); never touch prod infra without asking the user.
 
