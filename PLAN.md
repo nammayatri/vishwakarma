@@ -4,14 +4,16 @@
 >
 > - **Branch:** `argus` (created from `ny-vishwakarma` @ 07f5fe9, v1.1.23 in prod)
 > - **Current milestone:** Milestone 1 = Phase 0 (Postgres+pgvector, Memorystore dedup, durable `investigations` table, SQLite history migration) + Phase 1 (Tier-1 code-analyst toolset)
-> - **Status:** Phase 0 COMPLETE — Phase 1 (code_analyst toolset) next
-> - **Next step:** Phase 1 — `plugins/toolsets/code_analyst/` (repo cache, git blame/log, deploy_diff, ast-grep, stacktrace_to_source)
+> - **Status:** MILESTONE 1 COMPLETE (Phase 0 + Phase 1 Tier-1) — next: enable code_analyst in a config + shadow-test, then Phase 2 (RAG) or Phase 4 prep
+> - **Next step:** configure `toolsets.code_analyst` with real repos in a test config; verify `repo_sync` against the actual example-app monorepo (sparse-checkout); then Phase 2 embeddings helper
 > - **Done so far:**
 >   - Phase 0 ✅ dual-backend storage (`storage/db.py` — SQLite default + Postgres via `VK_PG_DSN`/`storage.dsn`, PGConnection adapter translates `?`→`%s`, conditional pgvector)
 >   - Phase 0 ✅ durable investigations (`storage/investigations.py` — create/claim/checkpoint/resume/orphan-reap/attempt-budget; engine checkpoints each step via `stream_investigate(incident_id=…)`)
 >   - Phase 0 ✅ Redis dedup (`storage/dedup.py` — SETNX+TTL via `VK_REDIS_URL`, in-memory fallback; replaced `_active_fingerprints` in server.py)
 >   - Phase 0 ✅ migration (`storage/migrate.py` + `vk migrate-db --from … --to …`, idempotent)
 >   - Phase 0 ✅ tests (`tests/test_storage_phase0.py` — 9 passing: parity, lifecycle, races, TTL, migration)
+>   - Phase 1 ✅ code_analyst toolset (`plugins/toolsets/code_analyst/` — repo_sync clone-once/ff-pull, git_blame, git_log_around, deploy_diff, code_search (ast-grep→rg fallback), stacktrace_to_source w/ suffix matching + blame; read-only git, repo allow-list, path-traversal + ref-injection guards)
+>   - Phase 1 ✅ tests (`tests/test_code_analyst.py` — 10 passing against a fixture repo simulating a breaking deploy)
 > - **Key context to re-load after compaction:** read this whole file; prod deployment is untouched single-pod v1.1.23 on EKS `monitoring` ns; all architectural decisions are final (see "Confirmed decisions" + "Resolved in discussion"); never touch prod infra without asking the user.
 
 ## Context
