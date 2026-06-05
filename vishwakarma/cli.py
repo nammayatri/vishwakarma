@@ -543,9 +543,12 @@ def serve(
     from vishwakarma.utils.log import setup_logging
     setup_logging()
 
-    # Start Slack bot in background thread
+    # Start Slack bots in background threads — Sage (chat) + Argus (RCA
+    # trigger via @mre; no-op until argus.bot_token/app_token are configured)
     from vishwakarma.bot.slack import start_bot
     start_bot(cfg)
+    from vishwakarma.bot.argus import start_argus
+    start_argus(cfg)
 
     # Start daily cost report scheduler
     from vishwakarma.scheduler.cost_report import start_cost_reporter
@@ -583,10 +586,12 @@ def serve_orchestrator(
     from vishwakarma.utils.log import setup_logging
     setup_logging()
 
-    # Orchestrator owns the Slack bot (mentions also become jobs) and there
-    # is exactly one of it — same Socket Mode model as today.
+    # Orchestrator owns the Slack bots (there's exactly one orchestrator):
+    # Sage (chat/commands, unchanged) + Argus (RCA trigger via @mre).
     from vishwakarma.bot.slack import start_bot
     start_bot(cfg)
+    from vishwakarma.bot.argus import start_argus
+    start_argus(cfg)
 
     from vishwakarma.server import create_app
     fastapi_app = create_app(cfg)

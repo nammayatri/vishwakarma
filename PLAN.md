@@ -4,8 +4,8 @@
 >
 > - **Branch:** `argus` (created from `ny-vishwakarma` @ 07f5fe9, v1.1.23 in prod)
 > - **Current milestone:** Milestone 1 = Phase 0 (Postgres+pgvector, Memorystore dedup, durable `investigations` table, SQLite history migration) + Phase 1 (Tier-1 code-analyst toolset)
-> - **Status:** MILESTONE 4a (Phase 4 dispatch) COMPLETE — orchestrator/executor topology working. Next: 4b (Argus/Sage bot split + @mre trigger) or Phase-3 PR path (blocked on GitHub App).
-> - **Next step:** Phase 4b — second Slack app (Argus), `bot/slack.py` split: Argus handler (@mre subteam-mention match + noise filter → enqueue), Sage unchanged. Pending externals: **Argus Slack app registration**; GitHub App (PR path); Acme embeddings model; update user's global ~/.config/opencode key (old blocked key); verify repo_sync against real monorepo; provision Cloud SQL + Memorystore (GCP) for the real deployment
+> - **Status:** MILESTONE 4b (Argus bot) CODE-COMPLETE — handler + noise filter + dispatcher built & tested; goes live the moment ARGUS_BOT_TOKEN/ARGUS_APP_TOKEN/ARGUS_MRE_GROUP_ID are set. Next: Phase 5 (UI) or Phase-3 PR path (GitHub App).
+> - **Next step:** Phase 5 — UI backend (REST + SSE on the orchestrator) + React/Vite console. Pending externals: **Argus Slack app registration** (then set the 3 env vars); GitHub App (PR path); Acme embeddings model; update user's global ~/.config/opencode key (old blocked key); verify repo_sync against real monorepo; provision Cloud SQL + Memorystore (GCP)
 > - **Done so far:**
 >   - Phase 0 ✅ dual-backend storage (`storage/db.py` — SQLite default + Postgres via `VK_PG_DSN`/`storage.dsn`, PGConnection adapter translates `?`→`%s`, conditional pgvector)
 >   - Phase 0 ✅ durable investigations (`storage/investigations.py` — create/claim/checkpoint/resume/orphan-reap/attempt-budget; engine checkpoints each step via `stream_investigate(incident_id=…)`)
@@ -28,6 +28,8 @@
 >   - Phase 4a ✅ job stream (`core/jobstream.py` — Redis Streams vk:jobs:{aws,gcp}, group 'executors', enqueue/consume/ack, XAUTOCLAIM stale recovery, both fan-out, depth/pending metrics)
 >   - Phase 4a ✅ topology entrypoints (`vk serve-orchestrator` — webhook→dedup→route→enqueue, owns Slack bot; `vk serve-executor --cloud aws|gcp` — consume→reuse _do_investigation→ack, idempotent re-delivery via investigations table, SIGTERM-graceful; `vk serve` unchanged all-in-one)
 >   - Phase 4a ✅ tests (`tests/test_phase4_dispatch.py` — 12 passing: router variants, stream isolation/fan-out/stale-claim, executor job handling + duplicate-drop + bad-payload-drop; full suite 52)
+>   - Phase 4b ✅ Argus bot (`bot/argus.py` — @mre subteam-mention + direct-mention triggers, fail-open noise filter w/ strong issue prior, debug override, screenshot URL capture, message dedup, dispatcher: orchestrator→enqueue / all-in-one→in-process; wired into `vk serve` + `vk serve-orchestrator`; Sage untouched; config argus.{bot_token,app_token,mre_group_id} / ARGUS_* env)
+>   - Phase 4b ✅ tests (`tests/test_argus_bot.py` — 13 passing; full suite 65)
 > - **Key context to re-load after compaction:** read this whole file; prod deployment is untouched single-pod v1.1.23 on EKS `monitoring` ns; all architectural decisions are final (see "Confirmed decisions" + "Resolved in discussion"); never touch prod infra without asking the user.
 
 ## Context

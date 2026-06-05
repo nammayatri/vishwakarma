@@ -262,6 +262,13 @@ class VishwakarmaConfig:
         self.default_cloud: str = _env("VK_DEFAULT_CLOUD", orch.get("default_cloud", "aws"))
         self.executor_cloud: str = _env("VK_EXECUTOR_CLOUD", raw.get("executor", {}).get("cloud", "")) or ""
 
+        # Argus — the RCA bot (second Slack app). Triggered by @mre subteam
+        # mentions or direct @Argus mentions; unset = Argus disabled.
+        argus = raw.get("argus", {})
+        self.argus_bot_token: str = _env("ARGUS_BOT_TOKEN", argus.get("bot_token", "")) or ""
+        self.argus_app_token: str = _env("ARGUS_APP_TOKEN", argus.get("app_token", "")) or ""
+        self.argus_mre_group_id: str = _env("ARGUS_MRE_GROUP_ID", argus.get("mre_group_id", "")) or ""
+
         # Embeddings provider (semantic RAG). Unset = keyword-only matching.
         emb = raw.get("embeddings", {})
         self.embeddings_api_base: str = _env("VK_EMBEDDINGS_API_BASE", emb.get("api_base", "")) or ""
