@@ -62,6 +62,32 @@ from vishwakarma.utils.stream import sse_event, sse_done
 log = logging.getLogger(__name__)
 
 
+def _mount_console_spa(app: FastAPI) -> None:
+    """
+    Serve the built Argus console (web/dist) at /console with an SPA
+    fallback (client-side routes → index.html). No-op when the bundle
+    hasn't been built — the API still works without the UI.
+    """
+    from pathlib import Path
+    from fastapi.responses import FileResponse
+
+    dist = Path(__file__).parent.parent / "web" / "dist"
+    index = dist / "index.html"
+    if not index.exists():
+        log.info("Console UI bundle not found (web/dist) — /console disabled")
+        return
+
+    @app.get("/console", include_in_schema=False)
+    @app.get("/console/{path:path}", include_in_schema=False)
+    async def console_spa(path: str = ""):
+        candidate = (dist / path).resolve()
+        if path and candidate.is_file() and str(candidate).startswith(str(dist.resolve())):
+            return FileResponse(candidate)
+        return FileResponse(index)
+
+    log.info("Console UI mounted at /console")
+
+
 def create_app(config=None) -> FastAPI:
     """Create and configure the FastAPI application."""
     from vishwakarma.config import VishwakarmaConfig
@@ -92,6 +118,7 @@ def create_app(config=None) -> FastAPI:
     app.include_router(create_ui_router(_state))
     from vishwakarma.ui.console_api import create_console_router
     app.include_router(create_console_router(config, _state))
+    _mount_console_spa(app)
 
     @app.on_event("startup")
     async def startup():

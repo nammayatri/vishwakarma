@@ -18,6 +18,9 @@ config.yaml
 .env
 .env.*
 
+# Frontend (web/dist covered by dist/ above)
+node_modules/
+
 # Runtime artifacts
 *.log
 *.db
