@@ -262,6 +262,14 @@ class VishwakarmaConfig:
         self.default_cloud: str = _env("VK_DEFAULT_CLOUD", orch.get("default_cloud", "aws"))
         self.executor_cloud: str = _env("VK_EXECUTOR_CLOUD", raw.get("executor", {}).get("cloud", "")) or ""
 
+        # Console UI auth — two roles. auth_disabled=true (dev default) makes
+        # every request admin. Tokens are the interim mechanism; Google SSO
+        # replaces them at deployment behind the same role dependency.
+        ui = raw.get("ui", {})
+        self.ui_auth_disabled: bool = bool(ui.get("auth_disabled", True))
+        self.ui_admin_tokens: list[str] = ui.get("admin_tokens", []) or []
+        self.ui_reader_tokens: list[str] = ui.get("reader_tokens", []) or []
+
         # Argus — the RCA bot (second Slack app). Triggered by @mre subteam
         # mentions or direct @Argus mentions; unset = Argus disabled.
         argus = raw.get("argus", {})

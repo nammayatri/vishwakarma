@@ -90,6 +90,8 @@ def create_app(config=None) -> FastAPI:
 
     from vishwakarma.ui.routes import create_ui_router
     app.include_router(create_ui_router(_state))
+    from vishwakarma.ui.console_api import create_console_router
+    app.include_router(create_console_router(config, _state))
 
     @app.on_event("startup")
     async def startup():
@@ -99,6 +101,8 @@ def create_app(config=None) -> FastAPI:
         from vishwakarma.core.embeddings import init_embeddings
         init_embeddings(config.embeddings_api_base, config.embeddings_api_key,
                         config.embeddings_model, config.embeddings_dim)
+        from vishwakarma.core.eventbus import init_eventbus
+        init_eventbus(config.redis_url)
         # Seed DB runbooks from the repo's agents.json + .md files (idempotent;
         # keeps file-based runbooks working as defaults on fresh installs).
         try:
@@ -847,6 +851,12 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
             except Exception as inv_err:
                 log.warning(f"Durable-job setup failed (continuing without): {inv_err}")
 
+            from vishwakarma.core import eventbus
+            eventbus.publish(incident_id, {
+                "type": "investigation_started", "title": issue.title,
+                "severity": issue.severity, "source": issue.source,
+            })
+
             for event in engine.stream_investigate(
                 question=question,
                 runbooks=matched_runbooks or None,
@@ -855,6 +865,12 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
                 incident_id=incident_id,
             ):
                 etype = event.get("type", "")
+                # Fan out to the console UI (SSE) — fire-and-forget.
+                if etype in ("tool_call_start", "tool_call_result", "hypothesis",
+                             "compaction", "status", "done", "max_steps_reached"):
+                    eventbus.publish(incident_id, {
+                        k: v for k, v in event.items() if k != "messages"
+                    })
 
                 if etype == "tool_call_start":
                     tool = event.get("tool", "")

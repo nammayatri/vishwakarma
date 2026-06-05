@@ -54,6 +54,8 @@ class Executor:
         if not cfg.redis_url:
             raise RuntimeError("executor requires storage.redis_url (job stream)")
         init_jobstream(cfg.redis_url)
+        from vishwakarma.core.eventbus import init_eventbus
+        init_eventbus(cfg.redis_url)  # publish live events to the console UI
         try:
             from vishwakarma.storage.runbooks import seed_from_files
             seed_from_files()
