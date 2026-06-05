@@ -253,6 +253,13 @@ class VishwakarmaConfig:
         # e.g. redis://10.x.y.z:6379/0
         self.redis_url: str = _env("VK_REDIS_URL", storage.get("redis_url", "")) or ""
 
+        # Embeddings provider (semantic RAG). Unset = keyword-only matching.
+        emb = raw.get("embeddings", {})
+        self.embeddings_api_base: str = _env("VK_EMBEDDINGS_API_BASE", emb.get("api_base", "")) or ""
+        self.embeddings_api_key: str = _env("VK_EMBEDDINGS_API_KEY", emb.get("api_key", "")) or ""
+        self.embeddings_model: str = _env("VK_EMBEDDINGS_MODEL", emb.get("model", "")) or ""
+        self.embeddings_dim: int = int(emb.get("dim", 1536))
+
         # Custom certificate
         self.certificate: str | None = _env("CERTIFICATE", raw.get("certificate"))
 
@@ -492,15 +499,29 @@ def _load_runbook_content(runbook_path_str: str) -> str | None:
         return None
 
 
-def load_matching_runbooks(alert_name: str, llm=None) -> list[str]:
+def load_matching_runbooks(alert_name: str, llm=None, cloud: str = "") -> list[str]:
     """
     Find the runbook(s) relevant to this alert.
 
-    Two-stage matching:
-    1. Fast: keyword match against agents.json — zero LLM cost, used for known alert patterns
-    2. Fallback: if no keyword match, ask the LLM to classify from the agents.json catalog
-       (one cheap classification call). If LLM also finds no match, investigate without runbook.
+    Primary path (when the runbooks table is populated): hybrid recall →
+    RRF → optional rerank via core.runbook_match — cloud-aware, DB-backed,
+    self-curating. Falls back to the file-based two-stage matching
+    (keyword → LLM classify over agents.json) when the DB has no runbooks
+    (fresh install before seeding, or storage unavailable).
     """
+    # ── DB-backed hybrid matching ────────────────────────────────────────────
+    try:
+        from vishwakarma.core.runbook_match import match_runbooks
+        matched = match_runbooks(alert_name, cloud=cloud, llm=llm)
+        if matched:
+            for m in matched:
+                log.info(f"Matched runbook '{m['id']}' for alert '{alert_name}' (hybrid)")
+            return [f"# Runbook: {m['title']}\n\n{m['content_md']}" for m in matched]
+        # Empty table → fall through to file-based. Non-empty table with no
+        # match → also fall through (file catalog may still know it).
+    except Exception as e:
+        log.debug(f"DB runbook matching unavailable ({e}) — using file-based")
+
     agents, agents_parent = _load_agents_catalog()
     if agents is None:
         return []

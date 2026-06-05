@@ -96,6 +96,16 @@ def create_app(config=None) -> FastAPI:
         from vishwakarma.storage.db import init_db
         init_db(config.db_path, dsn=config.pg_dsn)
         _dedup.init_dedup(config.redis_url)
+        from vishwakarma.core.embeddings import init_embeddings
+        init_embeddings(config.embeddings_api_base, config.embeddings_api_key,
+                        config.embeddings_model, config.embeddings_dim)
+        # Seed DB runbooks from the repo's agents.json + .md files (idempotent;
+        # keeps file-based runbooks working as defaults on fresh installs).
+        try:
+            from vishwakarma.storage.runbooks import seed_from_files
+            seed_from_files()
+        except Exception as seed_err:
+            log.warning(f"Runbook seeding failed (file-based matching still works): {seed_err}")
         from vishwakarma.core.learnings import LearningsManager
         _state["learnings"] = LearningsManager()
         _state["toolset_manager"] = config.make_toolset_manager()
@@ -981,6 +991,18 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
             slack_ts=slack_ts,
             pdf_path=pdf_path,
         )
+        # Index for semantic recurrence lookup (best-effort, no-op when
+        # embeddings are unconfigured).
+        try:
+            from vishwakarma.core.embeddings import get_client
+            from vishwakarma.storage.vectors import upsert_embedding
+            emb = get_client()
+            if emb.configured:
+                vec = emb.embed_one(f"{issue.title}\n{question[:500]}\n{analysis[:3000]}")
+                if vec:
+                    upsert_embedding("incident", incident_id, vec)
+        except Exception as idx_err:
+            log.debug(f"Incident embedding skipped: {idx_err}")
     except Exception as e:
         log.warning(f"DB save failed: {e}")
 
@@ -1092,12 +1114,39 @@ def _build_prior_context(issue) -> str:
     """
     Look up past investigations for the same alert and return a context block
     so the LLM knows if this is a recurrence and what was found before.
+
+    Recall is hybrid: substring search on the alert name (always), augmented
+    with semantic search over incident embeddings when an embeddings provider
+    is configured — catches paraphrased/differently-named recurrences that
+    LIKE misses.
     """
     try:
-        from vishwakarma.storage.queries import search_incidents
+        from vishwakarma.storage.queries import search_incidents, get_incident
         # Search by alert name (from labels or title)
         alert_name = issue.labels.get("alertname") or issue.title
         past = search_incidents(query=alert_name, limit=3)
+
+        # Semantic leg (best-effort)
+        try:
+            from vishwakarma.core.embeddings import get_client
+            from vishwakarma.storage.vectors import search_similar
+            emb = get_client()
+            if emb.configured:
+                qtext = f"{alert_name}\n{issue.title}\n{getattr(issue, 'description', '') or ''}"
+                qvec = emb.embed_one(qtext)
+                if qvec:
+                    seen = {p["id"] for p in past}
+                    for ref_id, score in search_similar("incident", qvec, top_k=3, min_score=0.45):
+                        if ref_id in seen:
+                            continue
+                        inc = get_incident(ref_id)
+                        if inc:
+                            past.append(inc)
+                            seen.add(ref_id)
+        except Exception as sem_err:
+            log.debug(f"Semantic prior-context skipped: {sem_err}")
+
+        past = past[:4]
         if not past:
             return ""
 

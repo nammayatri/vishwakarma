@@ -85,6 +85,41 @@ CREATE TABLE IF NOT EXISTS investigations (
     updated_at    REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS embeddings_json (
+    kind        TEXT NOT NULL,           -- 'incident' | 'runbook' | 'code'
+    ref_id      TEXT NOT NULL,
+    vec         TEXT NOT NULL,           -- JSON array of floats (fallback store;
+                                         -- pgvector tables used when extension exists)
+    created_at  REAL NOT NULL,
+    PRIMARY KEY (kind, ref_id)
+);
+
+CREATE TABLE IF NOT EXISTS runbooks (
+    id            TEXT PRIMARY KEY,      -- slug, e.g. "rds-cpu-high"
+    title         TEXT NOT NULL,
+    content_md    TEXT NOT NULL,
+    cloud_type    TEXT DEFAULT 'any',    -- 'aws' | 'gcp' | 'both' | 'any'
+    keywords      TEXT DEFAULT '[]',     -- JSON array (portable across backends)
+    services      TEXT DEFAULT '[]',     -- JSON array — applicable services facet
+    author        TEXT,
+    version       INTEGER DEFAULT 1,
+    status        TEXT DEFAULT 'active', -- 'active' | 'needs-review' | 'demoted'
+    hit_count     INTEGER DEFAULT 0,
+    miss_count    INTEGER DEFAULT 0,
+    created_at    REAL NOT NULL,
+    updated_at    REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS alert_runbook_map (
+    alert_pattern TEXT NOT NULL,         -- normalized alert key
+    runbook_id    TEXT NOT NULL,
+    priority      INTEGER DEFAULT 100,
+    PRIMARY KEY (alert_pattern, runbook_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_embeddings_kind ON embeddings_json(kind);
+CREATE INDEX IF NOT EXISTS idx_runbooks_status ON runbooks(status);
+CREATE INDEX IF NOT EXISTS idx_alert_map ON alert_runbook_map(alert_pattern);
 CREATE INDEX IF NOT EXISTS idx_incidents_source ON incidents(source);
 CREATE INDEX IF NOT EXISTS idx_incidents_status ON incidents(status);
 CREATE INDEX IF NOT EXISTS idx_incidents_created ON incidents(created_at);

@@ -4,8 +4,8 @@
 >
 > - **Branch:** `argus` (created from `ny-vishwakarma` @ 07f5fe9, v1.1.23 in prod)
 > - **Current milestone:** Milestone 1 = Phase 0 (Postgres+pgvector, Memorystore dedup, durable `investigations` table, SQLite history migration) + Phase 1 (Tier-1 code-analyst toolset)
-> - **Status:** MILESTONE 1 COMPLETE (Phase 0 + Phase 1 Tier-1) — next: enable code_analyst in a config + shadow-test, then Phase 2 (RAG) or Phase 4 prep
-> - **Next step:** configure `toolsets.code_analyst` with real repos in a test config; verify `repo_sync` against the actual example-app monorepo (sparse-checkout); then Phase 2 embeddings helper
+> - **Status:** MILESTONE 2 COMPLETE (Phase 2 RAG) — next: Phase 3 (OpenCode CodeAgent adapter + fix gate)
+> - **Next step:** Phase 3 — `core/code_agent.py` session adapter (start/send/end against OpenCode server), code_session_* tools, fix-confidence gate. Also pending: ask Acme to enable an embeddings model on the gateway team (none today — RAG runs keyword-only until then); verify repo_sync against the real monorepo
 > - **Done so far:**
 >   - Phase 0 ✅ dual-backend storage (`storage/db.py` — SQLite default + Postgres via `VK_PG_DSN`/`storage.dsn`, PGConnection adapter translates `?`→`%s`, conditional pgvector)
 >   - Phase 0 ✅ durable investigations (`storage/investigations.py` — create/claim/checkpoint/resume/orphan-reap/attempt-budget; engine checkpoints each step via `stream_investigate(incident_id=…)`)
@@ -14,6 +14,12 @@
 >   - Phase 0 ✅ tests (`tests/test_storage_phase0.py` — 9 passing: parity, lifecycle, races, TTL, migration)
 >   - Phase 1 ✅ code_analyst toolset (`plugins/toolsets/code_analyst/` — repo_sync clone-once/ff-pull, git_blame, git_log_around, deploy_diff, code_search (ast-grep→rg fallback), stacktrace_to_source w/ suffix matching + blame; read-only git, repo allow-list, path-traversal + ref-injection guards)
 >   - Phase 1 ✅ tests (`tests/test_code_analyst.py` — 10 passing against a fixture repo simulating a breaking deploy)
+>   - Phase 2 ✅ embeddings client (`core/embeddings.py` — configurable provider, None-degrade; gateway has NO embeddings model yet)
+>   - Phase 2 ✅ vector store (`storage/vectors.py` — pgvector when available, JSON+cosine fallback for SQLite/PG14)
+>   - Phase 2 ✅ incident RAG (index on save + semantic leg in `_build_prior_context`, best-effort)
+>   - Phase 2 ✅ runbook tables + CRUD (`storage/runbooks.py` — normalize_alert_key, map upsert, hit/miss auto-demote, seed_from_files: 13 prod runbooks import cleanly)
+>   - Phase 2 ✅ hybrid matcher (`core/runbook_match.py` — exact-map/keyword/vector → RRF → LLM rerank >3 candidates; wired into `load_matching_runbooks` with file fallback) + `runbook_search` tool
+>   - Phase 2 ✅ tests (`tests/test_rag_phase2.py` — 12 passing; full suite 31)
 > - **Key context to re-load after compaction:** read this whole file; prod deployment is untouched single-pod v1.1.23 on EKS `monitoring` ns; all architectural decisions are final (see "Confirmed decisions" + "Resolved in discussion"); never touch prod infra without asking the user.
 
 ## Context
