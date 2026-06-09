@@ -125,6 +125,34 @@ class CodeSessionToolset(Toolset):
                     "required": ["session_id"],
                 },
             ),
+            ToolDef(
+                name="propose_fix",
+                description=(
+                    "After an EDIT session has written a fix, propose it. You "
+                    "supply your confidence inputs; the system scores the fix and "
+                    "either opens a DRAFT PR (high confidence + localized + tests "
+                    "pass) or returns the diff to post as a suggestion. Never "
+                    "merges. Call this instead of code_session_end when the edit "
+                    "is the proposed fix."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "session_id": {"type": "string"},
+                        "title": {"type": "string", "description": "Short fix title"},
+                        "rca": {"type": "string", "description": "The root cause this fixes"},
+                        "rca_confidence": {"type": "string", "enum": ["HIGH", "MEDIUM", "LOW"]},
+                        "exact_line_found": {"type": "boolean",
+                                             "description": "Did you identify the exact offending line?"},
+                        "pattern_matched": {"type": "boolean",
+                                            "description": "Did a confirmed past pattern match?"},
+                        "tests_passed": {"type": "boolean",
+                                         "description": "Did the coding agent's tests pass? Omit if not run."},
+                        "rollback": {"type": "string", "description": "How to roll back"},
+                    },
+                    "required": ["session_id", "title", "rca", "rca_confidence"],
+                },
+            ),
         ]
 
     def execute(self, tool_name: str, params: dict) -> ToolOutput:
@@ -135,6 +163,8 @@ class CodeSessionToolset(Toolset):
                 return self._send(params)
             if tool_name == "code_session_end":
                 return self._end(params)
+            if tool_name == "propose_fix":
+                return self._propose_fix(params)
             return ToolOutput(tool_name=tool_name, status=ToolStatus.ERROR,
                               error=f"Unknown tool: {tool_name}")
         except Exception as e:
@@ -186,6 +216,105 @@ class CodeSessionToolset(Toolset):
             out += f"\nBranch: {result.get('branch')}\n\n--- DIFF ---\n{result['diff'][:20000]}"
         return ToolOutput(tool_name="code_session_end", status=ToolStatus.SUCCESS,
                           output=out, invocation=f"code_session_end({sid})")
+
+    def _propose_fix(self, params: dict) -> ToolOutput:
+        sid = params.get("session_id", "")
+        title = params.get("title", "Argus fix")
+        rca = params.get("rca", "")
+        agent = self._get_agent()
+        try:
+            info = agent.session_info(sid)
+        except Exception as e:
+            return ToolOutput(tool_name="propose_fix", status=ToolStatus.ERROR,
+                              error=f"unknown session: {e}")
+        if info.get("mode") != "edit":
+            return ToolOutput(tool_name="propose_fix", status=ToolStatus.ERROR,
+                              error="propose_fix requires an edit-mode session")
+
+        committed = agent.commit_fix(sid, f"Argus fix: {title[:60]}")
+        if committed.get("error"):
+            agent.end(sid)
+            return ToolOutput(tool_name="propose_fix", status=ToolStatus.ERROR,
+                              error=committed["error"])
+
+        # Score the fix.
+        from vishwakarma.core.fix_scorer import score_fix
+        decision = score_fix(
+            rca_confidence=params.get("rca_confidence", ""),
+            exact_line_found=bool(params.get("exact_line_found")),
+            pattern_matched=bool(params.get("pattern_matched")),
+            diff_files=committed["diff_files"], diff_lines=committed["diff_lines"],
+            tests_passed=params.get("tests_passed"),
+        )
+
+        # Mark the investigation as awaiting fix review (console + ops).
+        try:
+            from vishwakarma.core.toolcontext import current_incident
+            from vishwakarma.storage.investigations import (
+                get_investigation, finish_investigation)
+            iid = current_incident.get()
+            if iid and get_investigation(iid):
+                finish_investigation(iid, "awaiting_fix_review")
+        except Exception:
+            pass
+
+        diff_preview = committed["diff"][:8000]
+        base_msg = (
+            f"Fix confidence: {decision.confidence} (score {decision.score}; "
+            f"{', '.join(decision.reasons)})\n"
+            f"Diff: {committed['diff_files']} files / {committed['diff_lines']} lines on "
+            f"branch {committed['branch']}\n\n{diff_preview}"
+        )
+
+        if decision.action == "draft_pr":
+            from vishwakarma.core.pr_creator import (
+                get_pr_creator, build_pr_body, parse_owner_repo)
+            pc = get_pr_creator()
+            if pc is None:
+                agent.end(sid)
+                return ToolOutput(
+                    tool_name="propose_fix", status=ToolStatus.SUCCESS,
+                    output="DECISION: draft_pr — but GitHub is not configured, so no "
+                           "PR was opened. Post this fix as a suggestion:\n\n" + base_msg,
+                    invocation=f"propose_fix({sid})")
+            # owner/repo from the worktree's origin
+            origin = self._origin_url(info["worktree"])
+            owner_repo = parse_owner_repo(origin) if origin else None
+            if not owner_repo:
+                agent.end(sid)
+                return ToolOutput(tool_name="propose_fix", status=ToolStatus.ERROR,
+                                  error=f"could not parse owner/repo from origin {origin!r}")
+            body = build_pr_body(rca, "", params.get("rollback", ""), decision)
+            res = pc.create_draft_pr(
+                owner=owner_repo[0], repo=owner_repo[1],
+                worktree_path=info["worktree"], branch=committed["branch"],
+                title=title, body=body)
+            agent.end(sid)
+            if res.get("error"):
+                return ToolOutput(tool_name="propose_fix", status=ToolStatus.ERROR,
+                                  error=f"PR creation failed: {res['error']}\n\n{base_msg}")
+            return ToolOutput(
+                tool_name="propose_fix", status=ToolStatus.SUCCESS,
+                output=f"DRAFT PR opened: {res['url']} (#{res['number']})\n\n{base_msg}",
+                invocation=f"propose_fix({sid}) → PR")
+
+        # propose_only
+        agent.end(sid)
+        return ToolOutput(
+            tool_name="propose_fix", status=ToolStatus.SUCCESS,
+            output=f"DECISION: propose only (gate not met). Post these changes as a "
+                   f"suggestion for human review:\n\n{base_msg}",
+            invocation=f"propose_fix({sid})")
+
+    @staticmethod
+    def _origin_url(worktree: str) -> str:
+        import subprocess
+        try:
+            r = subprocess.run(["git", "-C", worktree, "remote", "get-url", "origin"],
+                               capture_output=True, text=True, timeout=20)
+            return r.stdout.strip()
+        except Exception:
+            return ""
 
     def _checkpoint_session(self, sid: str, transcript: list, result: dict) -> None:
         try:

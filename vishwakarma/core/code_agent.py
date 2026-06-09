@@ -192,6 +192,47 @@ class OpenCodeAgent:
         """For checkpointing into investigations.code_session."""
         return self._get(session_id).transcript
 
+    def session_info(self, session_id: str) -> dict:
+        """Worktree/branch/base for an edit session (used to open a PR before end)."""
+        cs = self._get(session_id)
+        return {"mode": cs.mode, "worktree": cs.repo_path,
+                "branch": cs.branch, "base_repo": cs.base_repo}
+
+    def commit_fix(self, session_id: str, message: str) -> dict:
+        """
+        Commit the edit session's staged changes onto its fix branch (so the
+        branch has a real commit to push) and return the diff + numstat.
+        """
+        cs = self._get(session_id)
+        if cs.mode != "edit":
+            return {"error": "not an edit session"}
+        wt = cs.repo_path
+        subprocess.run(["git", "-C", wt, "add", "-A"], capture_output=True, timeout=60)
+        # Anything to commit?
+        st = subprocess.run(["git", "-C", wt, "status", "--porcelain"],
+                            capture_output=True, text=True, timeout=30).stdout
+        if not st.strip():
+            return {"error": "no changes to commit"}
+        c = subprocess.run(["git", "-C", wt, "commit", "-m", message],
+                           capture_output=True, text=True, timeout=60)
+        if c.returncode != 0:
+            return {"error": f"commit failed: {c.stderr.strip()[:200]}"}
+        diff = subprocess.run(["git", "-C", wt, "diff", "HEAD~1", "HEAD"],
+                              capture_output=True, text=True, timeout=60).stdout
+        numstat = subprocess.run(["git", "-C", wt, "diff", "--numstat", "HEAD~1", "HEAD"],
+                                 capture_output=True, text=True, timeout=60).stdout
+        files = 0
+        lines = 0
+        for row in numstat.strip().splitlines():
+            parts = row.split("\t")
+            if len(parts) >= 2:
+                files += 1
+                for n in parts[:2]:
+                    if n.isdigit():
+                        lines += int(n)
+        return {"branch": cs.branch, "worktree": wt, "diff": diff,
+                "diff_files": files, "diff_lines": lines}
+
     # ── Internals ─────────────────────────────────────────────────────────────
 
     def _get(self, session_id: str) -> CodeSession:

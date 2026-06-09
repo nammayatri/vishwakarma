@@ -60,6 +60,9 @@ class Executor:
         init_keypool(cfg.llm.api_keys or ([cfg.llm.api_key] if cfg.llm.api_key else []))
         from vishwakarma.core.correlation import init_correlation
         init_correlation(cfg.redis_url)
+        from vishwakarma.core.pr_creator import init_pr_creator
+        init_pr_creator(cfg.github_enabled, cfg.github_token,
+                        cfg.github_api_base, cfg.github_default_base)
         try:
             from vishwakarma.storage.runbooks import seed_from_files
             seed_from_files()

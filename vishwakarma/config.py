@@ -263,6 +263,14 @@ class VishwakarmaConfig:
         self.default_cloud: str = _env("VK_DEFAULT_CLOUD", orch.get("default_cloud", "aws"))
         self.executor_cloud: str = _env("VK_EXECUTOR_CLOUD", raw.get("executor", {}).get("cloud", "")) or ""
 
+        # GitHub — draft-PR creation for the fix loop. Unset = fix path stays
+        # "propose only" (no PR). Needs a GitHub App installation token or PAT.
+        gh = raw.get("github", {})
+        self.github_enabled: bool = bool(gh.get("enabled", False))
+        self.github_token: str = _env("GITHUB_TOKEN", gh.get("token", "")) or ""
+        self.github_api_base: str = gh.get("api_base", "https://api.github.com")
+        self.github_default_base: str = gh.get("default_base_branch", "main")
+
         # Console UI auth — two roles. auth_disabled=true (dev default) makes
         # every request admin. Tokens are the interim mechanism; Google SSO
         # replaces them at deployment behind the same role dependency.

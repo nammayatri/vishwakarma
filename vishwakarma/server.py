@@ -140,6 +140,9 @@ def create_app(config=None) -> FastAPI:
         init_keypool(config.llm.api_keys or ([config.llm.api_key] if config.llm.api_key else []))
         from vishwakarma.core.correlation import init_correlation
         init_correlation(config.redis_url)
+        from vishwakarma.core.pr_creator import init_pr_creator
+        init_pr_creator(config.github_enabled, config.github_token,
+                        config.github_api_base, config.github_default_base)
         # Seed DB runbooks from the repo's agents.json + .md files (idempotent;
         # keeps file-based runbooks working as defaults on fresh installs).
         try:
