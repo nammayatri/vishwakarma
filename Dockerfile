@@ -76,6 +76,12 @@ COPY --from=webbuilder /web/dist ./web/dist
 # Install the package itself (no deps — already installed above)
 RUN pip install --no-cache-dir --no-deps .
 
+# Pre-bake the default local embedding model so pods need no HuggingFace egress
+# at runtime (offline-ready, instant start). ~300MB RAM resident, ~2ms/text on
+# CPU. Change the model here + embeddings.local_model in config to upgrade.
+RUN python -c "from fastembed import TextEmbedding; TextEmbedding(model_name='BAAI/bge-small-en-v1.5')" || \
+    echo "fastembed model pre-bake skipped (RAG will download on first use or run keyword-only)"
+
 # Data directory for SQLite PVC
 RUN mkdir -p /data
 

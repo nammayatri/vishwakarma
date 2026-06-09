@@ -44,12 +44,13 @@ class Executor:
     def start(self) -> None:
         cfg = self.config
         from vishwakarma.storage.db import init_db
-        init_db(cfg.db_path, dsn=cfg.pg_dsn)
+        init_db(cfg.db_path, dsn=cfg.pg_dsn, embedding_dim=cfg.embeddings_dim)
         from vishwakarma.storage import dedup
         dedup.init_dedup(cfg.redis_url)
         from vishwakarma.core.embeddings import init_embeddings
         init_embeddings(cfg.embeddings_api_base, cfg.embeddings_api_key,
-                        cfg.embeddings_model, cfg.embeddings_dim)
+                        cfg.embeddings_model, cfg.embeddings_dim,
+                        cfg.embeddings_provider, cfg.embeddings_local_model)
         from vishwakarma.core.jobstream import init_jobstream
         if not cfg.redis_url:
             raise RuntimeError("executor requires storage.redis_url (job stream)")

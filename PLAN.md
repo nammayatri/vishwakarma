@@ -17,7 +17,7 @@
 >
 > **Truly remaining (external/ops only — no more code to write):**
 >   - **GitHub App token** at runtime → activates pr_create + (future) CI-result reading.
->   - **Embeddings model** on the gateway → activates semantic incident/runbook/code RAG (code already degrades gracefully to keyword).
+>   - ~~Embeddings model on the gateway~~ — RESOLVED: **local embeddings** via fastembed (core/embeddings.py provider=local; bge-small 384d pre-baked in the image, +~300MB RAM, ~2ms/text on CPU, no gateway/egress; bge-base 768d optional upgrade; sidecar option B in k8s/argus/embeddings-sidecar.yaml). Semantic incident/runbook RAG works now; just set embeddings.provider=local. Verified: real semantic separation (db-query→rds 0.749 vs redis 0.636).
 >   - **Golden-set labeling** (your data) → run the eval harness for real calibration numbers.
 >   - **Provision** Cloud SQL + Memorystore, **register** Argus Slack app, **deploy** (shadow → cutover) via k8s/argus/.
 >   - NY-data scrub for a public OSS release (agents.json/runbooks still NY-specific — fine internally).

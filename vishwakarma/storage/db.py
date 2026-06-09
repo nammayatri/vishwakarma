@@ -195,7 +195,8 @@ CREATE TABLE IF NOT EXISTS code_embeddings (
     updated_at   DOUBLE PRECISION NOT NULL
 );
 """
-EMBEDDING_DIM = 1536
+EMBEDDING_DIM = 1536   # default; overridden by init_db(embedding_dim=…) to
+                       # match the configured model (384 for local bge/MiniLM)
 
 
 class PGConnection:
@@ -277,18 +278,23 @@ def _to_pg_schema(schema: str) -> str:
             .replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY"))
 
 
-def init_db(db_path: str | None = None, dsn: str | None = None) -> None:
+def init_db(db_path: str | None = None, dsn: str | None = None,
+            embedding_dim: int | None = None) -> None:
     """
     Initialize storage and create schema.
 
     dsn (or a previously-configured one) selects the Postgres backend;
-    otherwise SQLite at db_path. Safe to call repeatedly.
+    otherwise SQLite at db_path. embedding_dim sizes the pgvector columns to
+    match the configured model (must be set BEFORE the vector tables exist).
+    Safe to call repeatedly.
     """
-    global _db_path, _dsn, _conn, _backend, _vector_available
+    global _db_path, _dsn, _conn, _backend, _vector_available, EMBEDDING_DIM
     if db_path:
         _db_path = db_path
     if dsn:
         _dsn = dsn
+    if embedding_dim:
+        EMBEDDING_DIM = int(embedding_dim)
 
     with _lock:
         if _dsn:

@@ -294,7 +294,13 @@ class VishwakarmaConfig:
         self.embeddings_api_base: str = _env("VK_EMBEDDINGS_API_BASE", emb.get("api_base", "")) or ""
         self.embeddings_api_key: str = _env("VK_EMBEDDINGS_API_KEY", emb.get("api_key", "")) or ""
         self.embeddings_model: str = _env("VK_EMBEDDINGS_MODEL", emb.get("model", "")) or ""
-        self.embeddings_dim: int = int(emb.get("dim", 1536))
+        # provider: 'local' loads a small model in-process (fastembed, no API);
+        # 'api' uses the OpenAI-compatible endpoint above. Default inferred.
+        self.embeddings_provider: str = _env("VK_EMBEDDINGS_PROVIDER", emb.get("provider", "")) or ""
+        self.embeddings_local_model: str = _env("VK_EMBEDDINGS_LOCAL_MODEL", emb.get("local_model", "")) or ""
+        # Dim MUST match the model (384 for bge-small/MiniLM, 1536 for OpenAI).
+        _default_dim = 384 if (self.embeddings_provider == "local" or self.embeddings_local_model) else 1536
+        self.embeddings_dim: int = int(emb.get("dim", _default_dim))
 
         # Custom certificate
         self.certificate: str | None = _env("CERTIFICATE", raw.get("certificate"))

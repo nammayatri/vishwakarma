@@ -45,3 +45,7 @@ psycopg2-binary>=2.9.9
 
 # Control plane (multi-pod dedup + job streams)
 redis>=5.0.0
+
+# Optional: local embeddings (semantic RAG without a gateway model).
+# ONNX-based, no torch. Omit to run RAG keyword-only.
+fastembed>=0.3.0

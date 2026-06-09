@@ -129,11 +129,12 @@ def create_app(config=None) -> FastAPI:
     @app.on_event("startup")
     async def startup():
         from vishwakarma.storage.db import init_db
-        init_db(config.db_path, dsn=config.pg_dsn)
+        init_db(config.db_path, dsn=config.pg_dsn, embedding_dim=config.embeddings_dim)
         _dedup.init_dedup(config.redis_url)
         from vishwakarma.core.embeddings import init_embeddings
         init_embeddings(config.embeddings_api_base, config.embeddings_api_key,
-                        config.embeddings_model, config.embeddings_dim)
+                        config.embeddings_model, config.embeddings_dim,
+                        config.embeddings_provider, config.embeddings_local_model)
         from vishwakarma.core.eventbus import init_eventbus
         init_eventbus(config.redis_url)
         from vishwakarma.core.keypool import init_keypool

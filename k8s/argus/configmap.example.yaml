@@ -26,6 +26,20 @@ data:
     orchestrator:
       default_cloud: aws
 
+    # Semantic RAG. Pick ONE:
+    #  (A) in-process local model — no extra service, CPU only (pre-baked in
+    #      the image). bge-small: +~300MB RAM, ~2ms/text. Fits existing pods.
+    embeddings:
+      provider: local
+      local_model: BAAI/bge-small-en-v1.5   # upgrade: BAAI/bge-base-en-v1.5 (dim 768, +~1GB RAM)
+      dim: 384                               # MUST match the model
+    #  (B) shared embeddings server (apply embeddings-sidecar.yaml):
+    #    provider: api
+    #    api_base: http://argus-embeddings.argus/v1
+    #    model: BAAI/bge-small-en-v1.5
+    #    dim: 384
+    #  (omit the whole block → RAG runs keyword-only)
+
     ui:
       auth_disabled: false
       admin_tokens: []     # set via separate secret-backed config in prod
