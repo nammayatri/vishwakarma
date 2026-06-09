@@ -528,6 +528,51 @@ def migrate_db(
     console.print("[green]Migration complete (idempotent — safe to re-run).[/green]")
 
 
+# ── vk index-code ─────────────────────────────────────────────────────────────
+
+@app.command("index-code")
+def index_code(
+    config: Optional[str] = typer.Option(None, "--config", "-c"),
+    repo: Optional[str] = typer.Option(None, "--repo", help="Index one repo (default: all configured)"),
+):
+    """Build/refresh the semantic code index (background job, NOT inline).
+
+    Incremental: only files whose content changed are re-embedded. Run on a
+    schedule or after deploys. Requires embeddings (embeddings.provider) and,
+    at monorepo scale, Postgres+pgvector.
+    """
+    from pathlib import Path as _P
+    cfg = _load_config(config)
+    from vishwakarma.storage.db import init_db
+    from vishwakarma.core.embeddings import init_embeddings
+    from vishwakarma.core.code_index import index_repo
+    init_db(cfg.db_path, dsn=cfg.pg_dsn, embedding_dim=cfg.embeddings_dim)
+    init_embeddings(cfg.embeddings_api_base, cfg.embeddings_api_key,
+                    cfg.embeddings_model, cfg.embeddings_dim,
+                    cfg.embeddings_provider, cfg.embeddings_local_model)
+
+    ca = (cfg.toolsets_config.get("code_analyst", {}) or {}).get("config", {})
+    repo_dir = _P(ca.get("repo_dir", "/data/repos"))
+    repos = ca.get("repos", [])
+    if repo:
+        repos = [r for r in repos if r.get("name") == repo]
+    if not repos:
+        console.print("[yellow]No repos configured under toolsets.code_analyst.config.repos[/yellow]")
+        raise typer.Exit(1)
+
+    for r in repos:
+        name = r["name"]
+        path = repo_dir / name
+        if not path.exists():
+            console.print(f"[yellow]{name}: not cloned at {path} — run repo_sync first[/yellow]")
+            continue
+        console.print(f"Indexing [bold]{name}[/bold] (paths: {r.get('index_paths') or r.get('sparse') or 'all'})...")
+        res = index_repo(name, str(path),
+                         sub_paths=r.get("index_paths") or r.get("sparse"),
+                         on_progress=lambda i, c: console.print(f"  …{i} files, {c} chunks"))
+        console.print(f"  [green]{res}[/green]")
+
+
 # ── vk eval ───────────────────────────────────────────────────────────────────
 
 @app.command("eval")

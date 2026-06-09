@@ -117,6 +117,14 @@ CREATE TABLE IF NOT EXISTS alert_runbook_map (
     PRIMARY KEY (alert_pattern, runbook_id)
 );
 
+CREATE TABLE IF NOT EXISTS code_index_state (
+    repo        TEXT NOT NULL,
+    path        TEXT NOT NULL,
+    content_md5 TEXT NOT NULL,
+    indexed_at  REAL NOT NULL,
+    PRIMARY KEY (repo, path)
+);
+
 CREATE TABLE IF NOT EXISTS tool_effectiveness (
     alert_key   TEXT NOT NULL,           -- normalized alert key
     toolset     TEXT NOT NULL,

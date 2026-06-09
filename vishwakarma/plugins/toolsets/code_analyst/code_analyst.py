@@ -175,6 +175,25 @@ class CodeAnalystToolset(Toolset):
                 },
             ),
             ToolDef(
+                name="code_semantic_search",
+                description=(
+                    "Semantic search over indexed code — find the relevant "
+                    "function/module for a natural-language description "
+                    "('where is offer draining handled?'). Complements "
+                    "code_search (exact/regex) when you don't know the symbol "
+                    "name. Requires embeddings + a prior index (auto on repo_sync)."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string",
+                                  "description": "Natural-language description of the code you want"},
+                        "max_results": {"type": "integer", "description": "Default 8"},
+                    },
+                    "required": ["query"],
+                },
+            ),
+            ToolDef(
                 name="stacktrace_to_source",
                 description=(
                     "Given a stack frame (file path + line from a log/stack trace), "
@@ -200,6 +219,7 @@ class CodeAnalystToolset(Toolset):
             "git_log_around": self._git_log_around,
             "deploy_diff": self._deploy_diff,
             "code_search": self._code_search,
+            "code_semantic_search": self._code_semantic_search,
             "stacktrace_to_source": self._stacktrace_to_source,
         }
         handler = handlers.get(tool_name)
@@ -384,6 +404,26 @@ class CodeAnalystToolset(Toolset):
             out = out[:MAX_OUTPUT_CHARS] + "\n... [truncated]"
         return ToolOutput(tool_name="code_search", status=ToolStatus.SUCCESS, output=out,
                           invocation=f"code_search({repo}, {pattern[:40]})")
+
+    def _code_semantic_search(self, params: dict) -> ToolOutput:
+        query = params.get("query", "").strip()
+        if not query:
+            return ToolOutput(tool_name="code_semantic_search", status=ToolStatus.ERROR,
+                              error="query required")
+        top_k = min(int(params.get("max_results") or 8), 20)
+        from vishwakarma.core.code_index import search_code
+        hits = search_code(query, top_k=top_k)
+        if not hits:
+            return ToolOutput(
+                tool_name="code_semantic_search", status=ToolStatus.NO_DATA,
+                output="No semantic matches (code index empty or embeddings "
+                       "unconfigured — fall back to code_search/grep).",
+                invocation=f"code_semantic_search({query[:50]})")
+        lines = [f"{h['repo']}/{h['path']} :: {h['symbol']}  (score {h['score']})"
+                 for h in hits]
+        return ToolOutput(tool_name="code_semantic_search", status=ToolStatus.SUCCESS,
+                          output=f"{len(hits)} match(es):\n" + "\n".join(lines),
+                          invocation=f"code_semantic_search({query[:50]})")
 
     def _stacktrace_to_source(self, params: dict) -> ToolOutput:
         repo = params["repo"]
