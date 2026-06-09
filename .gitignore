@@ -15,8 +15,10 @@ build/
 
 # Secrets / local config
 config.yaml
+config.local.yaml
 .env
 .env.*
+.env.local
 
 # Frontend (web/dist covered by dist/ above)
 node_modules/

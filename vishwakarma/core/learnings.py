@@ -40,9 +40,16 @@ class LearningsManager:
     Categories are dynamic — any valid name can be created at runtime.
     """
 
-    def __init__(self, path: str = "/data/learnings"):
-        self.path = path
-        os.makedirs(path, exist_ok=True)
+    def __init__(self, path: str | None = None):
+        # VK_LEARNINGS_PATH lets local/dev runs use a writable dir instead of
+        # the /data PVC mount.
+        self.path = path or os.environ.get("VK_LEARNINGS_PATH", "/data/learnings")
+        try:
+            os.makedirs(self.path, exist_ok=True)
+        except OSError:
+            # read-only fs (e.g. /data not mounted locally) — fall back to tmp
+            self.path = os.path.join(os.environ.get("TMPDIR", "/tmp"), "vk-learnings")
+            os.makedirs(self.path, exist_ok=True)
         self._init_defaults()
 
     # ── Internal helpers ──────────────────────────────────────────────────────

@@ -2,91 +2,136 @@
   "agents": [
     {
       "id": "alb-5xx-investigation",
-      "update_date": "2026-03-19",
+      "update_date": "2026-06-09",
+      "cloud_type": "aws",
       "description": "Investigate AWS ALB 5xx alerts. Two-phase: fast RCA identifies the failing service/API/error in ~20s, deep RCA traces full root cause chain with ES logs and dependency checks. Covers: ALB5xxErrors, HTTPCode_Target_5XX_Count, HTTPCode_ELB_5XX_Count, HTTP_ELB_CODE_5XX, Protocol API ALB 5xx.",
       "keywords": ["alb", "5xx", "4xx", "elb", "target", "http", "gateway", "latency", "unhealthy", "ssl"],
       "runbook": "../runbooks/custom/alb-5xx-investigation.md"
     },
     {
       "id": "rds-investigation",
-      "update_date": "2026-03-19",
+      "update_date": "2026-06-09",
+      "cloud_type": "aws",
       "description": "Investigate AWS RDS alerts: high CPU utilization, high database connections, low freeable memory, high IOPS. Uses CloudWatch, Performance Insights, slow query logs, and Kubernetes pod logs. For alerts: RDSHighCPU, RDSHighConnections, RDSLowMemory.",
       "keywords": ["rds", "database", "postgres", "connections", "iops", "freeable", "swap", "writer"],
       "runbook": "../runbooks/aws/rds-investigation.md"
     },
     {
       "id": "rds-replication-lag",
-      "update_date": "2026-03-19",
-      "description": "Investigate RDS replication lag alerts: logical replication slot lag (AWS→GCP cross-cloud), Aurora read replica lag, WAL disk growth. Distinguishes stale logical slots (100+ days lag) from Aurora replica lag (<100ms). For alerts: RDSReplicationLag, ReplicationSlotLag, AuroraReplicaLag, OldestReplicationSlotLag.",
+      "update_date": "2026-06-09",
+      "cloud_type": "aws",
+      "description": "Investigate AWS RDS replication lag alerts: logical replication slot lag (AWS→GCP cross-cloud), Aurora read replica lag, WAL disk growth. Distinguishes stale logical slots (100+ days lag) from Aurora replica lag (<100ms). For alerts: RDSReplicationLag, ReplicationSlotLag, AuroraReplicaLag, OldestReplicationSlotLag.",
       "keywords": ["replication", "replica", "slot", "lag", "wal", "aurora", "logical"],
       "runbook": "../runbooks/aws/rds-replication-lag.md"
     },
     {
       "id": "redis-investigation",
-      "update_date": "2026-03-19",
+      "update_date": "2026-06-09",
+      "cloud_type": "aws",
       "description": "Investigate AWS ElastiCache Redis alerts: high CPU, high memory, key evictions, high connections, bandwidth saturation, CLUSTERDOWN. Covers: RedisHighCPU, RedisHighMemory, RedisEvictions, RedisHighConnections, Redis Node Memory beyond 90%, ProtocolRedis-CPU.",
       "keywords": ["redis", "elasticache", "cache", "eviction", "bandwidth", "networkbandwidth"],
       "runbook": "../runbooks/custom/redis-investigation.md"
     },
     {
+      "id": "alloydb-investigation",
+      "update_date": "2026-06-09",
+      "cloud_type": "gcp",
+      "description": "Investigate GCP AlloyDB (PostgreSQL) alerts: high CPU utilization, high connections, low memory, replication lag. Uses direct SQL (pg_stat_statements/pg_stat_activity) as the primary diagnostic, Prometheus-mirrored AlloyDB metrics, and gcloud alloydb for instance state. For alerts: AlloyDBHighCPU, AlloyDBHighConnections, AlloyDBLowMemory, DatabaseHighCPU (GCP).",
+      "keywords": ["alloydb", "database", "postgres", "connections", "iops", "memory", "cpu", "writer", "primary", "read-pool"],
+      "runbook": "../runbooks/gcp/alloydb-investigation.md"
+    },
+    {
+      "id": "alloydb-replication-lag",
+      "update_date": "2026-06-09",
+      "cloud_type": "gcp",
+      "description": "Investigate GCP AlloyDB replication lag alerts: read-pool replica byte-lag, logical replication slot lag (cross-cloud), WAL growth. Uses pg_stat_replication / pg_last_xact_replay_timestamp() on the primary and read-pool instances. For alerts: AlloyDBReplicationLag, ReadPoolLag, ReplicationSlotLag (GCP).",
+      "keywords": ["replication", "replica", "slot", "lag", "wal", "read-pool", "readpool", "logical", "alloydb"],
+      "runbook": "../runbooks/gcp/alloydb-replication-lag.md"
+    },
+    {
+      "id": "memorystore-investigation",
+      "update_date": "2026-06-09",
+      "cloud_type": "gcp",
+      "description": "Investigate GCP Memorystore for Redis alerts: high CPU, high memory, key evictions, high connections, network saturation. Uses redis-cli INFO/SLOWLOG (read-only) as the primary diagnostic, Prometheus-mirrored Memorystore metrics, and gcloud redis for instance state. For alerts: MemorystoreHighCPU, MemorystoreHighMemory, MemorystoreEvictions, RedisHighMemory (GCP).",
+      "keywords": ["memorystore", "redis", "cache", "eviction", "memory", "network"],
+      "runbook": "../runbooks/gcp/memorystore-investigation.md"
+    },
+    {
+      "id": "gclb-5xx-investigation",
+      "update_date": "2026-06-09",
+      "cloud_type": "gcp",
+      "description": "Investigate GCP HTTP(S) Load Balancer 5xx alerts. Distinguishes backend 5xx (app error) from LB-generated 5xx (backend unhealthy/timeout) via response_code_class and gcloud compute backend-services get-health. Uses Prometheus app metrics as the primary signal, plus ES logs and gcloud compute for LB state. For alerts: GCLB5xx, LoadBalancer5xx, HTTPSLB5xx, Protocol5xx (GCP).",
+      "keywords": ["gclb", "lb", "5xx", "4xx", "loadbalancer", "load-balancer", "backend", "https", "url-map", "unhealthy", "latency"],
+      "runbook": "../runbooks/gcp/gclb-5xx-investigation.md"
+    },
+    {
       "id": "drainer-not-running",
-      "update_date": "2026-03-19",
+      "update_date": "2026-06-09",
+      "cloud_type": "any",
       "description": "Investigate all drainer alerts: NoDriverDrainerRunning, NoAppDrainerRunning, NoDriverDrainerPodRunning, NoCustomerDrainerPodRunning, DriverDrainerLagIncreasing, CustomerDrainerLagIncreasing. Covers: pods down (OOM/eviction), SQL errors (integer overflow, varchar overflow), DB connectivity, Redis cluster issues, false alarms, and drainer lag.",
       "keywords": ["nodriver", "noapp", "drainerrunning", "drainerpod", "nodrain", "drainer"],
       "runbook": "../runbooks/custom/drainer-not-running.md"
     },
     {
       "id": "producer-not-producing",
-      "update_date": "2026-03-19",
+      "update_date": "2026-06-09",
+      "cloud_type": "any",
       "description": "Investigate ProducerNotProducing alert for driver job producer. Determines if producer is genuinely down or false alarm (stale metric). Checks pod status, producer metrics, stream jobs counter, and allocator health.",
       "keywords": ["producer", "producing"],
       "runbook": "../runbooks/custom/producer-not-producing.md"
     },
     {
       "id": "config-parse-failure",
-      "update_date": "2026-03-19",
+      "update_date": "2026-06-09",
+      "cloud_type": "any",
       "description": "Investigate SystemConfigParseFailure — identifies which service/event is failing, checks if it's Redis cache decode failures (baseline noise) or a real config issue from deployment/config push.",
       "keywords": ["config", "parse", "configparse", "system_configs_failed"],
       "runbook": "../runbooks/custom/ny-system-alerts.md"
     },
     {
       "id": "login-success-rate",
-      "update_date": "2026-03-19",
+      "update_date": "2026-06-09",
+      "cloud_type": "any",
       "description": "Investigate LoginSuccessRate alert — auth verify success rate dropped. Checks auth handler metrics, OTP delivery, Redis (session cache), DB health, and recent deployments.",
       "keywords": ["login", "auth", "verify", "otp", "success"],
       "runbook": "../runbooks/custom/login-success-rate.md"
     },
     {
       "id": "general-alerts",
-      "update_date": "2026-03-19",
+      "update_date": "2026-06-09",
+      "cloud_type": "any",
       "description": "General deep investigation for alerts without dedicated fast-RCA: TrinetraTriggered, Multimodal5xx, Protocol5xxErrors, ProtocolExternalAPI5xx, AcmeGateway5xx, OpenNetworkGateway5xx, GRPCDown, GIMS5xx, CMRLAPIGivingErrors, CrisAPIGivingErrors, PTExternalAPIErrorsIncreased, Refunds increased. Covers 5xx errors, external API failures, job failures, and business metric alerts.",
       "keywords": ["multimodal", "trinetra", "cmrl", "cris", "grpc", "gtfs", "gims", "refund", "pt-external", "ptexternal", "notification", "public-transit", "protocol", "acme", "opennetwork", "sev2", "external"],
       "runbook": "../runbooks/custom/general-alert-investigation.md"
     },
     {
       "id": "ride-to-search-ratio",
-      "update_date": "2026-03-19",
+      "update_date": "2026-06-09",
+      "cloud_type": "any",
       "description": "Investigate RideToSearchRatioDown alert — business metric drop. First verifies metrics are flowing, then checks search/ride pipeline: 5xx on search handlers, allocator health, external API failures (OpenNetwork/Acme/Google Maps), driver supply, and compares with yesterday baseline.",
       "keywords": ["ratio", "ridetosearch", "conversion", "drop"],
       "runbook": "../runbooks/custom/ride-to-search-ratio.md"
     },
     {
       "id": "database-investigation",
-      "update_date": "2026-03-19",
+      "update_date": "2026-06-09",
+      "cloud_type": "any",
       "description": "Deep domain debugging: trace application issues through database + source code. Given a ride/booking/payment UUID, resolves the full entity chain, finds the anomaly, then reads the actual Haskell backend code from /data/example-app-src/ to explain WHY the code behaved that way. Covers: rides, bookings, payments, drivers, riders, fare issues, cancellations, search failures.",
       "keywords": ["ride", "booking", "payment", "driver", "rider", "person", "uuid", "trace", "debug", "phone", "fare", "cancel", "refund", "transaction", "quote", "search_request", "pg_stat"],
       "runbook": "../runbooks/custom/domain-debugging.md"
     },
     {
       "id": "allocator-dead",
-      "update_date": "2026-03-19",
+      "update_date": "2026-06-09",
+      "cloud_type": "any",
       "description": "Investigate AllocatorLooksDead alert for ride matching allocator. Determines if allocator is genuinely dead or false alarm, checks dependencies (location-redis, driver RDS, Kafka), compares errors against yesterday's baseline to filter noise.",
       "keywords": ["allocator", "dead", "stream_jobs"],
       "runbook": "../runbooks/custom/allocator-dead.md"
     },
     {
       "id": "ny-sre-sev2-alerts",
-      "update_date": "2026-03-19",
+      "update_date": "2026-06-09",
+      "cloud_type": "any",
       "description": "Fallback for SEV2 alerts not caught by specific runbooks. Uses general investigation methodology.",
       "keywords": ["sev2"],
       "runbook": "../runbooks/custom/general-alert-investigation.md"
