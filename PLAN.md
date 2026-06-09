@@ -8,6 +8,7 @@
 > - **Next step:** shadow deployment (build image, provision Cloud SQL + Memorystore, apply k8s/argus/ manifests → test channel) OR wire pr_create when the GitHub App exists. Plain YAML in k8s/argus/ — NO Helm. Pending externals: **Argus Slack app registration**; GitHub App; Acme embeddings model; ~/.config/opencode old key; Cloud SQL + Memorystore (GCP).
 >
 > **Deferred / v2 (NOT built — don't assume these exist):**
+>   - (curated tool-subset — DONE, see gap-closure #10)
 >   - `both`-cloud SYNTHESIZER — cross-cloud jobs fan out and each side posts independently; no orchestrator-side merge of the two findings yet.
 >   - Code RAG (`code_semantic_search` + repo embedding index) — pointless until the gateway has an embeddings model.
 >   - Run-until-verified — engine still uses fixed step budgets, not evidence-based stop.
@@ -56,6 +57,7 @@
 >     7. per-cloud knowledge (knowledge-<cloud>.md with fallback)
 >     8. Prometheus self-metrics (core/metrics.py) at GET /metrics
 >     9. audit_log table + storage/audit.py; console mutations audited; GET /api/console/audit (admin)
+>     10. curated tool-subset (core/tool_selection.py) — orchestrator picks relevant toolsets by alert domain+cloud, stable across the run (prompt-cache + accuracy); engine.stream_investigate(tool_subset=…); falls back to all when uncertain/empty. Closes the last buildable item from the planning discussion.
 >   - Phase 5b ✅ console frontend (`web/` — Vite+React+TS+Tailwind dark theme, base /console/; pages: Dashboard, Investigations + live SSE detail w/ checkpointed transcript, Incidents search/detail w/ ✅/❌ feedback, Runbook studio (editor/dry-run/mappings), Fixes queue, Fleet (queues/executors/orphans), Settings (token). Typed api client w/ X-VK-Token. Served by server.py `_mount_console_spa` at /console with SPA fallback + traversal-safe assets; builds clean: 74KB gzip)
 > - **Key context to re-load after compaction:** read this whole file; prod deployment is untouched single-pod v1.1.23 on EKS `monitoring` ns; all architectural decisions are final (see "Confirmed decisions" + "Resolved in discussion"); never touch prod infra without asking the user.
 

@@ -750,6 +750,17 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
             # needs bot-token auth) → data URLs for vision-capable models.
             investigation_images = _fetch_issue_images(issue, config)
 
+            # Curated tool subset for this alert (stable across the run →
+            # prompt-cache friendly + better tool selection).
+            tool_subset = None
+            try:
+                from vishwakarma.core.tool_selection import select_toolset_names
+                available = {ts.name for ts in engine.executor.toolsets if ts.enabled}
+                sel_text = f"{alert_name} {issue.title} {issue.description or ''}"
+                tool_subset = select_toolset_names(sel_text, available)
+            except Exception:
+                pass
+
             for event in engine.stream_investigate(
                 question=question,
                 runbooks=matched_runbooks or None,
@@ -757,6 +768,7 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
                 pre_investigation_findings=sub_agent_findings_text,
                 incident_id=incident_id,
                 images=investigation_images or None,
+                tool_subset=tool_subset,
             ):
                 etype = event.get("type", "")
                 # Fan out to the console UI (SSE) — fire-and-forget.

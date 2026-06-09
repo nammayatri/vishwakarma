@@ -524,6 +524,7 @@ class InvestigationEngine:
         bash_always_deny: bool = False,
         pre_investigation_findings: str | None = None,
         incident_id: str | None = None,
+        tool_subset: set[str] | None = None,
     ) -> Generator[dict, None, None]:
         """
         Stream investigation events as they happen.
@@ -578,7 +579,17 @@ class InvestigationEngine:
             })
             log.info("Injected sub-agent pre-investigation findings into streaming messages")
 
-        tools = self.executor.openai_tools()
+        # Curated tool subset (stable across the investigation → prompt-cache
+        # friendly). None = all enabled tools.
+        if tool_subset:
+            from vishwakarma.core.tool_selection import filter_openai_tools
+            tools = filter_openai_tools(self.executor, tool_subset)
+            if not tools:                       # never strand the agent
+                tools = self.executor.openai_tools()
+            else:
+                log.info(f"Curated tool subset: {len(tools)} tools from {sorted(tool_subset)}")
+        else:
+            tools = self.executor.openai_tools()
         _MAX_LLM_RETRIES = 3
 
         checkpoint_injected_stream = False

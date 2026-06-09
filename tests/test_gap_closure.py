@@ -132,6 +132,58 @@ def test_audit_log(backend):
     assert rows[1]["actor"] == "admin"
 
 
+# ── Curated tool subset ───────────────────────────────────────────────────────
+
+def test_tool_selection_by_domain():
+    from vishwakarma.core.tool_selection import select_toolset_names, CORE_TOOLSETS
+    avail = {"bash", "todo", "runbooks", "learnings", "code_analyst",
+             "code_session", "prometheus", "grafana", "database", "mongodb",
+             "elasticsearch", "kafka", "aws", "http", "internet"}
+
+    # core always present
+    rds = select_toolset_names("RDSCpuHigh rds cpu connection", avail)
+    assert CORE_TOOLSETS <= rds
+    assert "database" in rds and "aws" in rds and "prometheus" in rds
+    assert "kafka" not in rds and "elasticsearch" not in rds
+
+    # streaming keywords
+    assert "kafka" in select_toolset_names("drainer consumer lag", avail)
+
+    # logs keywords
+    assert "elasticsearch" in select_toolset_names("exception stacktrace 500", avail)
+
+
+def test_tool_selection_vague_returns_all():
+    from vishwakarma.core.tool_selection import select_toolset_names
+    avail = {"bash", "todo", "prometheus", "kafka"}
+    assert select_toolset_names("MysteryAlert", avail) == avail
+
+
+def test_tool_selection_intersects_available():
+    from vishwakarma.core.tool_selection import select_toolset_names
+    # database domain matched but database toolset not enabled → not included
+    avail = {"bash", "todo", "runbooks", "learnings", "code_analyst",
+             "code_session", "prometheus"}
+    sel = select_toolset_names("postgres query connection", avail)
+    assert "database" not in sel and "prometheus" not in sel  # prom not a db tool
+    assert sel <= avail
+
+
+def test_filter_openai_tools():
+    from vishwakarma.core.tool_selection import filter_openai_tools
+    from vishwakarma.core.tools import ToolExecutor
+    from vishwakarma.plugins.toolsets.code_analyst.code_analyst import CodeAnalystToolset
+
+    ts = CodeAnalystToolset({"repo_dir": "/tmp/x",
+                             "repos": [{"name": "r", "url": "https://x/y.git"}]})
+    ex = ToolExecutor(toolsets=[ts])
+    specs = filter_openai_tools(ex, {"code_analyst"})
+    names = {s["function"]["name"] for s in specs}
+    assert "git_blame" in names and "repo_sync" in names
+    # a toolset not in the subset yields nothing
+    assert filter_openai_tools(ex, {"prometheus"}) == []
+
+
 # ── Argus image payload ───────────────────────────────────────────────────────
 
 def test_argus_payload_carries_image_urls():
