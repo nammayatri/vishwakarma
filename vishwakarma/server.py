@@ -425,7 +425,14 @@ async def _run_alert_investigation(config, state, issue, incident_id: str, finge
         await _do_investigation(config, state, issue, incident_id, fingerprint)
 
 
-async def _do_investigation(config, state, issue, incident_id: str, fingerprint: str = ""):
+async def _do_investigation(config, state, issue, incident_id: str, fingerprint: str = "",
+                            cross_cloud: str = "", cross_cloud_base: str = ""):
+    """
+    cross_cloud: when set ('aws'|'gcp'), this is one half of a `both`-cloud
+    investigation. Individual Slack posting is suppressed; the RCA is written
+    to cross_cloud_findings under `cross_cloud_base`, and the second half to
+    finish synthesizes + posts ONE unified RCA.
+    """
     import asyncio
 
     tm = state.get("toolset_manager")
@@ -453,7 +460,9 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
         # reporter expects the RCA where they raised it.
         report_channel = issue.labels.get("slack_channel") or ""
         report_thread = issue.labels.get("slack_thread_ts") or ""
-        if config.is_slack_configured():
+        # Cross-cloud halves don't post individually — the synthesizer posts
+        # one unified RCA.
+        if config.is_slack_configured() and not cross_cloud:
             try:
                 from vishwakarma.plugins.relays.slack.plugin import SlackDestination
                 dest = SlackDestination({"token": config.slack_bot_token})
@@ -877,6 +886,34 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
     meta = result.meta.model_dump() if result.meta else {}
     meta["matched_runbook_ids"] = matched_runbook_ids  # for ✅/❌ runbook credit
 
+    # ── Cross-cloud half: write this cloud's finding; the second finisher
+    #    synthesizes both into one unified RCA and posts it once. ──
+    if cross_cloud and cross_cloud_base:
+        from vishwakarma.core import cross_cloud as cc
+        cc.write_finding(cross_cloud_base, cross_cloud, analysis, meta)
+        # Persist this half's incident record (for the console), then decide
+        # whether we synthesize.
+        try:
+            from vishwakarma.storage.queries import save_incident
+            save_incident(incident_id=incident_id, title=f"{issue.title} [{cross_cloud}]",
+                          question=question, analysis=analysis, source=issue.source,
+                          severity=issue.severity, labels=issue.labels,
+                          tool_outputs=[o.model_dump() for o in result.tool_outputs], meta=meta)
+        except Exception as e:
+            log.warning(f"Cross-cloud half save failed: {e}")
+        try:
+            from vishwakarma.storage.investigations import finish_investigation
+            finish_investigation(incident_id, "done")
+        except Exception:
+            pass
+        if fingerprint:
+            _dedup.release(fingerprint)
+        if cc.both_present(cross_cloud_base):
+            import socket
+            if cc.claim_synthesis(cross_cloud_base, socket.gethostname()):
+                await _synthesize_and_post_cross_cloud(config, issue, cross_cloud_base)
+        return
+
     # Generate PDF
     pdf_path = None
     try:
@@ -963,6 +1000,52 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
     if fingerprint:
         _dedup.release(fingerprint)
         log.info(f"Investigation complete for {issue.title} — dedup lock released")
+
+
+async def _synthesize_and_post_cross_cloud(config, issue, base_incident_id: str) -> None:
+    """Merge both clouds' findings into one RCA, post it, save the unified incident."""
+    from vishwakarma.core import cross_cloud as cc
+    findings = cc.get_findings(base_incident_id)
+    llm = config.make_llm()
+    unified = cc.synthesize(llm, issue.title, findings)
+
+    # PDF + Slack (report channel/thread when this came from Argus)
+    pdf_path = None
+    try:
+        from vishwakarma.bot.pdf import generate_pdf
+        pdf_path = generate_pdf(title=f"{issue.title} (cross-cloud)", analysis=unified,
+                                source=issue.source, severity=issue.severity,
+                                tool_outputs=[], meta={"cross_cloud": True})
+    except Exception as e:
+        log.warning(f"Cross-cloud PDF failed: {e}")
+
+    slack_ts = None
+    if config.is_slack_configured():
+        try:
+            from vishwakarma.plugins.relays.slack.plugin import SlackDestination
+            dest = SlackDestination({"token": config.slack_bot_token})
+            channel = issue.labels.get("slack_channel") or None
+            resp = dest.post_investigation(
+                title=f"{issue.title} (cross-cloud)", analysis=unified,
+                source=issue.source, severity=issue.severity, pdf_path=pdf_path,
+                incident_id=base_incident_id,
+                thread_ts=issue.labels.get("slack_thread_ts") or None,
+                channel=channel,
+            )
+            slack_ts = resp.get("ts")
+        except Exception as e:
+            log.warning(f"Cross-cloud Slack post failed: {e}")
+
+    try:
+        from vishwakarma.storage.queries import save_incident
+        save_incident(incident_id=base_incident_id, title=f"{issue.title} (cross-cloud)",
+                      question=issue.question(), analysis=unified, source=issue.source,
+                      severity=issue.severity, labels=issue.labels, tool_outputs=[],
+                      meta={"cross_cloud": True, "clouds": [f["cloud"] for f in findings]},
+                      slack_ts=slack_ts, pdf_path=pdf_path)
+    except Exception as e:
+        log.warning(f"Cross-cloud unified save failed: {e}")
+    log.info(f"Cross-cloud RCA synthesized + posted for {base_incident_id}")
 
 
 def _fetch_issue_images(issue, config) -> list[dict]:

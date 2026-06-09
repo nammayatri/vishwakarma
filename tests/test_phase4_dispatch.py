@@ -144,7 +144,8 @@ def test_executor_runs_job_and_acks(monkeypatch, tmp_path):
 
     ran = {}
 
-    async def fake_do_investigation(config, state, iss, incident_id, fingerprint):
+    async def fake_do_investigation(config, state, iss, incident_id, fingerprint,
+                                    cross_cloud="", cross_cloud_base=""):
         ran["incident_id"] = incident_id
         ran["title"] = iss.title
         from vishwakarma.storage.investigations import (
@@ -189,6 +190,51 @@ def test_executor_runs_job_and_acks(monkeypatch, tmp_path):
     ex._run_job(msg_id2, payload2)
     assert ran == {}  # not re-run
     assert jobstream.pending_count("aws") == 0
+
+
+@needs_redis
+def test_executor_both_job_uses_suffixed_id_and_cross_cloud(monkeypatch, tmp_path):
+    """A `both`-tagged job → cloud-suffixed tracking id + cross_cloud set."""
+    import sys
+    for mod in list(sys.modules):
+        if mod.startswith("vishwakarma.storage"):
+            del sys.modules[mod]
+    import redis as redis_lib
+    redis_lib.Redis.from_url(REDIS_URL).flushdb()
+    from vishwakarma.storage import db as dbmod
+    dbmod.init_db(db_path=str(tmp_path / "t.db"))
+    from vishwakarma.core import jobstream
+    jobstream.init_jobstream(REDIS_URL)
+
+    seen = {}
+
+    async def fake_do_investigation(config, state, iss, incident_id, fingerprint,
+                                    cross_cloud="", cross_cloud_base=""):
+        seen["incident_id"] = incident_id
+        seen["cross_cloud"] = cross_cloud
+        seen["base"] = cross_cloud_base
+
+    import vishwakarma.server as server_mod
+    monkeypatch.setattr(server_mod, "_do_investigation", fake_do_investigation)
+
+    from vishwakarma.executor import Executor
+
+    class Cfg:
+        db_path = str(tmp_path / "t.db"); pg_dsn = ""; redis_url = REDIS_URL
+
+    ex = Executor.__new__(Executor)
+    ex.config = Cfg(); ex.cloud = "gcp"; ex.consumer = "g1"; ex._state = {}
+
+    jobstream.enqueue("gcp", {
+        "incident_id": "inc-both", "fingerprint": "fp", "cloud": "both",
+        "issue": {"id": "x", "title": "Drainer lag", "source": "alertmanager", "labels": {}},
+    })
+    msg_id, payload = jobstream.consume("gcp", "g1", block_ms=500)
+    ex._run_job(msg_id, payload)
+
+    assert seen["incident_id"] == "inc-both:gcp"   # suffixed so halves don't collide
+    assert seen["cross_cloud"] == "gcp"
+    assert seen["base"] == "inc-both"
 
 
 @needs_redis

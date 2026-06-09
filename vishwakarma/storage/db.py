@@ -117,6 +117,21 @@ CREATE TABLE IF NOT EXISTS alert_runbook_map (
     PRIMARY KEY (alert_pattern, runbook_id)
 );
 
+CREATE TABLE IF NOT EXISTS cross_cloud_findings (
+    incident_id   TEXT NOT NULL,
+    cloud         TEXT NOT NULL,         -- 'aws' | 'gcp'
+    rca           TEXT,                  -- this cloud's RCA text
+    meta          TEXT,                  -- JSON
+    created_at    REAL NOT NULL,
+    PRIMARY KEY (incident_id, cloud)
+);
+
+CREATE TABLE IF NOT EXISTS cross_cloud_synthesis (
+    incident_id   TEXT PRIMARY KEY,      -- claimed once by the synthesizing worker
+    worker_id     TEXT,
+    created_at    REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS audit_log (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     ts          REAL NOT NULL,

@@ -112,8 +112,14 @@ class Executor:
         from vishwakarma.core.issue import Issue
         from vishwakarma.storage.investigations import get_investigation
 
-        incident_id = payload.get("incident_id", "")
+        base_incident_id = payload.get("incident_id", "")
         fingerprint = payload.get("fingerprint", "")
+        # `both`-cloud jobs are fanned to both pools with the same payload. Each
+        # half tracks under a cloud-suffixed id (so the two halves don't collide
+        # in the investigations table) but writes findings under the base id.
+        is_both = payload.get("cloud", "") == "both"
+        cross_cloud = self.cloud if is_both else ""
+        incident_id = f"{base_incident_id}:{self.cloud}" if is_both else base_incident_id
         try:
             issue = Issue.model_validate(payload["issue"])
         except Exception as e:
@@ -140,7 +146,8 @@ class Executor:
             # agentic loop (with checkpointing)/PDF/Slack/save/dedup-release.
             from vishwakarma.server import _do_investigation
             asyncio.run(_do_investigation(
-                self.config, self._state, issue, incident_id, fingerprint))
+                self.config, self._state, issue, incident_id, fingerprint,
+                cross_cloud=cross_cloud, cross_cloud_base=base_incident_id))
         except Exception as e:
             log.error(f"Job {msg_id} investigation crashed: {e}", exc_info=True)
             # Leave the dedup lock to its TTL; mark investigation failed so the

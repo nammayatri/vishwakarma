@@ -9,7 +9,7 @@
 >
 > **Deferred / v2 (NOT built — don't assume these exist):**
 >   - (curated tool-subset — DONE, see gap-closure #10)
->   - `both`-cloud SYNTHESIZER — cross-cloud jobs fan out and each side posts independently; no orchestrator-side merge of the two findings yet.
+>   - (`both`-cloud SYNTHESIZER — DONE: core/cross_cloud.py; each half writes findings, second finisher atomically claims + merges + posts one unified RCA; executor suffixes tracking id per cloud)
 >   - Code RAG (`code_semantic_search` + repo embedding index) — pointless until the gateway has an embeddings model.
 >   - Run-until-verified — engine still uses fixed step budgets, not evidence-based stop.
 >   - Incident correlation (alert-storm grouping into one investigation) — only fingerprint dedup today.
