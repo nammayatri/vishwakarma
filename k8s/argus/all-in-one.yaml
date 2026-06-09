@@ -21,9 +21,7 @@ spec:
       serviceAccountName: argus      # Workload Identity → read-only GCP SA + view RBAC
       containers:
         - name: argus
-          # Built image. Push to a registry GKE can pull (GCP Artifact Registry
-          # or the AWS ECR if GKE has cross-cloud pull), then set it here.
-          image: CHANGE_ME-registry/vishwakarma:argus
+          image: asia-south1-docker.pkg.dev/prod-project/argus/vishwakarma:1.0.0-argus
           command: ["vk", "serve", "--config", "/etc/argus/config.yaml"]
           ports:
             - { name: http, containerPort: 5050 }
@@ -79,19 +77,12 @@ spec:
   selector: { app: argus }
   ports:
     - { name: http, port: 80, targetPort: 5050 }
----
-# UI ACCESS — internal LoadBalancer for a stable private URL on the VPN.
-# Gives a private IP reachable from your corp network / VPN. The console is at
-# http://<internal-ip>/console. Comment this out if you only use port-forward.
-apiVersion: v1
-kind: Service
-metadata:
-  name: argus-ui
-  namespace: argus
-  annotations:
-    networking.gke.io/load-balancer-type: "Internal"   # private IP, not public
-spec:
-  type: LoadBalancer
-  selector: { app: argus }
-  ports:
-    - { name: http, port: 80, targetPort: 5050 }
+# UI ACCESS — fronted by POMERIUM (identity-aware proxy, SSO at the edge).
+# Pomerium routes an external hostname -> this ClusterIP Service
+# (argus.argus.svc.cluster.local:80) and enforces auth, so ui.auth_disabled:true
+# in the config is fine — Pomerium is the gate. Add a Pomerium route/Ingress:
+#   from: https://argus.<your-domain>
+#   to:   http://argus.argus.svc.cluster.local
+#   policy: allow @example.com (or the relevant group)
+# (For a quick check before Pomerium is wired: kubectl -n argus port-forward
+#  svc/argus 8080:80 -> http://localhost:8080/console)
