@@ -1,0 +1,57 @@
+# GCP alert trigger — mirrors AWS: AlertManager POSTs firing alerts to the
+# Argus webhook (/api/alertmanager on the argus Service). Argus dedups,
+# enriches, investigates, posts the RCA.
+#
+# `continue: true` => Argus runs ALONGSIDE the existing Slack/email receivers
+# (it does NOT replace your current alerting). For SHADOW rollout, keep the
+# matchers narrow first (e.g. a single test alert), prove it, then widen.
+#
+# ── Option A: VMAlertmanagerConfig CR (operator-native, declarative) ──
+# Requires the VMAlertmanager to SELECT this CR. Your VMAlertmanager has no
+# configSelector today, so first enable selection (one-time):
+#   kubectl -n victoriametrics patch vmalertmanager victoriametrics --type=merge \
+#     -p '{"spec":{"selectAllByDefault":true}}'
+# (or set a configSelector that matches the label below). Then apply this CR.
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMAlertmanagerConfig
+metadata:
+  name: argus
+  namespace: victoriametrics
+  labels: { app: argus }
+spec:
+  route:
+    receiver: argus
+    continue: true                 # keep existing Slack/email routing
+    group_wait: 10s
+    group_interval: 5m
+    repeat_interval: 4h
+    # SHADOW: start narrow. Widen once proven (e.g. drop to severity=~"critical").
+    matchers:
+      - 'alertname="ArgusShadowTest"'
+  receivers:
+    - name: argus
+      webhook_configs:
+        - url: http://argus.argus.svc.cluster.local/api/alertmanager
+          send_resolved: false
+---
+# ── Option B: raw config (matches your current setup) ──
+# If you keep using the raw config secret instead of CRs, add to it:
+#
+#   receivers:
+#     - name: argus
+#       webhook_configs:
+#         - url: http://argus.argus.svc.cluster.local/api/alertmanager
+#           send_resolved: false
+#   route:
+#     routes:
+#       - receiver: argus
+#         continue: true
+#         matchers: [ 'alertname="ArgusShadowTest"' ]   # widen after shadow
+#
+# (Edit the vmalertmanager-victoriametrics-config secret — back it up first:
+#  kubectl -n victoriametrics get secret vmalertmanager-victoriametrics-config -o yaml > backup.yaml)
+#
+# Test end-to-end with a synthetic alert (no real incident needed):
+#   curl -XPOST http://argus.argus.svc.cluster.local/api/alertmanager \
+#     -H 'Content-Type: application/json' \
+#     -d '{"alerts":[{"status":"firing","labels":{"alertname":"ArgusShadowTest","severity":"warning","service":"protocol-app","namespace":"atlas"}}]}'

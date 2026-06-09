@@ -3,17 +3,9 @@
 # AGENT's own state, not prod app data — a PVC-backed single pod + periodic
 # pg_dump backup is adequate. For cross-cloud (AWS executors) add an internal
 # LoadBalancer Service (see postgres-internal-lb.yaml note at bottom).
-apiVersion: v1
-kind: Secret
-metadata:
-  name: argus-postgres
-  namespace: argus
-type: Opaque
-stringData:
-  # CHANGE in prod (or source from a secret manager). The app reads pg_dsn from
-  # the argus configmap/secret — keep these in sync.
-  POSTGRES_PASSWORD: "CHANGE_ME_strong_password"
----
+# NOTE: the argus-postgres Secret (POSTGRES_PASSWORD) is defined in the real
+# secrets.yaml (gitignored) so it stays in sync with VK_PG_DSN. Do NOT define it
+# here too — applying this file would clobber the real password.
 apiVersion: v1
 kind: ConfigMap
 metadata:

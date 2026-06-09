@@ -39,3 +39,7 @@ node_modules/
 htmlcov/
 k8s/deployment.yaml
 NY_CONTEXT.md
+# real (filled) argus manifests — never commit
+k8s/argus/configmap.yaml
+k8s/argus/secrets.yaml
+k8s/argus/postgres-secret.yaml
