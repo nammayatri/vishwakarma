@@ -117,6 +117,16 @@ CREATE TABLE IF NOT EXISTS alert_runbook_map (
     PRIMARY KEY (alert_pattern, runbook_id)
 );
 
+CREATE TABLE IF NOT EXISTS tool_effectiveness (
+    alert_key   TEXT NOT NULL,           -- normalized alert key
+    toolset     TEXT NOT NULL,
+    hits        INTEGER DEFAULT 0,        -- contributed to a confirmed RCA
+    updated_at  REAL NOT NULL,
+    PRIMARY KEY (alert_key, toolset)
+);
+
+CREATE INDEX IF NOT EXISTS idx_tooleff_alert ON tool_effectiveness(alert_key);
+
 CREATE TABLE IF NOT EXISTS correlated_alerts (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     parent_id     TEXT NOT NULL,         -- the incident this alert was grouped into

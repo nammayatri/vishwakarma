@@ -790,6 +790,20 @@ def start_bot(config: "VishwakarmaConfig") -> None:
             except Exception as e:
                 log.debug(f"[FEEDBACK] Runbook hit update failed (non-fatal): {e}")
 
+            # Learned tool routing: credit the toolsets that produced this
+            # confirmed RCA's evidence for this alert class.
+            try:
+                from vishwakarma.storage.tool_effectiveness import (
+                    record_effective, tools_to_toolsets)
+                from vishwakarma.storage.runbooks import normalize_alert_key
+                tos = json.loads(incident.get("tool_outputs", "[]")) if incident.get("tool_outputs") else []
+                used_tools = {o.get("tool_name") for o in tos if o.get("tool_name")}
+                toolsets = config.make_toolset_manager().active_toolsets()
+                used_toolsets = tools_to_toolsets(used_tools, toolsets)
+                record_effective(normalize_alert_key(alert_name), used_toolsets)
+            except Exception as e:
+                log.debug(f"[FEEDBACK] Tool effectiveness update failed (non-fatal): {e}")
+
             # Extract and save replayable pattern
             pattern_saved = False
             try:

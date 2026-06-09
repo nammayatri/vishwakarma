@@ -786,9 +786,12 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
             tool_subset = None
             try:
                 from vishwakarma.core.tool_selection import select_toolset_names
+                from vishwakarma.storage.tool_effectiveness import top_toolsets
+                from vishwakarma.storage.runbooks import normalize_alert_key
                 available = {ts.name for ts in engine.executor.toolsets if ts.enabled}
                 sel_text = f"{alert_name} {issue.title} {issue.description or ''}"
-                tool_subset = select_toolset_names(sel_text, available)
+                learned = top_toolsets(normalize_alert_key(alert_name))
+                tool_subset = select_toolset_names(sel_text, available, learned=learned)
             except Exception:
                 pass
 

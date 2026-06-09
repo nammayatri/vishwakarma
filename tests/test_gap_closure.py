@@ -136,9 +136,8 @@ def test_audit_log(backend):
 
 def test_tool_selection_by_domain():
     from vishwakarma.core.tool_selection import select_toolset_names, CORE_TOOLSETS
-    avail = {"bash", "todo", "runbooks", "learnings", "code_analyst",
-             "code_session", "prometheus", "grafana", "database", "mongodb",
-             "elasticsearch", "kafka", "aws", "http", "internet"}
+    avail = CORE_TOOLSETS | {"prometheus", "grafana", "database", "mongodb",
+                             "elasticsearch", "kafka", "aws", "http", "internet"}
 
     # core always present
     rds = select_toolset_names("RDSCpuHigh rds cpu connection", avail)

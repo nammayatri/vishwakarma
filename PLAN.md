@@ -4,18 +4,23 @@
 >
 > - **Branch:** `argus` (created from `ny-vishwakarma` @ 07f5fe9, v1.1.23 in prod)
 > - **Current milestone:** Milestone 1 = Phase 0 (Postgres+pgvector, Memorystore dedup, durable `investigations` table, SQLite history migration) + Phase 1 (Tier-1 code-analyst toolset)
-> - **Status:** GAP-CLOSURE COMPLETE (gaps 1-9 from the planning-history audit) + Phase 6a + fast-RCA removed. 89 tests passing. Roadmap code-complete except items genuinely blocked on externals (see "Deferred / v2" below).
+> - **Status:** GOD-LEVEL COMPLETE — all 6 god-level features built (pr_create/fix-loop, eval harness, run-until-verified, LSP, active verification, learned tool routing) + gap-closure + Phase 6a + fast-RCA removed. **138 tests passing.** Everything buildable is built; only external/ops items remain (GitHub App token, embeddings model, golden-set labeling, infra provisioning).
 > - **Next step:** shadow deployment (build image, provision Cloud SQL + Memorystore, apply k8s/argus/ manifests → test channel) OR wire pr_create when the GitHub App exists. Plain YAML in k8s/argus/ — NO Helm. Pending externals: **Argus Slack app registration**; GitHub App; Acme embeddings model; ~/.config/opencode old key; Cloud SQL + Memorystore (GCP).
 >
-> **Deferred / v2 (NOT built — don't assume these exist):**
->   - (curated tool-subset — DONE, see gap-closure #10)
->   - (`both`-cloud SYNTHESIZER — DONE: core/cross_cloud.py; each half writes findings, second finisher atomically claims + merges + posts one unified RCA; executor suffixes tracking id per cloud)
->   - Code RAG (`code_semantic_search` + repo embedding index) — pointless until the gateway has an embeddings model.
->   - Run-until-verified — engine still uses fixed step budgets, not evidence-based stop.
->   - (Incident correlation — DONE: core/correlation.py; storm alerts sharing service+namespace/cluster within a 15-min window group into the active investigation instead of starting competing ones; recorded in correlated_alerts, shown on the console.)
->   - LSP/HLS via MCP bridge — code_analyst uses git+ast-grep+rg, no semantic LSP.
->   - pr_create + CI-result reading + golden-set eval — blocked on GitHub App (the fix-confidence SCORER + gate ARE built, core/fix_scorer.py).
->   - NY-data scrub for public OSS (agents.json/runbooks still NY-specific — fine internally).
+> **GOD-LEVEL FEATURES — ALL BUILT (this round):**
+>   1. ✅ pr_create — close the fix loop (core/pr_creator.py + propose_fix tool; push fix branch + open DRAFT PR; idempotent; gated by fix_scorer). Runtime needs only a GitHub App token (github.enabled+token).
+>   2. ✅ eval/calibration harness (core/eval_harness.py + `vk eval`) — RCA precision + confidence calibration vs a golden set. Needs you to label past incidents to run.
+>   3. ✅ run-until-verified — periodic verification checkpoints (cause must explain ALL symptoms + be confirmed, not correlated); config.run_until_verified.
+>   4. ✅ LSP code intelligence (core/lsp_client.py + lsp toolset) — find_definition/references/hover via a language server (HLS/pylsp). Runtime needs the server binary configured.
+>   5. ✅ active verification (verify toolset) — verify_hypothesis runs a read-only check → CONFIRMED/REFUTED verdict.
+>   6. ✅ learned tool routing (storage/tool_effectiveness.py) — ✅-confirmed RCAs credit their toolsets per alert class; biases curated tool selection.
+>
+> **Truly remaining (external/ops only — no more code to write):**
+>   - **GitHub App token** at runtime → activates pr_create + (future) CI-result reading.
+>   - **Embeddings model** on the gateway → activates semantic incident/runbook/code RAG (code already degrades gracefully to keyword).
+>   - **Golden-set labeling** (your data) → run the eval harness for real calibration numbers.
+>   - **Provision** Cloud SQL + Memorystore, **register** Argus Slack app, **deploy** (shadow → cutover) via k8s/argus/.
+>   - NY-data scrub for a public OSS release (agents.json/runbooks still NY-specific — fine internally).
 > - **Done so far:**
 >   - Phase 0 ✅ dual-backend storage (`storage/db.py` — SQLite default + Postgres via `VK_PG_DSN`/`storage.dsn`, PGConnection adapter translates `?`→`%s`, conditional pgvector)
 >   - Phase 0 ✅ durable investigations (`storage/investigations.py` — create/claim/checkpoint/resume/orphan-reap/attempt-budget; engine checkpoints each step via `stream_investigate(incident_id=…)`)

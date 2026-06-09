@@ -15,7 +15,8 @@ import logging
 log = logging.getLogger(__name__)
 
 # Always available — investigation plumbing + cheap universal tools.
-CORE_TOOLSETS = {"bash", "todo", "runbooks", "learnings", "code_analyst", "code_session"}
+CORE_TOOLSETS = {"bash", "todo", "runbooks", "learnings", "code_analyst",
+                 "code_session", "verify", "lsp"}
 
 # Domain → toolsets. An alert matching a domain's keywords pulls its toolsets.
 _DOMAIN_TOOLSETS: dict[str, set[str]] = {
@@ -45,14 +46,16 @@ _DOMAIN_KEYWORDS: dict[str, tuple[str, ...]] = {
 }
 
 
-def select_toolset_names(alert_text: str, available: set[str]) -> set[str]:
+def select_toolset_names(alert_text: str, available: set[str],
+                         learned: set[str] | None = None) -> set[str]:
     """
     Return the curated toolset names for an alert, intersected with what's
-    actually enabled. Always includes the core set. Falls back to ALL enabled
+    actually enabled. Always includes the core set + any `learned` toolsets
+    (historically effective for this alert class). Falls back to ALL enabled
     toolsets when nothing domain-specific matches (uncertain → don't trim).
     """
     text = (alert_text or "").lower()
-    selected: set[str] = set(CORE_TOOLSETS)
+    selected: set[str] = set(CORE_TOOLSETS) | set(learned or set())
 
     matched_domain = False
     for domain, keywords in _DOMAIN_KEYWORDS.items():
@@ -62,11 +65,11 @@ def select_toolset_names(alert_text: str, available: set[str]) -> set[str]:
 
     selected &= available  # only what's enabled
 
-    if not matched_domain:
-        # No clear domain — give everything (conservative).
+    # Learned toolsets count as a match signal — a class that always needed
+    # `database` should keep getting it even without a keyword hit.
+    if not matched_domain and not (learned and (set(learned) & available)):
         return set(available)
 
-    # If the trim removed too much (e.g. core toolsets disabled), bail to all.
     if not selected:
         return set(available)
     return selected
