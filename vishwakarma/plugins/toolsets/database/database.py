@@ -207,6 +207,11 @@ class DatabaseToolset(Toolset):
 
             db_type = cfg.get("type", "postgresql")
 
+            # Default query/connect timeout = 10s; override per-connection with
+            # `timeout`. Passed at client creation so it's the default for every
+            # query (Postgres statement_timeout kills runaways server-side).
+            timeout_s = int(cfg.get("timeout", 10))
+
             if db_type == "postgresql":
                 import psycopg2
                 conn = psycopg2.connect(
@@ -215,8 +220,11 @@ class DatabaseToolset(Toolset):
                     database=cfg["database"],
                     user=cfg.get("username"),
                     password=cfg.get("password"),
-                    connect_timeout=10,
-                    options="-c default_transaction_read_only=on -c statement_timeout=10000",
+                    connect_timeout=timeout_s,
+                    options=(
+                        "-c default_transaction_read_only=on "
+                        f"-c statement_timeout={timeout_s * 1000}"
+                    ),
                 )
                 conn.autocommit = True
             elif db_type == "mysql":
@@ -227,7 +235,8 @@ class DatabaseToolset(Toolset):
                     database=cfg["database"],
                     user=cfg.get("username"),
                     password=cfg.get("password", ""),
-                    connect_timeout=10,
+                    connect_timeout=timeout_s,
+                    read_timeout=timeout_s,
                 )
             elif db_type == "clickhouse":
                 # ClickHouse uses HTTP API — store config dict as "connection"
