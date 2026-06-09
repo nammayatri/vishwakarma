@@ -58,6 +58,8 @@ class Executor:
         init_eventbus(cfg.redis_url)  # publish live events to the console UI
         from vishwakarma.core.keypool import init_keypool
         init_keypool(cfg.llm.api_keys or ([cfg.llm.api_key] if cfg.llm.api_key else []))
+        from vishwakarma.core.correlation import init_correlation
+        init_correlation(cfg.redis_url)
         try:
             from vishwakarma.storage.runbooks import seed_from_files
             seed_from_files()

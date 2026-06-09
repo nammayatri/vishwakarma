@@ -12,7 +12,7 @@
 >   - (`both`-cloud SYNTHESIZER — DONE: core/cross_cloud.py; each half writes findings, second finisher atomically claims + merges + posts one unified RCA; executor suffixes tracking id per cloud)
 >   - Code RAG (`code_semantic_search` + repo embedding index) — pointless until the gateway has an embeddings model.
 >   - Run-until-verified — engine still uses fixed step budgets, not evidence-based stop.
->   - Incident correlation (alert-storm grouping into one investigation) — only fingerprint dedup today.
+>   - (Incident correlation — DONE: core/correlation.py; storm alerts sharing service+namespace/cluster within a 15-min window group into the active investigation instead of starting competing ones; recorded in correlated_alerts, shown on the console.)
 >   - LSP/HLS via MCP bridge — code_analyst uses git+ast-grep+rg, no semantic LSP.
 >   - pr_create + CI-result reading + golden-set eval — blocked on GitHub App (the fix-confidence SCORER + gate ARE built, core/fix_scorer.py).
 >   - NY-data scrub for public OSS (agents.json/runbooks still NY-specific — fine internally).

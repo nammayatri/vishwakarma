@@ -117,6 +117,16 @@ CREATE TABLE IF NOT EXISTS alert_runbook_map (
     PRIMARY KEY (alert_pattern, runbook_id)
 );
 
+CREATE TABLE IF NOT EXISTS correlated_alerts (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    parent_id     TEXT NOT NULL,         -- the incident this alert was grouped into
+    alert_title   TEXT,
+    alert_labels  TEXT,                  -- JSON
+    created_at    REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_correlated_parent ON correlated_alerts(parent_id);
+
 CREATE TABLE IF NOT EXISTS cross_cloud_findings (
     incident_id   TEXT NOT NULL,
     cloud         TEXT NOT NULL,         -- 'aws' | 'gcp'

@@ -138,6 +138,8 @@ def create_app(config=None) -> FastAPI:
         init_eventbus(config.redis_url)
         from vishwakarma.core.keypool import init_keypool
         init_keypool(config.llm.api_keys or ([config.llm.api_key] if config.llm.api_key else []))
+        from vishwakarma.core.correlation import init_correlation
+        init_correlation(config.redis_url)
         # Seed DB runbooks from the repo's agents.json + .md files (idempotent;
         # keeps file-based runbooks working as defaults on fresh installs).
         try:
@@ -321,7 +323,24 @@ def create_app(config=None) -> FastAPI:
                 triggered.append({"title": issue.title, "status": "deduplicated"})
                 continue
 
+            # Incident correlation: a DIFFERENT alert sharing a strong entity
+            # with an active investigation (within the window) is part of the
+            # same storm — group it instead of starting a competing one.
+            from vishwakarma.core import correlation as _corr
+            corr_key = _corr.correlation_key(issue.labels)
+            parent = _corr.find_correlated(corr_key)
+            if parent:
+                _corr.record_correlated_alert(parent, issue.title, issue.labels)
+                _corr.link(corr_key, parent)  # extend the window while the storm continues
+                _dedup.release(fingerprint)   # not investigating this one
+                log.info(f"Alert correlated into {parent} (key={corr_key}): {issue.title}")
+                triggered.append({"title": issue.title, "status": "correlated",
+                                  "parent": parent})
+                continue
+
             incident_id = str(uuid.uuid4())
+            if corr_key:
+                _corr.link(corr_key, incident_id)   # claim the entity window
 
             if getattr(config, "role", "") == "orchestrator":
                 # Orchestrator topology: route to the cloud whose executors can
@@ -1000,6 +1019,13 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
     if fingerprint:
         _dedup.release(fingerprint)
         log.info(f"Investigation complete for {issue.title} — dedup lock released")
+    # Close the correlation window so a genuinely new problem on the same
+    # entity right after resolution starts a fresh investigation.
+    try:
+        from vishwakarma.core import correlation as _corr
+        _corr.unlink(_corr.correlation_key(issue.labels))
+    except Exception:
+        pass
 
 
 async def _synthesize_and_post_cross_cloud(config, issue, base_incident_id: str) -> None:

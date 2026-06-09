@@ -139,6 +139,12 @@ def create_console_router(config, state: dict) -> APIRouter:
         inv = get_investigation(incident_id)
         if not inv:
             raise HTTPException(404, "investigation not found")
+        # Attach any alerts grouped into this one by incident correlation.
+        try:
+            from vishwakarma.core.correlation import list_correlated
+            inv["correlated_alerts"] = list_correlated(incident_id)
+        except Exception:
+            inv["correlated_alerts"] = []
         return inv
 
     # ── Incident history ──────────────────────────────────────────────────────
