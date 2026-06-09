@@ -117,6 +117,16 @@ CREATE TABLE IF NOT EXISTS alert_runbook_map (
     PRIMARY KEY (alert_pattern, runbook_id)
 );
 
+CREATE TABLE IF NOT EXISTS audit_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          REAL NOT NULL,
+    actor       TEXT,                    -- role/user that did it
+    action      TEXT NOT NULL,           -- e.g. runbook.save, fix.approve
+    target      TEXT,                    -- the object id
+    detail      TEXT                     -- JSON
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts);
 CREATE INDEX IF NOT EXISTS idx_embeddings_kind ON embeddings_json(kind);
 CREATE INDEX IF NOT EXISTS idx_runbooks_status ON runbooks(status);
 CREATE INDEX IF NOT EXISTS idx_alert_map ON alert_runbook_map(alert_pattern);
@@ -226,8 +236,10 @@ class PGConnection:
 
 
 def _to_pg_schema(schema: str) -> str:
-    """Translate the shared schema to Postgres types (REAL → float8)."""
-    return schema.replace(" REAL", " DOUBLE PRECISION")
+    """Translate the shared (SQLite-dialect) schema to Postgres."""
+    return (schema
+            .replace(" REAL", " DOUBLE PRECISION")
+            .replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY"))
 
 
 def init_db(db_path: str | None = None, dsn: str | None = None) -> None:

@@ -38,6 +38,7 @@ class LLMConfig(BaseModel):
     fast_fallbacks: list[str] = []  # e.g. ["openai/kimi-latest", "openai/glm-flash-experimental"]
     model_fallbacks: list[str] = []  # e.g. ["openai/glm-latest"]
     api_key: str | None = None
+    api_keys: list[str] = []   # optional pool — round-robined, 429-aware
     api_base: str | None = None
     api_version: str | None = None
     max_tokens: int = 65536
@@ -67,6 +68,29 @@ class VishwakarmaLLM:
         self._total_prompt_tokens = 0
         self._total_completion_tokens = 0
 
+    def _pick_key(self) -> str | None:
+        """Next key from the pool if configured, else the single configured key."""
+        try:
+            from vishwakarma.core.keypool import get_pool
+            pool = get_pool()
+            if pool and pool.size:
+                return pool.get()
+        except Exception:
+            pass
+        return self.cfg.api_key
+
+    @staticmethod
+    def _penalize_key(key: str | None) -> None:
+        if not key:
+            return
+        try:
+            from vishwakarma.core.keypool import get_pool
+            pool = get_pool()
+            if pool:
+                pool.penalize(key)
+        except Exception:
+            pass
+
     def complete(
         self,
         messages: list[dict],
@@ -85,8 +109,9 @@ class VishwakarmaLLM:
             "timeout": self.cfg.timeout,
         }
 
-        if self.cfg.api_key:
-            kwargs["api_key"] = self.cfg.api_key
+        _key = self._pick_key()
+        if _key:
+            kwargs["api_key"] = _key
         if self.cfg.api_base:
             kwargs["api_base"] = self.cfg.api_base
         if self.cfg.api_version:
@@ -170,8 +195,9 @@ class VishwakarmaLLM:
                 "stream": True,
                 "num_retries": 0,
             }
-            if self.cfg.api_key:
-                kwargs["api_key"] = self.cfg.api_key
+            _key = self._pick_key()
+            if _key:
+                kwargs["api_key"] = _key
             if self.cfg.api_base:
                 kwargs["api_base"] = self.cfg.api_base
             if self.cfg.api_version:
@@ -355,8 +381,9 @@ class VishwakarmaLLM:
                     "timeout": remaining,
                     "num_retries": 0,  # no per-model retry — fall through to next model fast
                 }
-                if self.cfg.api_key:
-                    kwargs["api_key"] = self.cfg.api_key
+                _key = self._pick_key()
+                if _key:
+                    kwargs["api_key"] = _key
                 if self.cfg.api_base:
                     kwargs["api_base"] = self.cfg.api_base
                 if tools:
@@ -381,6 +408,7 @@ class VishwakarmaLLM:
                 error_type = type(e).__name__
                 # Rate limit: extract reset time and wait briefly before next attempt
                 if "RateLimit" in error_type or "429" in str(e):
+                    self._penalize_key(_key)   # bench this key in the pool
                     import re
                     reset_match = re.search(r'resets at: (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})', str(e))
                     if reset_match:

@@ -539,6 +539,7 @@ class InvestigationEngine:
         be resumed from the last step by another worker (durable jobs).
         """
         guard = LoopGuard()
+        self.executor.incident_id = incident_id or ""
 
         def _checkpoint(step_no: int) -> None:
             if not incident_id:

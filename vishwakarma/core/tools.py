@@ -185,6 +185,7 @@ class ToolExecutor:
 
     def __init__(self, toolsets: list[Toolset]):
         self.toolsets = toolsets
+        self.incident_id: str = ""   # set per-investigation by the engine
         self._index: dict[str, ToolDef] = {}
         self._rebuild_index()
 
@@ -217,6 +218,12 @@ class ToolExecutor:
                 status=ToolStatus.ERROR,
                 error=f"Tool '{tool_name}' not found. Available: {list(self._index.keys())}",
             )
+
+        # Expose the current investigation to incident-aware tools. execute()
+        # and the handler run in the same worker thread, so this ContextVar is
+        # visible to the toolset and isolated per concurrent investigation.
+        from vishwakarma.core.toolcontext import current_incident
+        current_incident.set(self.incident_id)
 
         # Python handler
         if tool.handler:

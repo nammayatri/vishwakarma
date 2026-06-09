@@ -781,6 +781,15 @@ def start_bot(config: "VishwakarmaConfig") -> None:
             except Exception as e:
                 log.debug(f"[FEEDBACK] Evidence update failed (non-fatal): {e}")
 
+            # Credit the runbooks used (hit + self-populate alert→runbook map)
+            try:
+                from vishwakarma.storage.runbooks import mark_runbook_hit
+                meta = json.loads(incident.get("meta", "{}")) if incident.get("meta") else {}
+                for rid in meta.get("matched_runbook_ids", []):
+                    mark_runbook_hit(rid, alert_name=alert_name)
+            except Exception as e:
+                log.debug(f"[FEEDBACK] Runbook hit update failed (non-fatal): {e}")
+
             # Extract and save replayable pattern
             pattern_saved = False
             try:
@@ -903,6 +912,16 @@ def start_bot(config: "VishwakarmaConfig") -> None:
                 log.info(f"[FEEDBACK] Invalidated patterns linked to incident {incident_id}")
             except Exception as e:
                 log.warning(f"[FEEDBACK] Pattern invalidation failed (non-fatal): {e}")
+
+            # Penalize the runbooks that led to the wrong RCA (auto-demote on
+            # repeated misses).
+            try:
+                from vishwakarma.storage.runbooks import mark_runbook_miss
+                inc_meta = _json.loads(incident.get("meta", "{}")) if incident and incident.get("meta") else {}
+                for rid in inc_meta.get("matched_runbook_ids", []):
+                    mark_runbook_miss(rid)
+            except Exception as e:
+                log.debug(f"[FEEDBACK] Runbook miss update failed (non-fatal): {e}")
 
             # Update the original feedback message
             if channel_id and msg_ts:

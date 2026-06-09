@@ -190,6 +190,8 @@ def create_console_router(config, state: dict) -> APIRouter:
     async def feedback(incident_id: str, body: FeedbackBody, role: str = admin):
         from vishwakarma.storage import evidence
         from vishwakarma.storage import runbooks as rb
+        from vishwakarma.storage.audit import audit
+        audit(role, "feedback", incident_id, {"correct": body.correct})
         results = {"evidence": False, "runbooks": []}
         try:
             if body.correct:
@@ -229,25 +231,31 @@ def create_console_router(config, state: dict) -> APIRouter:
     @router.put("/runbooks/{runbook_id}")
     async def runbook_save(runbook_id: str, body: RunbookBody, role: str = admin):
         from vishwakarma.storage import runbooks as rb
+        from vishwakarma.storage.audit import audit
         rb.save_runbook(runbook_id, body.title, body.content_md,
                         cloud_type=body.cloud_type, keywords=body.keywords,
                         services=body.services, author=body.author or role)
+        audit(role, "runbook.save", runbook_id, {"title": body.title})
         return rb.get_runbook(runbook_id)
 
     @router.delete("/runbooks/{runbook_id}")
     async def runbook_delete(runbook_id: str, role: str = admin):
         from vishwakarma.storage import runbooks as rb
+        from vishwakarma.storage.audit import audit
         if not rb.get_runbook(runbook_id):
             raise HTTPException(404, "runbook not found")
         rb.delete_runbook(runbook_id)
+        audit(role, "runbook.delete", runbook_id)
         return {"deleted": runbook_id}
 
     @router.post("/runbooks/{runbook_id}/mappings")
     async def runbook_map(runbook_id: str, body: MappingBody, role: str = admin):
         from vishwakarma.storage import runbooks as rb
+        from vishwakarma.storage.audit import audit
         if not rb.get_runbook(runbook_id):
             raise HTTPException(404, "runbook not found")
         rb.map_alert(body.alert_name, runbook_id, priority=body.priority)
+        audit(role, "runbook.map", runbook_id, {"alert": body.alert_name})
         return {"mapped": rb.normalize_alert_key(body.alert_name),
                 "runbook_id": runbook_id}
 
@@ -280,6 +288,13 @@ def create_console_router(config, state: dict) -> APIRouter:
                     pass
             out.append(d)
         return out
+
+    # ── Audit log ─────────────────────────────────────────────────────────────
+
+    @router.get("/audit")
+    async def audit_list(limit: int = 100, role: str = admin):
+        from vishwakarma.storage.audit import list_audit
+        return list_audit(limit=limit)
 
     # ── Fleet ─────────────────────────────────────────────────────────────────
 

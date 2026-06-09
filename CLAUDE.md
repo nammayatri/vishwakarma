@@ -38,6 +38,16 @@ vk config --config config.yaml
 
 Config is loaded from: `VK_CONFIG` env var → `~/.vishwakarma/config.yaml` → `./config.yaml`. All YAML fields can be overridden with `VK_` prefixed env vars.
 
+> **Argus evolution (branch `argus`):** the multi-cloud topology, durable
+> investigations, code-analyst/OpenCode toolsets, DB-backed runbooks, the two
+> Slack bots (Sage/Argus), and the web console live on the `argus` branch.
+> The authoritative status + design is in **PLAN.md** (repo root) — read its
+> WORKING STATUS header first. The legacy "fast RCA" preliminary classifier
+> was REMOVED (it was mostly incorrect); every alert now runs the full
+> investigation, and only human-confirmed pattern replay short-cuts it.
+> Extra run modes: `vk serve-orchestrator`, `vk serve-executor --cloud aws|gcp`
+> (plain `vk serve` remains the all-in-one default).
+
 ## Architecture
 
 ### Alert → RCA Flow

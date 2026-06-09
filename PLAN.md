@@ -4,8 +4,17 @@
 >
 > - **Branch:** `argus` (created from `ny-vishwakarma` @ 07f5fe9, v1.1.23 in prod)
 > - **Current milestone:** Milestone 1 = Phase 0 (Postgres+pgvector, Memorystore dedup, durable `investigations` table, SQLite history migration) + Phase 1 (Tier-1 code-analyst toolset)
-> - **Status:** PHASE 6a COMPLETE + fast-RCA REMOVED (user decision: it was mostly incorrect; -641 lines; auto-resolve gone too — every alert gets the full investigation; pattern replay of human-confirmed patterns kept). Roadmap code-complete except Phase-3 PR path.
-> - **Next step:** shadow deployment (build image, provision Cloud SQL + Memorystore, apply k8s/argus/ manifests, test channel) OR Phase-3 PR finish when GitHub App exists. NOTE: deployment uses plain YAML in k8s/argus/ — NO Helm (user decision). Pending externals: **Argus Slack app registration**; GitHub App; Acme embeddings model; ~/.config/opencode old key; repo_sync vs real monorepo; Cloud SQL + Memorystore (GCP)
+> - **Status:** GAP-CLOSURE COMPLETE (gaps 1-9 from the planning-history audit) + Phase 6a + fast-RCA removed. 89 tests passing. Roadmap code-complete except items genuinely blocked on externals (see "Deferred / v2" below).
+> - **Next step:** shadow deployment (build image, provision Cloud SQL + Memorystore, apply k8s/argus/ manifests → test channel) OR wire pr_create when the GitHub App exists. Plain YAML in k8s/argus/ — NO Helm. Pending externals: **Argus Slack app registration**; GitHub App; Acme embeddings model; ~/.config/opencode old key; Cloud SQL + Memorystore (GCP).
+>
+> **Deferred / v2 (NOT built — don't assume these exist):**
+>   - `both`-cloud SYNTHESIZER — cross-cloud jobs fan out and each side posts independently; no orchestrator-side merge of the two findings yet.
+>   - Code RAG (`code_semantic_search` + repo embedding index) — pointless until the gateway has an embeddings model.
+>   - Run-until-verified — engine still uses fixed step budgets, not evidence-based stop.
+>   - Incident correlation (alert-storm grouping into one investigation) — only fingerprint dedup today.
+>   - LSP/HLS via MCP bridge — code_analyst uses git+ast-grep+rg, no semantic LSP.
+>   - pr_create + CI-result reading + golden-set eval — blocked on GitHub App (the fix-confidence SCORER + gate ARE built, core/fix_scorer.py).
+>   - NY-data scrub for public OSS (agents.json/runbooks still NY-specific — fine internally).
 > - **Done so far:**
 >   - Phase 0 ✅ dual-backend storage (`storage/db.py` — SQLite default + Postgres via `VK_PG_DSN`/`storage.dsn`, PGConnection adapter translates `?`→`%s`, conditional pgvector)
 >   - Phase 0 ✅ durable investigations (`storage/investigations.py` — create/claim/checkpoint/resume/orphan-reap/attempt-budget; engine checkpoints each step via `stream_investigate(incident_id=…)`)
@@ -37,6 +46,16 @@
 >   - Phase 6a ✅ Dockerfile node build stage (web → /app/web/dist); SPA mount resolves repo/container/env layouts
 >   - Phase 6a ✅ k8s/argus/ plain-YAML manifests (orchestrator Recreate-strategy, executor-{aws,gcp} pools, configmap+secrets examples, shadow-mode README) — NO Helm per user
 >   - Phase 6a ✅ docs (docs/ARCHITECTURE.md — topology+flow+durability; docs/SECURITY.md — threat model; LICENSE Apache-2.0; README Argus section)
+>   - Gap-closure ✅ (9 gaps from planning-history audit, tests/test_gap_closure.py 12 passing):
+>     1. Argus RCAs post to the report channel/thread (not the env alert channel)
+>     2. multimodal — Slack screenshots fetched (bot-token auth) → data URLs → images= into the engine
+>     3. Slack ✅/❌ now credits runbooks (hit/miss + map self-populate) via meta.matched_runbook_ids
+>     4. code_session transcript checkpointed to investigations.code_session (ContextVar via core/toolcontext.py)
+>     5. LLM key pool (core/keypool.py) — round-robin + 429 bench; llm.py uses it; config llm.api_keys / VK_API_KEYS
+>     6. fix-confidence scorer + gate (core/fix_scorer.py) — never PRs unvalidated/broad-diff/test-failed
+>     7. per-cloud knowledge (knowledge-<cloud>.md with fallback)
+>     8. Prometheus self-metrics (core/metrics.py) at GET /metrics
+>     9. audit_log table + storage/audit.py; console mutations audited; GET /api/console/audit (admin)
 >   - Phase 5b ✅ console frontend (`web/` — Vite+React+TS+Tailwind dark theme, base /console/; pages: Dashboard, Investigations + live SSE detail w/ checkpointed transcript, Incidents search/detail w/ ✅/❌ feedback, Runbook studio (editor/dry-run/mappings), Fixes queue, Fleet (queues/executors/orphans), Settings (token). Typed api client w/ X-VK-Token. Served by server.py `_mount_console_spa` at /console with SPA fallback + traversal-safe assets; builds clean: 74KB gzip)
 > - **Key context to re-load after compaction:** read this whole file; prod deployment is untouched single-pod v1.1.23 on EKS `monitoring` ns; all architectural decisions are final (see "Confirmed decisions" + "Resolved in discussion"); never touch prod infra without asking the user.
 

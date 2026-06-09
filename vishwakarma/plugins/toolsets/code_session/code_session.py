@@ -171,9 +171,38 @@ class CodeSessionToolset(Toolset):
 
     def _end(self, params: dict) -> ToolOutput:
         sid = params.get("session_id", "")
-        result = self._get_agent().end(sid)
+        agent = self._get_agent()
+        transcript = []
+        try:
+            transcript = agent.transcript(sid)
+        except Exception:
+            pass
+        result = agent.end(sid)
+        # Checkpoint the code session into the durable investigation so a
+        # resumed run keeps the code-work context.
+        self._checkpoint_session(sid, transcript, result)
         out = f"Session closed ({result['mode']})."
         if result.get("diff"):
             out += f"\nBranch: {result.get('branch')}\n\n--- DIFF ---\n{result['diff'][:20000]}"
         return ToolOutput(tool_name="code_session_end", status=ToolStatus.SUCCESS,
                           output=out, invocation=f"code_session_end({sid})")
+
+    def _checkpoint_session(self, sid: str, transcript: list, result: dict) -> None:
+        try:
+            from vishwakarma.core.toolcontext import current_incident
+            from vishwakarma.storage.investigations import (
+                get_investigation, checkpoint_investigation)
+            incident_id = current_incident.get()
+            if not incident_id or not get_investigation(incident_id):
+                return
+            existing = get_investigation(incident_id).get("code_session") or {}
+            sessions = existing.get("sessions", []) if isinstance(existing, dict) else []
+            sessions.append({
+                "session_id": sid, "mode": result.get("mode"),
+                "branch": result.get("branch"),
+                "diff_len": len(result.get("diff", "")),
+                "transcript": transcript[-40:],  # cap
+            })
+            checkpoint_investigation(incident_id, code_session={"sessions": sessions})
+        except Exception as e:
+            log.debug(f"code_session checkpoint skipped: {e}")

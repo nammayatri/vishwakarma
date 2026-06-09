@@ -210,6 +210,7 @@ class VishwakarmaConfig:
             fast_fallbacks=llm_cfg.get("fast_fallbacks", []),
             model_fallbacks=llm_cfg.get("model_fallbacks", []),
             api_key=_env("VK_API_KEY", llm_cfg.get("api_key")),
+            api_keys=_split_keys(_env("VK_API_KEYS", "")) or llm_cfg.get("api_keys", []),
             api_base=_env("VK_API_BASE", llm_cfg.get("api_base")),
             api_version=_env("VK_API_VERSION", llm_cfg.get("api_version")),
             max_tokens=int(_env("VK_MAX_TOKENS", str(llm_cfg.get("max_tokens", 65536)))),
@@ -307,7 +308,11 @@ class VishwakarmaConfig:
         # Site knowledge base — loaded from a .md file on the PVC (not baked into image)
         # Contains infra-specific: instance names, alert→instance mappings, known working commands
         self.knowledge_path: str = _env("VK_KNOWLEDGE_PATH", raw.get("knowledge_path", "/data/knowledge.md"))
-        self.knowledge: str = _load_knowledge(self.knowledge_path)
+        # Per-cloud knowledge: an executor for a cloud prefers
+        # knowledge-<cloud>.md (e.g. knowledge-aws.md) next to the base path,
+        # falling back to the generic file. Lets one runbook serve both clouds
+        # with cloud-specific instance IDs/endpoints resolved locally.
+        self.knowledge: str = _load_knowledge(self.knowledge_path, cloud=self.executor_cloud)
 
         # Alert deduplication window (seconds)
         self.dedup_window: int = int(
@@ -443,17 +448,39 @@ def _env(key: str, fallback: Any = None) -> Any:
     return val if val is not None else fallback
 
 
-def _load_knowledge(path: str) -> str:
-    """Load site-specific knowledge base from a markdown file (e.g. on PVC)."""
-    try:
-        with open(path) as f:
-            return f.read()
-    except FileNotFoundError:
-        return ""
-    except Exception as e:
-        import logging
-        logging.getLogger(__name__).warning(f"Could not load knowledge base from {path}: {e}")
-        return ""
+def _split_keys(val: str) -> list[str]:
+    """Parse a comma/whitespace-separated list of API keys."""
+    if not val:
+        return []
+    return [k.strip() for k in val.replace("\n", ",").split(",") if k.strip()]
+
+
+def _load_knowledge(path: str, cloud: str = "") -> str:
+    """
+    Load the site knowledge base. When `cloud` is set, prefer a cloud-specific
+    file (knowledge-<cloud>.md) beside the base path, falling back to the
+    generic file.
+    """
+    candidates = []
+    if cloud:
+        from pathlib import Path
+        p = Path(path)
+        candidates.append(str(p.with_name(f"{p.stem}-{cloud}{p.suffix}")))
+    candidates.append(path)
+    for cand in candidates:
+        try:
+            with open(cand) as f:
+                content = f.read()
+            if cand != path:
+                import logging
+                logging.getLogger(__name__).info(f"Loaded cloud-specific knowledge: {cand}")
+            return content
+        except FileNotFoundError:
+            continue
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(f"Could not load knowledge base from {cand}: {e}")
+    return ""
 
 
 def _load_runbooks(extra: list[str]) -> list[str]:

@@ -136,6 +136,8 @@ def create_app(config=None) -> FastAPI:
                         config.embeddings_model, config.embeddings_dim)
         from vishwakarma.core.eventbus import init_eventbus
         init_eventbus(config.redis_url)
+        from vishwakarma.core.keypool import init_keypool
+        init_keypool(config.llm.api_keys or ([config.llm.api_key] if config.llm.api_key else []))
         # Seed DB runbooks from the repo's agents.json + .md files (idempotent;
         # keeps file-based runbooks working as defaults on fresh installs).
         try:
@@ -162,6 +164,19 @@ def create_app(config=None) -> FastAPI:
     @app.get("/healthz", include_in_schema=False)
     async def healthz():
         return {"status": "ok"}
+
+    @app.get("/metrics", include_in_schema=False)
+    async def metrics():
+        from vishwakarma.core import metrics as m
+        # Refresh queue gauges on scrape (cheap) when Redis is wired.
+        try:
+            from vishwakarma.core import jobstream
+            for cloud in ("aws", "gcp"):
+                m.set_gauge("vk_queue_depth", jobstream.depth(cloud), {"cloud": cloud})
+                m.set_gauge("vk_queue_pending", jobstream.pending_count(cloud), {"cloud": cloud})
+        except Exception:
+            pass
+        return Response(content=m.render(), media_type="text/plain; version=0.0.4")
 
     # ── /readyz ───────────────────────────────────────────────────────────────
 
@@ -433,14 +448,22 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
         ack_ts = None
         slack_channel_id = None
         slack_client = None
+        # When the issue was reported in Slack (Argus @mre/@Argus), answer IN
+        # that channel/thread instead of the default alert channel — the
+        # reporter expects the RCA where they raised it.
+        report_channel = issue.labels.get("slack_channel") or ""
+        report_thread = issue.labels.get("slack_thread_ts") or ""
         if config.is_slack_configured():
             try:
                 from vishwakarma.plugins.relays.slack.plugin import SlackDestination
                 dest = SlackDestination({"token": config.slack_bot_token})
                 slack_client = dest._get_client()
-                slack_channel_id = dest._resolve_channel_id(
-                    os.environ.get("SLACK_CHANNEL", "#sre-alerts")
-                )
+                if report_channel:
+                    slack_channel_id = report_channel        # already a channel id from the event
+                else:
+                    slack_channel_id = dest._resolve_channel_id(
+                        os.environ.get("SLACK_CHANNEL", "#sre-alerts")
+                    )
                 severity_color = "#FF0000" if (issue.severity or "").lower() in ("critical", "high") else "#FFA500"
                 ack_text = f":rotating_light: Investigating: {issue.title}"
                 ack_blocks = [
@@ -454,11 +477,12 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
                         "elements": [{"type": "mrkdwn", "text": ":hourglass_flowing_sand: _Investigation in progress — full RCA with PDF will follow in this thread..._"}],
                     },
                 ]
-                resp = slack_client.chat_postMessage(
-                    channel=slack_channel_id,
-                    text=ack_text,
-                    attachments=[{"color": severity_color, "blocks": ack_blocks}],
-                )
+                # Thread the ack under the original report when known.
+                ack_kwargs = {"channel": slack_channel_id, "text": ack_text,
+                              "attachments": [{"color": severity_color, "blocks": ack_blocks}]}
+                if report_thread:
+                    ack_kwargs["thread_ts"] = report_thread
+                resp = slack_client.chat_postMessage(**ack_kwargs)
                 ack_ts = resp["ts"]
             except Exception as e:
                 log.warning(f"Slack ack failed (non-fatal): {e}")
@@ -472,6 +496,17 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
         prefetch_ctx, prior_ctx, entities_ctx, matched_runbooks = await _asyncio.gather(
             prefetch_future, prior_future, entities_future, runbooks_future
         )
+
+        # Capture the matched runbook ids so the ✅/❌ feedback loop can credit
+        # them (Slack buttons + console feedback bump hit/miss + self-populate
+        # the alert→runbook map).
+        matched_runbook_ids: list[str] = []
+        try:
+            from vishwakarma.core.runbook_match import match_runbooks
+            cloud = issue.labels.get("cloud", "")
+            matched_runbook_ids = [m["id"] for m in match_runbooks(alert_name, cloud=cloud)]
+        except Exception:
+            pass
 
         # Pre-inject learnings relevant to this alert
         learnings_mgr = state.get("learnings")
@@ -703,11 +738,17 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
             except Exception as inv_err:
                 log.warning(f"Durable-job setup failed (continuing without): {inv_err}")
 
-            from vishwakarma.core import eventbus
+            from vishwakarma.core import eventbus, metrics
+            metrics.inc("vk_investigations_started_total",
+                        labels={"cloud": issue.labels.get("cloud", "") or "none"})
             eventbus.publish(incident_id, {
                 "type": "investigation_started", "title": issue.title,
                 "severity": issue.severity, "source": issue.source,
             })
+
+            # Multimodal: fetch any reported screenshots (Slack url_private
+            # needs bot-token auth) → data URLs for vision-capable models.
+            investigation_images = _fetch_issue_images(issue, config)
 
             for event in engine.stream_investigate(
                 question=question,
@@ -715,6 +756,7 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
                 extra_system_prompt=extra_system_prompt,
                 pre_investigation_findings=sub_agent_findings_text,
                 incident_id=incident_id,
+                images=investigation_images or None,
             ):
                 etype = event.get("type", "")
                 # Fan out to the console UI (SSE) — fire-and-forget.
@@ -790,6 +832,8 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
             try:
                 from vishwakarma.storage.investigations import finish_investigation
                 finish_investigation(incident_id, "done")
+                from vishwakarma.core import metrics
+                metrics.inc("vk_investigations_completed_total")
             except Exception:
                 pass
 
@@ -809,6 +853,8 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
         try:
             from vishwakarma.storage.investigations import finish_investigation
             finish_investigation(incident_id, "failed")
+            from vishwakarma.core import metrics
+            metrics.inc("vk_investigations_failed_total")
         except Exception:
             pass
         if fingerprint:
@@ -817,6 +863,7 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
 
     analysis = result.answer or "(no analysis)"
     meta = result.meta.model_dump() if result.meta else {}
+    meta["matched_runbook_ids"] = matched_runbook_ids  # for ✅/❌ runbook credit
 
     # Generate PDF
     pdf_path = None
@@ -863,6 +910,7 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
                 pdf_path=pdf_path,
                 incident_id=incident_id,
                 thread_ts=ack_ts,
+                channel=slack_channel_id or None,   # report channel for Argus issues
             )
             slack_ts = resp.get("ts")
         except Exception as e:
@@ -903,6 +951,42 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
     if fingerprint:
         _dedup.release(fingerprint)
         log.info(f"Investigation complete for {issue.title} — dedup lock released")
+
+
+def _fetch_issue_images(issue, config) -> list[dict]:
+    """
+    Download images attached to a Slack-reported issue and return them as
+    OpenAI-vision image parts ([{url: data-uri, detail}]).
+
+    Slack file `url_private` requires the bot token. Other (already-public)
+    URLs are passed through directly. Best-effort: failures are skipped.
+    """
+    import base64
+    raw = getattr(issue, "raw", None) or {}
+    urls = raw.get("image_urls") or []
+    if not urls:
+        return []
+    images: list[dict] = []
+    token = config.slack_bot_token or ""
+    import urllib.request
+    for url in urls[:4]:  # cap — vision context is expensive
+        try:
+            headers = {}
+            if "slack.com" in url and token:
+                headers["Authorization"] = f"Bearer {token}"
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                ctype = resp.headers.get("Content-Type", "image/jpeg").split(";")[0]
+                if not ctype.startswith("image/"):
+                    continue
+                data = resp.read()
+            b64 = base64.b64encode(data).decode()
+            images.append({"url": f"data:{ctype};base64,{b64}", "detail": "auto"})
+        except Exception as e:
+            log.warning(f"Could not fetch issue image: {e}")
+    if images:
+        log.info(f"Fetched {len(images)} image(s) for investigation")
+    return images
 
 
 def _prefetch_alert_context(issue) -> str:
