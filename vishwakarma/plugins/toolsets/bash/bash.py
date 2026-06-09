@@ -292,6 +292,41 @@ class BashToolset(Toolset):
         re.IGNORECASE,
     )
 
+    # Infra-mutation guard — the agent is READ-ONLY. Even though kubectl/aws/
+    # gcloud/helm/etc. are allowed (for get/describe/logs), a destructive
+    # SUBCOMMAND must never run with prod credentials. Blocked regardless of
+    # config; cannot be overridden. This catches both honest mistakes and
+    # prompt-injection attempts to mutate infrastructure.
+    _INFRA_MUTATION_RE = re.compile(
+        r"\b("
+        # kubectl write verbs
+        r"kubectl\s+(?:[\w\-=./]+\s+)*?(delete|apply|create|edit|patch|replace|scale|"
+        r"rollout\s+(?:restart|undo|pause)|drain|cordon|uncordon|taint|evict|set|"
+        r"annotate|label|exec|cp|attach|port-forward)\b"
+        # aws mutating verbs (delete-/create-/put-/update-/modify-/terminate-/stop-/start-/
+        # reboot-/run-/remove-/deregister-/detach-/attach-/disable-/enable-/revoke-/authorize-/
+        # associate-/disassociate-/reset-/restore-/cancel-/release-)
+        r"|aws\s+s3\s+(?:rm|cp|mv|sync|rb|mb)\b"
+        r"|aws\s+[\w\-]+\s+(?:delete|create|put|update|modify|terminate|stop|start|reboot|"
+        r"run|remove|deregister|register|detach|attach|disable|enable|revoke|authorize|"
+        r"associate|disassociate|reset|restore|cancel|release|set|add|deploy|promote|"
+        r"reboot|purge|empty|abort)[\w\-]*"
+        # gcloud mutating verbs
+        r"|gcloud\s+(?:[\w\-]+\s+)*?(delete|create|update|patch|remove|set|add|disable|"
+        r"enable|reset|restart|stop|start|scale|deploy|promote|rollback|resize|drain|"
+        r"detach|attach|clear|purge|undelete|import|restore)\b"
+        # helm / gsutil / argocd / flux / terraform / pulumi / docker push etc.
+        r"|helm\s+(install|upgrade|uninstall|rollback|delete)"
+        r"|gsutil\s+(rm|cp|mv|rsync|setmeta|rewrite)"
+        r"|argocd\s+app\s+(create|delete|set|sync|rollback|patch)"
+        r"|flux\s+(create|delete|reconcile|suspend|resume)"
+        r"|terraform\s+(apply|destroy|import|taint|state\s+(rm|mv))"
+        r"|pulumi\s+(up|destroy|import)"
+        r"|docker\s+(push|rmi|rm|kill|stop)"
+        r")",
+        re.IGNORECASE,
+    )
+
     def _is_allowed(self, command: str) -> tuple[bool, str]:
         """
         Apply local bash rules (safe_mode, allow, block).
@@ -308,6 +343,14 @@ class BashToolset(Toolset):
         # Block destructive SQL/DB commands embedded in bash (psql -c "DROP TABLE", redis-cli FLUSHALL, etc.)
         if self._DESTRUCTIVE_SQL_RE.search(cmd):
             return False, "Blocked: destructive database operation detected (DROP/DELETE/TRUNCATE/FLUSH)"
+
+        # Block infra-mutating CLI subcommands (kubectl/aws/gcloud/helm/...) — the
+        # agent is read-only. Non-overridable.
+        m = self._INFRA_MUTATION_RE.search(cmd)
+        if m:
+            return False, (f"Blocked: infrastructure-mutating command — the agent is "
+                           f"READ-ONLY (matched '{m.group(0)[:60]}'). Use get/describe/"
+                           f"logs/list only.")
 
         # Config block list — split on ALL chaining operators: |, ;, &&, ||
         parts = [p.strip() for p in re.split(r'[|;]|&&|\|\|', cmd)]
@@ -326,6 +369,8 @@ class BashToolset(Toolset):
                     for pattern in HARDCODED_BLOCK:
                         if pattern in sub:
                             return False, f"Blocked by hardcoded safety rule (in subshell): {pattern}"
+                    if self._INFRA_MUTATION_RE.search(sub):
+                        return False, "Blocked: infrastructure-mutating command in subshell (agent is read-only)"
                     for blocked in self.block:
                         sub_parts = [p.strip() for p in re.split(r'[|;]|&&|\|\|', sub)]
                         for part in sub_parts:
