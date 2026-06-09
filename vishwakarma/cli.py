@@ -528,6 +528,59 @@ def migrate_db(
     console.print("[green]Migration complete (idempotent — safe to re-run).[/green]")
 
 
+# ── vk eval ───────────────────────────────────────────────────────────────────
+
+@app.command("eval")
+def eval_cmd(
+    golden: str = typer.Option(..., "--golden", "-g", help="Golden-set JSON path"),
+    config: Optional[str] = typer.Option(None, "--config", "-c"),
+    out: Optional[str] = typer.Option(None, "--out", help="Write the JSON report here"),
+):
+    """Evaluate RCA precision + confidence calibration against a golden set.
+
+    Golden JSON: [{title, labels, known_root_cause, must_include?, known_fix?}]
+    """
+    import json as _json
+    from vishwakarma.core.eval_harness import load_golden, run_eval
+    cfg = _load_config(config)
+    cases = load_golden(golden)
+    console.print(f"Evaluating {len(cases)} golden cases...")
+
+    tm = cfg.make_toolset_manager()
+    tm.check_all()
+
+    def investigate(case: dict) -> str:
+        from vishwakarma.core.issue import Issue
+        import uuid
+        issue = Issue(id=str(uuid.uuid4()), title=case["title"],
+                      source="eval", labels=case.get("labels", {}))
+        llm = cfg.make_llm()
+        engine = cfg.make_engine(llm=llm, toolset_manager=tm)
+        result = engine.investigate(question=issue.question())
+        return result.answer or ""
+
+    report = run_eval(cases, investigate)
+    summary = report.summary()
+
+    table = Table(title="Eval Report")
+    table.add_column("Metric"); table.add_column("Value", justify="right")
+    table.add_row("cases", str(summary["total"]))
+    table.add_row("precision", str(summary["precision"]))
+    table.add_row("calibration (HIGH correct)", str(summary["calibration_high"]))
+    table.add_row("calibration (MEDIUM correct)", str(summary["calibration_medium"]))
+    console.print(table)
+    for c in report.cases:
+        mark = "[green]✓[/green]" if c.correct else "[red]✗[/red]"
+        console.print(f"  {mark} [{c.confidence or '?'}] {c.title}"
+                      + (f" — missing: {c.missing_terms}" if c.missing_terms else ""))
+
+    if out:
+        Path(out).write_text(_json.dumps({
+            "summary": summary,
+            "cases": [vars(c) for c in report.cases]}, indent=2))
+        console.print(f"[green]Report written to {out}[/green]")
+
+
 # ── vk serve ──────────────────────────────────────────────────────────────────
 
 @app.command()

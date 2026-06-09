@@ -65,6 +65,41 @@ class InvestigationEngine:
         self.cluster_name = cluster_name
         self.all_toolsets = all_toolsets  # includes disabled ones — shown to LLM
         self.knowledge = knowledge        # site-specific knowledge base (from /data/knowledge.md)
+        # Run-until-verified: instead of one checkpoint at step 20, inject a
+        # verification prompt periodically once enough recon is done. The agent
+        # ends when the root cause is VERIFIED (explains all symptoms), not at a
+        # fixed step. max_steps is the hard backstop.
+        self.run_until_verified: bool = True
+        self.verify_after: int = 12       # first verification check
+        self.verify_every: int = 8        # then every N steps
+
+    def _should_verify(self, step: int, last_verify: int) -> bool:
+        """True when a verification checkpoint should be injected at this step."""
+        if not self.run_until_verified:
+            return step == CHECKPOINT_STEP   # legacy single checkpoint
+        if step < self.verify_after:
+            return False
+        return (step - self.verify_after) % self.verify_every == 0 and step != last_verify
+
+    @staticmethod
+    def _verify_prompt(step: int) -> dict:
+        return {
+            "role": "user",
+            "content": (
+                f"**Verification checkpoint (step {step}).** Before concluding, "
+                "verify — don't just correlate:\n"
+                "1. State your current root-cause hypothesis in one sentence.\n"
+                "2. Does it explain ALL observed symptoms? List any symptom it does "
+                "NOT explain.\n"
+                "3. Have you CONFIRMED it (e.g. the offending query/commit/config "
+                "value), or only observed a correlation?\n\n"
+                "If the cause is verified and explains everything → write the final "
+                "RCA now (Root Cause / Confidence / Evidence Chain / Immediate Fix / "
+                "Prevention). If not → state the single most important thing left to "
+                "confirm and run exactly that check next. Don't re-run tools you've "
+                "already run."
+            ),
+        }
 
     def _compress_tool_outputs(
         self, executed: dict[str, tuple[ToolOutput, str]]
@@ -224,7 +259,7 @@ class InvestigationEngine:
         all_tool_outputs: list[ToolOutput] = []
         pending_approvals: list[PendingApproval] = []
         tool_call_counter = 0
-        checkpoint_injected = False
+        checkpoint_injected = -1   # last step a verify prompt was injected
 
         # Decisions index for approval workflow
         decisions = {d.tool_call_id: d for d in (approval_decisions or [])}
@@ -278,22 +313,12 @@ class InvestigationEngine:
             log.debug(f"Investigation step {step + 1}/{self.max_steps}")
             _emit({"type": "step_start", "step": step + 1, "max_steps": self.max_steps})
 
-            # Checkpoint: at step 20, force the LLM to decide RCA-or-continue
-            if step == CHECKPOINT_STEP and not checkpoint_injected:
-                checkpoint_injected = True
+            # Verification checkpoint(s): push the agent to verify the cause
+            # explains all symptoms before concluding (run-until-verified).
+            if self._should_verify(step, checkpoint_injected):
+                checkpoint_injected = step
                 _emit({"type": "checkpoint", "step": step + 1})
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        f"**Investigation Checkpoint (step {step}):** "
-                        "You have gathered significant data. Pause and evaluate:\n"
-                        "1. What is your current best hypothesis for the root cause?\n"
-                        "2. Do you have enough evidence to write the final RCA now?\n"
-                        "   - If YES → write the complete RCA immediately (Root Cause / Confidence / Evidence Chain / Immediate Fix / Prevention).\n"
-                        "   - If NO → state in one sentence exactly what is still missing, then continue investigating.\n\n"
-                        "Be decisive. Do not re-run tools you have already run."
-                    ),
-                })
+                messages.append(self._verify_prompt(step))
 
             # Compact if needed (pass llm for LLM-based compaction)
             messages, did_compact = compact_messages(messages, llm=self.llm)
@@ -592,7 +617,7 @@ class InvestigationEngine:
             tools = self.executor.openai_tools()
         _MAX_LLM_RETRIES = 3
 
-        checkpoint_injected_stream = False
+        checkpoint_injected_stream = -1   # last step a verify prompt was injected
 
         # Build approval prefixes once (used across all steps)
         approved_stream_prefixes: set[str] = set()
@@ -650,20 +675,9 @@ class InvestigationEngine:
         try:
             for step in range(self.max_steps):
                 # Checkpoint: at step 20, force the LLM to decide RCA-or-continue
-                if step == CHECKPOINT_STEP and not checkpoint_injected_stream:
-                    checkpoint_injected_stream = True
-                    messages.append({
-                        "role": "user",
-                        "content": (
-                            f"**Investigation Checkpoint (step {step}):** "
-                            "You have gathered significant data. Pause and evaluate:\n"
-                            "1. What is your current best hypothesis for the root cause?\n"
-                            "2. Do you have enough evidence to write the final RCA now?\n"
-                            "   - If YES → write the complete RCA immediately (Root Cause / Confidence / Evidence Chain / Immediate Fix / Prevention).\n"
-                            "   - If NO → state in one sentence exactly what is still missing, then continue investigating.\n\n"
-                            "Be decisive. Do not re-run tools you have already run."
-                        ),
-                    })
+                if self._should_verify(step, checkpoint_injected_stream):
+                    checkpoint_injected_stream = step
+                    messages.append(self._verify_prompt(step))
 
                 messages, did_compact = compact_messages(messages, llm=self.llm)
                 if did_compact:

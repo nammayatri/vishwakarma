@@ -220,6 +220,9 @@ class VishwakarmaConfig:
 
         # Cluster context
         self.cluster_name: str = _env("VK_CLUSTER", raw.get("cluster_name", ""))
+        # Run-until-verified: periodic verification checkpoints instead of one
+        # at step 20; investigation ends when the cause is verified.
+        self.run_until_verified: bool = bool(raw.get("run_until_verified", True))
 
         # Server
         srv = raw.get("server", {})
@@ -370,7 +373,7 @@ class VishwakarmaConfig:
             toolset_manager = self.make_toolset_manager()
 
         executor = ToolExecutor(toolsets=toolset_manager.active_toolsets())
-        return InvestigationEngine(
+        engine = InvestigationEngine(
             llm=llm,
             executor=executor,
             max_steps=self.max_steps,
@@ -378,6 +381,8 @@ class VishwakarmaConfig:
             all_toolsets=toolset_manager.all_toolsets(),
             knowledge=self.knowledge,
         )
+        engine.run_until_verified = self.run_until_verified
+        return engine
 
     # ── Loader ─────────────────────────────────────────────────────────────────
 
