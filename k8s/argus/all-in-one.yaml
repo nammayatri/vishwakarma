@@ -1,0 +1,97 @@
+# Argus ALL-IN-ONE deployment (GCP-first start). One pod runs `vk serve`:
+# webhook + both Slack bots + in-process investigations + the web console at
+# /console. No Redis, no separate executors (those are the scaled topology in
+# orchestrator.yaml / executor-*.yaml — use those only when you split out).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: argus
+  namespace: argus
+  labels: { app: argus }
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate          # single pod owns the Slack Socket Mode connections
+  selector:
+    matchLabels: { app: argus }
+  template:
+    metadata:
+      labels: { app: argus }
+    spec:
+      serviceAccountName: argus      # Workload Identity → read-only GCP SA + view RBAC
+      containers:
+        - name: argus
+          # Built image. Push to a registry GKE can pull (GCP Artifact Registry
+          # or the AWS ECR if GKE has cross-cloud pull), then set it here.
+          image: CHANGE_ME-registry/vishwakarma:argus
+          command: ["vk", "serve", "--config", "/etc/argus/config.yaml"]
+          ports:
+            - { name: http, containerPort: 5050 }
+          envFrom:
+            - secretRef: { name: argus-secrets }
+          env:
+            - name: VK_CONFIG
+              value: /etc/argus/config.yaml
+            - name: VK_LEARNINGS_PATH
+              value: /data/learnings
+            - name: VK_KNOWLEDGE_PATH
+              value: /data/knowledge.md
+          volumeMounts:
+            - { name: config, mountPath: /etc/argus }
+            - { name: data, mountPath: /data }       # learnings, knowledge, repo cache
+          readinessProbe:
+            httpGet: { path: /healthz, port: 5050 }
+            initialDelaySeconds: 15
+          livenessProbe:
+            httpGet: { path: /healthz, port: 5050 }
+            initialDelaySeconds: 40
+            periodSeconds: 30
+          resources:
+            requests: { cpu: 500m, memory: 1Gi }      # +~300MB for the bge-small model
+            limits: { cpu: "2", memory: 4Gi }
+      volumes:
+        - name: config
+          configMap: { name: argus-config }
+        - name: data
+          persistentVolumeClaim: { claimName: argus-data }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: argus-data
+  namespace: argus
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    # /data holds: learnings + knowledge + the cloned repo cache (/data/repos)
+    # + OpenCode edit worktrees + the code-RAG index. The example-app monorepo
+    # (sparse-checkout of Backend) + worktrees needs real room.
+    requests: { storage: 50Gi }
+---
+# ClusterIP — in-cluster + used by `kubectl port-forward` for the console.
+apiVersion: v1
+kind: Service
+metadata:
+  name: argus
+  namespace: argus
+  labels: { app: argus }
+spec:
+  selector: { app: argus }
+  ports:
+    - { name: http, port: 80, targetPort: 5050 }
+---
+# UI ACCESS — internal LoadBalancer for a stable private URL on the VPN.
+# Gives a private IP reachable from your corp network / VPN. The console is at
+# http://<internal-ip>/console. Comment this out if you only use port-forward.
+apiVersion: v1
+kind: Service
+metadata:
+  name: argus-ui
+  namespace: argus
+  annotations:
+    networking.gke.io/load-balancer-type: "Internal"   # private IP, not public
+spec:
+  type: LoadBalancer
+  selector: { app: argus }
+  ports:
+    - { name: http, port: 80, targetPort: 5050 }

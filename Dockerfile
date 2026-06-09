@@ -33,6 +33,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     unzip \
     jq \
     git \
+    gnupg \
+    ripgrep \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
@@ -59,6 +61,34 @@ RUN ARCH=$([ "$TARGETPLATFORM" = "linux/arm64" ] && echo "aarch64" || echo "x86_
     && unzip -q /tmp/awscliv2.zip -d /tmp \
     && /tmp/aws/install \
     && rm -rf /tmp/aws /tmp/awscliv2.zip
+
+# gcloud (Google Cloud SDK) + GKE auth plugin — REQUIRED for the GCP runbooks
+# (gcloud alloydb/redis/compute). In a GKE pod, gcloud authenticates via
+# Workload Identity (bind the pod's k8s SA to a GCP SA with alloydb/redis/
+# compute viewer roles).
+RUN echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" \
+      > /etc/apt/sources.list.d/google-cloud-sdk.list \
+    && curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \
+      | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends google-cloud-cli google-cloud-cli-gke-gcloud-auth-plugin \
+    && rm -rf /var/lib/apt/lists/*
+
+# ast-grep (structural code search for code_analyst). ripgrep already installed above.
+RUN ARCH=$([ "$TARGETPLATFORM" = "linux/arm64" ] && echo "aarch64" || echo "x86_64") && \
+    curl -fsSL "https://github.com/ast-grep/ast-grep/releases/latest/download/app-${ARCH}-unknown-linux-gnu.zip" \
+      -o /tmp/sg.zip \
+    && unzip -q /tmp/sg.zip -d /usr/local/bin sg ast-grep 2>/dev/null \
+    && rm -f /tmp/sg.zip && chmod +x /usr/local/bin/sg /usr/local/bin/ast-grep 2>/dev/null \
+    || echo "ast-grep install skipped (code_analyst falls back to ripgrep/git)"
+
+# OpenCode (code_session / fix loop). PINNED to the version code_session was
+# built + tested against (the headless server API changes across releases).
+# Graceful skip so the build never fails on a transient download.
+ARG OPENCODE_VERSION=1.4.3
+RUN curl -fsSL https://opencode.ai/install | bash -s -- --version ${OPENCODE_VERSION} \
+    && ln -sf /root/.opencode/bin/opencode /usr/local/bin/opencode \
+    || echo "opencode install skipped (code_session disabled until present)"
 
 WORKDIR /app
 
