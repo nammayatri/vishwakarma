@@ -77,12 +77,24 @@ spec:
   selector: { app: argus }
   ports:
     - { name: http, port: 80, targetPort: 5050 }
-# UI ACCESS — fronted by POMERIUM (identity-aware proxy, SSO at the edge).
-# Pomerium routes an external hostname -> this ClusterIP Service
-# (argus.argus.svc.cluster.local:80) and enforces auth, so ui.auth_disabled:true
-# in the config is fine — Pomerium is the gate. Add a Pomerium route/Ingress:
+---
+# UI Service for POMERIUM to point at (identity-aware proxy, SSO at the edge).
+# Pomerium enforces auth, so ui.auth_disabled:true in the config is fine.
+# Pomerium route:
 #   from: https://argus.<your-domain>
-#   to:   http://argus.argus.svc.cluster.local
+#   to:   http://argus-ui.argus.svc.cluster.local
 #   policy: allow @example.com (or the relevant group)
-# (For a quick check before Pomerium is wired: kubectl -n argus port-forward
-#  svc/argus 8080:80 -> http://localhost:8080/console)
+# Console lands at https://argus.<domain>/console.
+# (Quick check before Pomerium: kubectl -n argus port-forward svc/argus-ui
+#  8080:80 -> http://localhost:8080/console)
+apiVersion: v1
+kind: Service
+metadata:
+  name: argus-ui
+  namespace: argus
+  labels: { app: argus, role: ui }
+spec:
+  type: ClusterIP
+  selector: { app: argus }
+  ports:
+    - { name: http, port: 80, targetPort: 5050 }
