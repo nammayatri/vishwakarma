@@ -36,6 +36,11 @@ from vishwakarma.storage import dedup as _dedup
 MAX_CONCURRENT_INVESTIGATIONS = int(os.environ.get("VK_MAX_CONCURRENT_INVESTIGATIONS", "2"))
 _investigation_semaphore: "asyncio.Semaphore | None" = None
 
+# Shared app state (learnings, toolset_manager). MODULE-LEVEL so the Slack bots
+# (Argus/Sage), which run in background threads, can import it:
+#   from vishwakarma.server import _state
+_state: "dict[str, Any]" = {}
+
 
 def _get_semaphore():
     import asyncio
@@ -117,8 +122,9 @@ def create_app(config=None) -> FastAPI:
 
     suppress_probe_logs()
 
-    # Initialize toolset manager and storage once at startup
-    _state: dict[str, Any] = {}
+    # Use the MODULE-LEVEL _state so other threads (the Argus/Sage bots) can
+    # `from vishwakarma.server import _state`. Clear it for a fresh app.
+    _state.clear()
 
     from vishwakarma.ui.routes import create_ui_router
     app.include_router(create_ui_router(_state))
