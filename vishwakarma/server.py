@@ -656,9 +656,14 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
     llm = config.make_llm()
     engine = config.make_engine(llm=llm, toolset_manager=tm)
 
-    # Scale investigation depth by alert severity
-    _severity_steps = {"critical": 60, "high": 50, "warning": 40, "medium": 40, "low": 25, "info": 20}
-    engine.max_steps = _severity_steps.get((issue.severity or "").lower(), config.max_steps)
+    # Scale investigation depth by alert severity, capped at config.max_steps
+    # (VK_MAX_STEPS / config max_steps — set to 100). Critical/high get the full
+    # budget; lower severities a proportion so cheap cases still finish fast.
+    _m = config.max_steps
+    _severity_steps = {"critical": _m, "high": _m,
+                       "warning": max(40, int(_m * 0.7)), "medium": max(40, int(_m * 0.7)),
+                       "low": max(25, int(_m * 0.5)), "info": max(20, int(_m * 0.4))}
+    engine.max_steps = _severity_steps.get((issue.severity or "").lower(), _m)
 
     try:
         question = issue.question()
