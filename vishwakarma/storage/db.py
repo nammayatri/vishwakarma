@@ -110,6 +110,21 @@ CREATE TABLE IF NOT EXISTS runbooks (
     updated_at    REAL NOT NULL
 );
 
+-- Site knowledge base — DB-only (was a PVC file). Per-cloud + a 'default' row.
+-- Shared across pods so GCP/AWS see the same knowledge; PVC keeps only repos.
+CREATE TABLE IF NOT EXISTS site_knowledge (
+    cloud       TEXT PRIMARY KEY,        -- '' (default) | 'gcp' | 'aws'
+    content_md  TEXT NOT NULL,
+    updated_at  REAL NOT NULL
+);
+
+-- Learnings — DB-only (was /data/learnings/*.md on the PVC). One row per category.
+CREATE TABLE IF NOT EXISTS learnings (
+    category    TEXT PRIMARY KEY,
+    content_md  TEXT NOT NULL,
+    updated_at  REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS alert_runbook_map (
     alert_pattern TEXT NOT NULL,         -- normalized alert key
     runbook_id    TEXT NOT NULL,

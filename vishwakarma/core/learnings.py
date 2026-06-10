@@ -41,162 +41,95 @@ class LearningsManager:
     """
 
     def __init__(self, path: str | None = None):
-        # VK_LEARNINGS_PATH lets local/dev runs use a writable dir instead of
-        # the /data PVC mount.
-        self.path = path or os.environ.get("VK_LEARNINGS_PATH", "/data/learnings")
-        try:
-            os.makedirs(self.path, exist_ok=True)
-        except OSError:
-            # read-only fs (e.g. /data not mounted locally) — fall back to tmp
-            self.path = os.path.join(os.environ.get("TMPDIR", "/tmp"), "vk-learnings")
-            os.makedirs(self.path, exist_ok=True)
+        # DB-backed now (was /data/learnings/*.md on the PVC). `path` kept for
+        # signature compatibility but unused. Seeds default categories in the DB.
         self._init_defaults()
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
-    def _file(self, category: str) -> str:
-        return os.path.join(self.path, f"{category}.md")
-
     def _init_defaults(self) -> None:
-        """Create default category files with a header if they don't exist yet."""
+        """Create default categories in the DB if they don't exist yet."""
+        from vishwakarma.storage import site_content
         for cat in _DEFAULT_CATEGORIES:
-            fpath = self._file(cat)
-            if not os.path.exists(fpath):
-                try:
-                    with open(fpath, "w", encoding="utf-8") as f:
-                        f.write(f"# {cat.capitalize()} Learnings\n")
-                except OSError as e:
-                    log.warning(f"Could not initialise learnings file {fpath}: {e}")
+            try:
+                if site_content.get_learning(cat) is None:
+                    site_content.set_learning(cat, f"# {cat.capitalize()} Learnings\n")
+            except Exception as e:
+                log.debug(f"learnings default init skipped for {cat}: {e}")
 
     def _all_categories(self) -> list[str]:
-        """Return all category names by scanning the directory."""
+        from vishwakarma.storage import site_content
         try:
-            names = []
-            for fname in sorted(os.listdir(self.path)):
-                if fname.endswith(".md"):
-                    names.append(fname[:-3])
-            return names
-        except OSError:
+            cats = [c["category"] for c in site_content.list_learnings()]
+            return cats or list(_DEFAULT_CATEGORIES)
+        except Exception:
             return list(_DEFAULT_CATEGORIES)
 
     # ── Public API ────────────────────────────────────────────────────────────
 
     def create(self, category: str) -> None:
-        """Create a new category file. Raises ValueError for invalid names."""
+        """Create a new category. Raises ValueError for invalid names."""
         cat = category.lower().strip()
         if not _valid_category_name(cat):
             raise ValueError(
                 f"Invalid category name '{cat}'. "
                 "Use lowercase letters, digits, hyphens, or underscores (max 64 chars)."
             )
-        fpath = self._file(cat)
-        if not os.path.exists(fpath):
-            with open(fpath, "w", encoding="utf-8") as f:
-                f.write(f"# {cat.capitalize()} Learnings\n")
+        from vishwakarma.storage import site_content
+        if site_content.get_learning(cat) is None:
+            site_content.set_learning(cat, f"# {cat.capitalize()} Learnings\n")
 
     def get(self, category: str) -> str:
-        """Return the full content of a category file (cached with TTL)."""
+        """Return the full content of a category (cached with TTL)."""
         cat = category.lower().strip()
         now = time.time()
         if cat in _learnings_cache:
             ts, content = _learnings_cache[cat]
             if now - ts < _CACHE_TTL:
                 return content
-        fpath = self._file(cat)
-        try:
-            with open(fpath, "r", encoding="utf-8") as f:
-                content = f.read()
-            _learnings_cache[cat] = (now, content)
-            return content
-        except FileNotFoundError:
+        from vishwakarma.storage import site_content
+        content = site_content.get_learning(cat)
+        if content is None:
             return f"# {cat.capitalize()} Learnings\n"
-        except OSError as e:
-            log.error(f"Could not read learnings file {fpath}: {e}")
-            return ""
+        _learnings_cache[cat] = (now, content)
+        return content
 
     def set(self, category: str, content: str) -> None:
-        """Overwrite the content of a category file."""
+        """Overwrite the content of a category."""
         cat = category.lower().strip()
-        fpath = self._file(cat)
-        try:
-            with open(fpath, "w", encoding="utf-8") as f:
-                f.write(content)
-            _learnings_cache.pop(cat, None)
-        except OSError as e:
-            log.error(f"Could not write learnings file {fpath}: {e}")
-            raise
+        from vishwakarma.storage import site_content
+        site_content.set_learning(cat, content)
+        _learnings_cache.pop(cat, None)
 
     def append(self, category: str, fact: str) -> None:
-        """Append a bullet-point fact to a category file."""
+        """Append a bullet-point fact to a category."""
         cat = category.lower().strip()
-        fpath = self._file(cat)
-        line = f"- {fact.strip()}\n"
-        try:
-            with open(fpath, "a", encoding="utf-8") as f:
-                f.write(line)
-            _learnings_cache.pop(cat, None)
-        except OSError as e:
-            log.error(f"Could not append to learnings file {fpath}: {e}")
-            raise
+        existing = self.get(cat)
+        if existing and not existing.endswith("\n"):
+            existing += "\n"
+        self.set(cat, existing + f"- {fact.strip()}\n")
 
     def forget(self, category: str, keyword: str) -> int:
-        """
-        Remove all lines containing `keyword` (case-insensitive) from a category file.
-        Returns the number of lines removed.
-        """
+        """Remove all lines containing `keyword` (case-insensitive). Returns count removed."""
         cat = category.lower().strip()
-        fpath = self._file(cat)
-        keyword_lower = keyword.lower()
-        try:
-            with open(fpath, "r", encoding="utf-8") as f:
-                lines = f.readlines()
-        except FileNotFoundError:
-            return 0
-        except OSError as e:
-            log.error(f"Could not read learnings file {fpath}: {e}")
-            return 0
-
-        kept = [l for l in lines if keyword_lower not in l.lower()]
+        lines = self.get(cat).splitlines(keepends=True)
+        kw = keyword.lower()
+        kept = [l for l in lines if kw not in l.lower()]
         removed = len(lines) - len(kept)
         if removed:
-            try:
-                with open(fpath, "w", encoding="utf-8") as f:
-                    f.writelines(kept)
-                _learnings_cache.pop(cat, None)
-            except OSError as e:
-                log.error(f"Could not write learnings file {fpath}: {e}")
-                return 0
+            self.set(cat, "".join(kept))
         return removed
 
     def list_categories(self) -> list[dict]:
-        """
-        Return metadata for all categories (scanned from disk):
-        [{category, fact_count, size_bytes, last_modified}]
-        """
+        """[{category, fact_count, size_bytes, last_modified}] from the DB."""
+        from vishwakarma.storage import site_content
         result = []
-        for cat in self._all_categories():
-            fpath = self._file(cat)
-            try:
-                stat = os.stat(fpath)
-                size_bytes = stat.st_size
-                last_modified = datetime.fromtimestamp(stat.st_mtime).isoformat()
-                with open(fpath, "r", encoding="utf-8") as f:
-                    lines = f.readlines()
-                fact_count = sum(1 for l in lines if l.strip().startswith("- "))
-            except FileNotFoundError:
-                size_bytes = 0
-                last_modified = None
-                fact_count = 0
-            except OSError as e:
-                log.warning(f"Could not stat {fpath}: {e}")
-                size_bytes = 0
-                last_modified = None
-                fact_count = 0
+        for c in site_content.list_learnings():
             result.append({
-                "category": cat,
-                "fact_count": fact_count,
-                "size_bytes": size_bytes,
-                "last_modified": last_modified,
+                "category": c["category"],
+                "fact_count": c["fact_count"],
+                "size_bytes": c["size_bytes"],
+                "last_modified": c.get("last_modified"),
             })
         return result
 

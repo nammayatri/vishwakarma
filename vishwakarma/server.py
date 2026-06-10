@@ -136,6 +136,35 @@ def create_app(config=None) -> FastAPI:
     async def startup():
         from vishwakarma.storage.db import init_db
         init_db(config.db_path, dsn=config.pg_dsn, embedding_dim=config.embeddings_dim)
+
+        # Knowledge base + learnings are DB-ONLY now (the PVC keeps only the repo
+        # cache). One-time migrate any PVC files into the DB, then load knowledge
+        # from the DB (authoritative + shared across pods).
+        try:
+            from vishwakarma.storage import site_content
+            if not site_content.has_knowledge() and config.knowledge:
+                site_content.set_knowledge(config.knowledge, config.cloud or "")
+                log.info("Migrated knowledge.md → DB (site_knowledge)")
+            if not site_content.has_learnings():
+                import glob as _glob
+                ld = os.environ.get("VK_LEARNINGS_PATH", "/data/learnings")
+                seeded = 0
+                for fp in _glob.glob(os.path.join(ld, "*.md")):
+                    try:
+                        with open(fp) as f:
+                            site_content.set_learning(os.path.basename(fp)[:-3], f.read())
+                        seeded += 1
+                    except Exception:
+                        pass
+                if seeded:
+                    log.info(f"Migrated {seeded} learnings file(s) → DB (learnings)")
+            db_know = site_content.get_knowledge(config.cloud or "")
+            if db_know:
+                config.knowledge = db_know   # DB is authoritative
+                log.info(f"Knowledge loaded from DB ({len(db_know)} chars, cloud={config.cloud or 'default'})")
+        except Exception as e:
+            log.warning(f"Site-content DB migrate/load skipped (using file): {e}")
+
         _dedup.init_dedup(config.redis_url)
         from vishwakarma.core.embeddings import init_embeddings
         init_embeddings(config.embeddings_api_base, config.embeddings_api_key,
