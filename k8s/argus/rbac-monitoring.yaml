@@ -1,0 +1,28 @@
+# Read-only access to the Prometheus-operator CRDs (monitoring.coreos.com) +
+# metrics — the built-in `view` role covers operator.victoriametrics.com but not
+# these, so the agent got Forbidden reading prometheusrules. All read-only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: argus-monitoring-read
+rules:
+  - apiGroups: ["monitoring.coreos.com"]
+    resources: ["prometheusrules", "servicemonitors", "podmonitors", "probes",
+                "prometheuses", "alertmanagers", "thanosrulers", "scrapeconfigs"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["pods", "nodes"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: argus-monitoring-read
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: argus-monitoring-read
+subjects:
+  - kind: ServiceAccount
+    name: argus
+    namespace: argus
