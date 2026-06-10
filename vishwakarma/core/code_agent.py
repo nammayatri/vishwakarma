@@ -28,6 +28,7 @@ Safety:
 """
 import json
 import logging
+import os
 import socket
 import subprocess
 import time
@@ -259,7 +260,17 @@ class OpenCodeAgent:
                             capture_output=True, text=True, timeout=30).stdout
         if not st.strip():
             return {"error": "no changes to commit (only agent-infra files were touched)"}
-        c = subprocess.run(["git", "-C", wt, "commit", "-m", message],
+        # Commit author/email from env (durable across re-clones); fall back to the
+        # repo's configured identity. Never GPG-sign — the agent has no signing key.
+        _name = os.environ.get("VK_GIT_AUTHOR_NAME", "")
+        _email = os.environ.get("VK_GIT_AUTHOR_EMAIL", "")
+        _ident = []
+        if _name:
+            _ident += ["-c", f"user.name={_name}"]
+        if _email:
+            _ident += ["-c", f"user.email={_email}"]
+        c = subprocess.run(["git", "-C", wt, *_ident, "-c", "commit.gpgsign=false",
+                            "commit", "-m", message],
                            capture_output=True, text=True, timeout=60)
         if c.returncode != 0:
             return {"error": f"commit failed: {c.stderr.strip()[:200]}"}
