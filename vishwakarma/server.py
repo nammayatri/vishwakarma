@@ -1184,7 +1184,14 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
             slack_ts = resp.get("ts")
             # If a draft PR was opened during the fix step, surface it
             # prominently in the thread (the RCA PDF is already attached above).
+            # The streamed path leaves result.tool_outputs empty, so also look in
+            # the RCA analysis text (propose_fix writes the PR link into it).
             pr_url = _extract_pr_url(result.tool_outputs)
+            if not pr_url:
+                import re as _re
+                _m = _re.search(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+", analysis or "")
+                if _m:
+                    pr_url = _m.group(0)
             if pr_url and (slack_ts or ack_ts):
                 try:
                     dest._get_client().chat_postMessage(
