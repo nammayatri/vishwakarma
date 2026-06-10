@@ -59,7 +59,7 @@ AlertManager webhook POST /api/alertmanager
         1. kubectl get pods/events/replicasets (prefetch_ctx)
         2. SQLite prior incidents for this alert (prior_ctx)
         3. fast_model entity extraction (service/namespace/impact)
-        4. Runbook keyword match → agents.json → LLM fallback (runbooks)
+        4. Runbook hybrid match from the DB (exact-map + keyword + vector → RRF → rerank)
     → InvestigationEngine.investigate() — agentic loop up to 40 steps
     → generate PDF + post to Slack + save to SQLite
 ```
@@ -94,13 +94,22 @@ All toolsets must opt-in via `config.yaml` (`enabled: true`). Disabled toolsets 
 
 The `bash` toolset is the primary investigation tool. It runs `subprocess.run(shell=True)` with allow/block lists. The hardcoded block list (`rm`, `curl`, `wget`, etc.) cannot be overridden by config.
 
-### Runbook Matching (`config.py:load_matching_runbooks`)
+### Runbook Matching (`core/runbook_match.py:match_runbooks`)
 
-Two stages:
-1. **Keyword match**: `any(kw in alert_name.lower() for kw in entry["keywords"])` against `plugins/agents/agents.json`
-2. **LLM classification fallback**: if no keyword match, fast_model picks from the agents catalog
+Runbooks are **DB-only** — stored in the `runbooks` table (Postgres), authored in
+the console or via `storage/runbooks.py`, **never in the codebase**. There are no
+runbook files; `seed_from_files()` no-ops gracefully when none exist.
 
-Runbook content is injected into the system prompt as `## Relevant Runbook\n\n{content}`. The LLM is instructed that **runbook takes precedence** over generic RECON phases.
+Hybrid retrieval (parallel recall → single rerank), all from the DB:
+1. **Exact-map**: normalized alert key → `alert_runbook_map` table (fast path; self-populates on ✅-confirmed RCAs).
+2. **Keyword**: overlap against `runbooks.keywords[]`.
+3. **Vector**: pgvector cosine over `runbooks.embedding` (semantic recall for a large corpus).
+4. **RRF merge** of the three lists → **one** `fast_model` rerank → top 1–3 injected.
+
+A `cloud_type` facet filter (`aws|gcp|both|any`) is applied throughout. The agent
+can also re-retrieve mid-investigation via the `runbook_search(query)` tool with a
+recon-enriched query. Runbook content is injected into the system prompt as
+`## Relevant Runbook`; the LLM is told **runbook takes precedence** over generic RECON.
 
 ### Prompt Assembly (`core/prompt.py:build_system_prompt`)
 
@@ -122,7 +131,7 @@ Order of sections:
 | Layer | Where | What goes here |
 |-------|-------|---------------|
 | **Site Knowledge Base** | `/data/knowledge.md` on PVC | Static infra facts: instance IDs, namespaces, metric names, proven commands, IAM gaps |
-| **Runbooks** | `plugins/runbooks/` | Per-alert investigation workflows — which tools, which order, what to look for |
+| **Runbooks** | **`runbooks` table (Postgres)** | Per-alert investigation workflows — which tools, which order, what to look for. Authored in the console / `storage/runbooks.py`, **not in code** |
 | **Learnings** | `/data/learnings/*.md` on PVC | Patterns and gotchas discovered from real incidents. Agent reads via `learnings_list` + `learnings_read` |
 
 Runbooks use `<placeholder>` for anything cluster-specific and tell the agent to "use the value from the Site Knowledge Base". Never hardcode instance IDs, namespaces, or region names in runbooks.
@@ -167,8 +176,8 @@ toolsets:
 kubectl cp database-learnings.md <namespace>/<pod>:/data/learnings/database.md
 ```
 
-The generic runbook (`plugins/runbooks/database-investigation.md`) tells the agent to `learnings_read(database)` first, then use the tools. This way:
-- The runbook (open source) says **how** to investigate
+The `database-investigation` runbook (in the DB) tells the agent to `learnings_read(database)` first, then use the tools. This way:
+- The runbook (generic, in the DB) says **how** to investigate
 - The learnings file (on PV, private) says **what** to query for your specific schema
 
 ### Storage (`storage/db.py`)
@@ -183,22 +192,30 @@ Runs in Socket Mode in a background thread alongside FastAPI. Two paths:
 - **`@bot <anything>`** → `_simple_chat()` with fast_model, no tools, tone-matched reply
 - **Channel message with "CloudWatch Alarm"** → `parse_cloudwatch_slack_message()` → POST `/api/alertmanager`
 
-The bot persona is "Sage" (ExampleApp-specific). To change: edit `_simple_chat()` system prompt in `bot/slack.py`.
+The bot persona is "Sage". To change: edit `_simple_chat()` system prompt in `bot/slack.py`.
 
-## Adding a Runbook
+## Adding a Runbook (DB-only — no files)
 
-1. Create `vishwakarma/plugins/runbooks/custom/<alert-name>.md`
-2. Register in `plugins/agents/agents.json`:
-```json
-{
-  "id": "my-alert",
-  "description": "Investigate MyAlert...",
-  "keywords": ["myalert", "keyword2"],
-  "runbook": "../runbooks/custom/<alert-name>.md"
-}
+Runbooks live in the `runbooks` table, not the repo. Add one via the console
+(Runbook studio) or programmatically:
+
+```python
+from vishwakarma.storage.runbooks import save_runbook, map_alert
+save_runbook(
+    runbook_id="my-alert",
+    title="Investigate MyAlert",
+    content_md="## 0 Match …\n## 1 Metrics …\n## 4 Fix …\n## 5 Code fix …",
+    cloud_type="any",            # aws | gcp | both | any
+    keywords=["myalert", "keyword2"],
+    services=["my-svc"],
+)
+map_alert("MyAlert", "my-alert")   # optional: pin an exact alert → runbook (fast path)
 ```
-3. Use `<placeholder>` for cluster-specific values, reference Site Knowledge Base
-4. Include an Elasticsearch query step for any alert that involves application errors
+
+The embedding is computed on upsert (for vector recall). Guidelines for the body:
+- Use `<placeholder>` for cluster-specific values; reference the Site Knowledge Base.
+- Include an Elasticsearch/log step for any alert involving application errors.
+- Include a **Code fix** step (locate the handler → `code_session` → `propose_fix`) when a code change can fix it.
 
 ## Adding a Python Toolset
 

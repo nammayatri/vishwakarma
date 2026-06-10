@@ -132,7 +132,7 @@ graph TB
                     │  🔍 kubectl get pods + events + replicasets          │
                     │  📚 SQLite: last 3 investigations of this alert      │
                     │  ⚡ fast_model: extract service / namespace / impact  │
-                    │  📖 Runbook match: keyword → agents.json → LLM       │
+                    │  📖 Runbook match (DB): exact+keyword+vector → rerank │
                     │  🧠 Learnings: for_alert() pre-injects relevant facts │
                     └───────────────────────────┬─────────────────────────┘
                                                 │  merged into extra_system_prompt
@@ -279,36 +279,33 @@ engine.investigate(question, runbooks, extra_system_prompt)
 
 ## 📖 Runbook Matching
 
-```
-Alert name: "RDS_HighCPU_app-db-r1"
-        │
-        ▼
-┌─────────────────────────────────────────────┐
-│  Stage 1: Keyword match (zero LLM cost)     │
-│                                             │
-│  agents.json keywords checked:             │
-│  ┌─────────────────────────────────────┐   │
-│  │ alb-5xx      → alb, 5xx, elb        │   │
-│  │ rds          → rds, cpu, database ✓ │   │  ← MATCH
-│  │ redis        → redis, elasticache   │   │
-│  │ ny-system    → drainer, producer    │   │
-│  │ ny-sev2      → protocol, acme        │   │
-│  │ ny-pt        → cmrl, cris, gtfs     │   │
-│  └─────────────────────────────────────┘   │
-└───────────────────┬─────────────────────────┘
-                    │ match found
-                    ▼
-        load aws/rds-investigation.md
-                    │
-                    ▼
-        inject into system prompt
-                    │
-                    ▼
-        LLM follows step-by-step
-        RDS investigation workflow
+Runbooks live in the **`runbooks` table** (DB). Recall runs three mechanisms in
+parallel, merges them, and reranks once — never a short-circuit cascade.
 
-  (if no keyword match → LLM picks from catalog)
 ```
+Alert name: "RDS_HighCPU_app-db-r1"  (cloud=aws)
+        │
+        ▼  facet pre-filter: cloud_type ∈ {aws, both, any}
+┌─────────────────────────────────────────────────────┐
+│  Parallel recall over the runbooks table             │
+│  ┌──────────────┬───────────────┬─────────────────┐  │
+│  │ exact-map    │ keyword/FTS   │ vector (pgvector)│  │
+│  │ alert_runbook│ keywords[] ∩  │ embed(alert)     │  │
+│  │ _map lookup  │ "rds,cpu" ✓   │ <=> embedding    │  │
+│  └──────────────┴───────────────┴─────────────────┘  │
+│            → RRF merge (~10–15 candidates)            │
+└───────────────────────┬──────────────────────────────┘
+                        │ one fast_model rerank
+                        ▼
+            top 1–3 runbooks (e.g. rds-investigation)
+                        │
+                        ▼  inject into system prompt
+            LLM follows step-by-step; can also call
+            runbook_search(query) mid-investigation
+```
+
+Self-improving: a ✅-confirmed RCA bumps `hit_count` and inserts the exact-map
+row, so repeat alerts hit the fast path; repeated ❌ demotes a runbook.
 
 ---
 
@@ -379,7 +376,7 @@ Alert name: "RDS_HighCPU_app-db-r1"
 
 | Feature | Description |
 |---------|-------------|
-| 🗺️ **Runbook routing** | Per-alert runbooks matched by keyword, then LLM classification fallback |
+| 🗺️ **Runbook routing** | DB-only runbooks; hybrid recall (exact-map + keyword + pgvector) → RRF → one rerank |
 | ⚡ **Pre-enrichment** | K8s pod status, warning events, prior incidents, and entity extraction — all in parallel *before* the loop starts |
 | 📚 **Site knowledge base** | `/data/knowledge.md` on PVC, injected into every investigation — edit without rebuilding the image |
 | 🧠 **Learnings system** | Accumulated incident knowledge organized by category (rds, redis, drainer…). Relevant facts are pre-injected before every investigation via `for_alert()` — no wasted tool steps. Auto-compacts when a category exceeds 50 facts or 5KB. |
@@ -442,42 +439,41 @@ toolsets:
 
 ### 3️⃣ Runbooks
 
-Runbooks are `.md` files in `vishwakarma/plugins/runbooks/`. Each one tells the agent exactly how to investigate a specific alert type — which metrics to query, which logs to check, how to pivot between symptoms.
+Runbooks are stored in the **database** (the `runbooks` table) — **not in the repo**. Each one tells the agent exactly how to investigate a specific alert type — which metrics to query, which logs to check, how to pivot between symptoms, and the fix (including a code-fix path). You author and edit them in the **console (Runbook studio)** or via `storage/runbooks.py`; no code deploy needed, and they persist across restarts.
 
-**Two layers:**
+**Why DB-only:** anyone can author/edit a runbook without a deploy; runbooks can be cloud-scoped (`aws|gcp|both|any`); and matching uses hybrid retrieval (exact-map + keyword + pgvector) that scales to a large corpus. The repo ships with **none** — you seed your own.
 
-- **`aws/` and other generic runbooks** — infrastructure runbooks that work for any cluster. They use `<placeholder>` values and reference the Site Knowledge Base for cluster-specific details (instance IDs, metric names, namespaces). These ship with Vishwakarma.
-- **`custom/` runbooks** — your cluster-specific investigation workflows. Write one per alert group for your own services. The `ny-*.md` files are an example for ExampleApp's setup — replace or extend them for your own stack.
+**Adding a runbook** (console, or programmatically):
 
-**Adding a runbook:**
+```python
+from vishwakarma.storage.runbooks import save_runbook, map_alert
 
-1. Create `vishwakarma/plugins/runbooks/custom/<alert-name>.md` with step-by-step investigation instructions
-2. Register in `plugins/agents/agents.json`:
-
-```json
-{
-  "id": "my-alert-investigation",
-  "description": "Investigate MyAlert — what it means and how to diagnose",
-  "keywords": ["myalert", "keyword2"],
-  "runbook": "../runbooks/custom/<alert-name>.md"
-}
+save_runbook(
+    runbook_id="my-alert-investigation",
+    title="Investigate MyAlert",
+    content_md="## 0 Match …\n## 1 Metrics …\n## 4 Fix …\n## 5 Code fix …",
+    cloud_type="any",                 # aws | gcp | both | any
+    keywords=["myalert", "keyword2"],
+    services=["my-svc"],
+)
+map_alert("MyAlert", "my-alert-investigation")   # optional exact-match fast path
 ```
+
+The embedding is computed on upsert (for vector recall). The match self-improves:
+a ✅-confirmed RCA bumps the runbook's `hit_count` and auto-inserts the
+`(alert, runbook)` map row so repeat alerts hit the fast path.
 
 **Runbook design tips:**
 - Use `<placeholder>` for anything cluster-specific (namespaces, service names, instance IDs) and tell the agent to "use the value from the Site Knowledge Base"
 - Put the actual values in `knowledge.md` — not in the runbook
 - Put patterns discovered from real incidents in Learnings — not in the runbook
+- Add a **Code fix** step (locate handler → `code_session` → `propose_fix` → draft PR) when a code change can resolve it
 
-**Included runbooks:**
-
-| Runbook | Covers |
-|---------|--------|
-| `☁️ aws/rds-investigation.md` | RDS high CPU, connections, slow queries via Performance Insights |
-| `☁️ aws/redis-investigation.md` | ElastiCache high CPU, evictions, connection storms |
-| `☁️ aws/alb-5xx-investigation.md` | ALB 5xx — Istio logs → app logs → dependency pivot |
-| `🛺 custom/ny-system-alerts.md` | *(Example)* Drainer lag, login drops, producer failures, config errors |
-| `🛺 custom/ny-sre-sev2-alerts.md` | *(Example)* SEV2: 5xx errors, gateway failures, ride-to-search ratio |
-| `🛺 custom/ny-pt-alerts.md` | *(Example)* Public transit: CMRL/CRIS API failures, GTFS OOM, GRPC down |
+**Example runbook coverage** (you author these in the DB — RDS CPU/connections,
+ElastiCache evictions, ALB/LB 5xx via the istio→request-id→app-log pivot,
+drainer lag, login-success drops, ride-to-search ratio, config-parse failures,
+etc.). Each follows: §0 Match → §1 Metrics → §2 Logs → §3 Diagnosis → §4 Fix →
+§5 Code fix → §6 RCA.
 
 ### 4️⃣ Site Knowledge Base
 
@@ -523,7 +519,7 @@ Learnings are facts your team accumulates from real incidents — patterns, gotc
 | Layer | What goes here | Where |
 |-------|---------------|-------|
 | **Site Knowledge Base** | Static infra facts: instance IDs, namespaces, metric names, proven commands | `knowledge.md` on PVC |
-| **Runbooks** | How to investigate each alert type: which tools, which order, what to look for | `plugins/runbooks/` |
+| **Runbooks** | How to investigate each alert type: which tools, which order, what to look for | `runbooks` table (DB) |
 | **Learnings** | What you've *learned* from incidents: quirks, patterns, past RCAs | `/data/learnings/*.md` on PVC |
 
 **Teaching the bot via Slack:**
@@ -603,11 +599,7 @@ vishwakarma/
 │
 ├── 🔌 plugins/
 │   ├── toolsets/           bash, prometheus, elasticsearch, grafana, aws ...
-│   ├── runbooks/
-│   │   ├── aws/            RDS, ALB, Redis runbooks
-│   │   └── custom/         Your cluster-specific runbooks
-│   ├── agents/
-│   │   └── agents.json     Alert → runbook routing catalog
+│   │                       (runbooks live in the DB, not here)
 │   ├── channels/
 │   │   └── alertmanager/   AlertManager webhook parser
 │   └── relays/
@@ -709,8 +701,8 @@ Also update the `@sage` references in the help text (`_help_text()`) and the DM 
 | Prometheus / ES / Grafana URLs | `config.yaml` → `toolsets.*` |
 | Which tools are available | `config.yaml` → `toolsets.*.enabled` |
 | Bash allowlist | `config.yaml` → `toolsets.bash.config.allow` |
-| Investigation workflow for your alerts | `plugins/runbooks/<your-category>/` |
-| Alert → runbook routing | `plugins/agents/agents.json` |
+| Investigation workflow for your alerts | `runbooks` table (DB) — console / `storage/runbooks.py` |
+| Alert → runbook routing | `alert_runbook_map` table (DB), auto-populated on ✅-confirmed RCAs |
 | Infra-specific context (instances, namespaces, metrics) | `/data/knowledge.md` on PVC |
 | Incident patterns and gotchas discovered over time | `/data/learnings/*.md` via `@sage learn` or the UI |
 | Slack bot name + persona | `bot/slack.py` → `_simple_chat` system prompt (change "Sage" to your own bot name/persona) |
