@@ -51,13 +51,14 @@ def test_fix_scorer_draft_pr_path():
     assert d.action == "draft_pr" and d.confidence == "HIGH"
 
 
-def test_fix_scorer_never_pr_unvalidated():
+def test_fix_scorer_draft_pr_when_tests_unknown():
     from vishwakarma.core.fix_scorer import score_fix
-    # high score but tests not run → must not PR
+    # high + localized + tests not run (None) → DRAFT PR (CI validates the draft;
+    # the Haskell monorepo can't build in-pod). Only a confirmed FAILURE blocks.
     d = score_fix("HIGH", exact_line_found=True, pattern_matched=True,
                   diff_files=1, diff_lines=10, tests_passed=None)
-    assert d.action == "propose_only"
-    # tests failed → must not PR
+    assert d.action == "draft_pr"
+    # tests FAILED → must not PR
     d2 = score_fix("HIGH", exact_line_found=True, diff_files=1, diff_lines=10,
                    tests_passed=False)
     assert d2.action == "propose_only"

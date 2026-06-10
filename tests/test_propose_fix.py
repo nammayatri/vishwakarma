@@ -103,7 +103,9 @@ def test_propose_fix_opens_draft_pr(fake_gh, fake_oc_bin, repos, monkeypatch):
     assert "/pull/" in str(out.output)
 
 
-def test_propose_fix_propose_only_when_tests_unknown(fake_oc_bin, repos):
+def test_propose_fix_draft_decision_but_github_disabled(fake_oc_bin, repos):
+    # tests unknown is now allowed for a DRAFT PR (CI validates), but with
+    # GitHub disabled there's no PR — it returns the fix as a suggestion.
     from vishwakarma.core import pr_creator
     pr_creator.init_pr_creator(False, "", "", "main")   # github disabled
 
@@ -114,9 +116,10 @@ def test_propose_fix_propose_only_when_tests_unknown(fake_oc_bin, repos):
 
     out = ts.execute("propose_fix", {
         "session_id": sid, "title": "T", "rca": "x", "rca_confidence": "HIGH",
-        "exact_line_found": True})   # tests_passed omitted → can't PR
+        "exact_line_found": True})
     assert out.status == ToolStatus.SUCCESS, out.error
-    assert "propose only" in str(out.output).lower()
+    o = str(out.output).lower()
+    assert "github is not configured" in o or "propose only" in o
 
 
 def test_propose_fix_no_changes(fake_oc_bin, repos):

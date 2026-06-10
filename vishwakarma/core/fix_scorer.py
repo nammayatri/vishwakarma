@@ -83,16 +83,19 @@ def score_fix(
 
     confidence = "HIGH" if score >= DRAFT_PR_THRESHOLD else "MEDIUM" if score >= 0.4 else "LOW"
 
-    # Hard gates: never draft-PR an unvalidated fix, a non-localized diff, or
-    # one whose tests failed.
+    # Hard gates for a DRAFT PR (never auto-merged; CI + a human review it):
+    # high confidence + localized diff + tests NOT explicitly failed. Unknown
+    # test status (None) is allowed — the build can't run in-pod for the Haskell
+    # monorepo, and CI on the draft does the validation. Only a confirmed test
+    # FAILURE blocks the PR.
     can_pr = (
         score >= DRAFT_PR_THRESHOLD
         and localized
-        and tests_passed is True
+        and tests_passed is not False
     )
     action = "draft_pr" if can_pr else "propose_only"
     if action == "propose_only" and score >= DRAFT_PR_THRESHOLD:
-        reasons.append("score high but gate not met (tests/diff) — propose only")
+        reasons.append("score high but gate not met (diff size / tests failed) — propose only")
 
     return FixDecision(score=round(score, 3), confidence=confidence,
                        action=action, reasons=reasons)
