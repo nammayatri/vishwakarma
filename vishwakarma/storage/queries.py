@@ -77,6 +77,32 @@ def update_incident_status(incident_id: str, status: str) -> bool:
     return cur.rowcount > 0
 
 
+def resolve_incidents_by_labels(labels: dict) -> int:
+    """Mark OPEN incidents matching this alert's identity (alertname + namespace +
+    service) as resolved — called when AlertManager reports the alert cleared, so
+    incidents don't sit at 'open' forever after the underlying issue is gone."""
+    alertname = (labels or {}).get("alertname", "")
+    if not alertname:
+        return 0
+    ns = (labels or {}).get("namespace", "")
+    svc = (labels or {}).get("service", "")
+    conn = _get_conn()
+    rows = conn.execute("SELECT id, labels FROM incidents WHERE status='open'").fetchall()
+    resolved = 0
+    for r in rows:
+        d = dict(r)
+        try:
+            L = json.loads(d.get("labels") or "{}")
+        except Exception:
+            L = {}
+        if (L.get("alertname") == alertname
+                and (not ns or L.get("namespace") == ns)
+                and (not svc or L.get("service") == svc)):
+            if update_incident_status(d["id"], "resolved"):
+                resolved += 1
+    return resolved
+
+
 def get_incident(incident_id: str) -> dict | None:
     conn = _get_conn()
     row = conn.execute(

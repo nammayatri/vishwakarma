@@ -341,6 +341,20 @@ def create_app(config=None) -> FastAPI:
         from vishwakarma.plugins.channels.alertmanager.plugin import parse_alertmanager_webhook
         from vishwakarma.storage.queries import save_incident, alert_fingerprint
 
+        # Auto-resolve: AlertManager 'resolved' status → close the matching open
+        # incident(s). parse_alertmanager_webhook drops resolved alerts (we don't
+        # investigate them), so read them off the raw payload here.
+        try:
+            from vishwakarma.storage.queries import resolve_incidents_by_labels
+            for a in (payload.get("alerts") or []):
+                if a.get("status") == "resolved":
+                    n = resolve_incidents_by_labels(a.get("labels") or {})
+                    if n:
+                        log.info(f"Auto-resolved {n} incident(s) — alert cleared: "
+                                 f"{(a.get('labels') or {}).get('alertname')}")
+        except Exception as e:
+            log.debug(f"Auto-resolve on alert-clear failed: {e}")
+
         issues = parse_alertmanager_webhook(payload)
         if not issues:
             return {"status": "no_issues"}
