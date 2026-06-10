@@ -150,13 +150,15 @@ def create_app(config=None) -> FastAPI:
         from vishwakarma.core.pr_creator import init_pr_creator
         init_pr_creator(config.github_enabled, config.github_token,
                         config.github_api_base, config.github_default_base)
-        # Seed DB runbooks from the repo's agents.json + .md files (idempotent;
-        # keeps file-based runbooks working as defaults on fresh installs).
+        # Runbooks are DB-ONLY (authored in the DB / console). No code seeding —
+        # seed_from_files no-ops gracefully when agents.json is absent. The DB
+        # is the single source of truth for runbook content + match patterns,
+        # so DB authoring is never overwritten on restart.
         try:
             from vishwakarma.storage.runbooks import seed_from_files
             seed_from_files()
         except Exception as seed_err:
-            log.warning(f"Runbook seeding failed (file-based matching still works): {seed_err}")
+            log.debug(f"Runbook seeding skipped (DB-only): {seed_err}")
         # Orchestrator topology: connect the job stream (requires Redis)
         if getattr(config, "role", "") == "orchestrator":
             from vishwakarma.core.jobstream import init_jobstream
