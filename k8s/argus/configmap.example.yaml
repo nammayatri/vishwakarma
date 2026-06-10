@@ -1,0 +1,114 @@
+# COPY to configmap.yaml and edit endpoints for your site.
+# Secrets (tokens, DSNs, keys) come from argus-secrets env vars, NOT here.
+# This is the ALL-IN-ONE shape (vk serve): no Redis, in-process investigations,
+# EVERYTHING enabled (database, ES, code_analyst, code_session/fix-loop, verify).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argus-config
+  namespace: argus
+data:
+  config.yaml: |
+    llm:
+      model: openai/open-large
+      fast_model: openai/open-large   # glm-latest was 400-erroring on compression; open-large is reliable
+      api_base: https://llm-gateway.example.com
+      # api_keys come from VK_API_KEYS (comma-separated) in argus-secrets — the
+      # key pool round-robins across them + backs off on 429.
+      fast_fallbacks:
+        - openai/glm-latest
+        - openai/minimaxai/minimax-m2
+      model_fallbacks:
+        - openai/minimaxai/minimax-m2
+      max_tokens: 65536
+      temperature: 0.0
+      timeout: 300
+
+    cluster_name: prod-project-gcp
+    max_steps: 40
+    run_until_verified: true
+
+    # All-in-one: role unset, no Redis (in-memory dedup/events/correlation).
+
+    # Semantic RAG — local model, pre-baked in the image. No external service.
+    embeddings:
+      provider: local
+      local_model: BAAI/bge-small-en-v1.5
+      dim: 384
+
+    # Draft-PR fix loop. propose_fix pushes the fix branch + opens a DRAFT PR
+    # (never auto-merge). Needs GITHUB_TOKEN (argus-secrets) with repo + PR scope.
+    github:
+      enabled: true
+      default_base_branch: main
+
+    # Web console at /console — exposed via the INTERNAL LoadBalancer (private).
+    ui:
+      auth_disabled: true
+
+    toolsets:
+      bash:
+        enabled: true
+        config:
+          safe_mode: false
+          # read verbs only; the infra-mutation guard hard-blocks any
+          # kubectl/gcloud/aws WRITE regardless of this list.
+          allow: [gcloud, kubectl, stern, aws, redis-cli, psql]
+          block: [rm, wget, curl]
+      prometheus:
+        enabled: true
+        config:
+          url: http://CHANGE_ME-vmselect.monitoring:8481/select/0/prometheus
+      database:
+        enabled: true
+        config:
+          # Every connection is forced READ-ONLY + 10s statement_timeout in code
+          # (default_transaction_read_only=on, statement_timeout=10000) — a
+          # runaway query is killed by Postgres at 10s. Use the READER/REPLICA
+          # endpoint (never the writer) so even read load stays off the primary.
+          connections:
+            - name: bpp_pg
+              type: postgresql
+              host: CHANGE_ME-aws-bpp-READER.aps1.rds.amazonaws.com   # AWS read replica
+              port: 5432
+              database: provider_db_v2
+              username: readonly
+              password: CHANGE_ME
+              timeout: 10
+            - name: bap_pg
+              type: postgresql
+              host: CHANGE_ME-aws-bap-READER.aps1.rds.amazonaws.com   # AWS read replica
+              port: 5432
+              database: app_db_v2
+              username: readonly
+              password: CHANGE_ME
+              timeout: 10
+      elasticsearch:
+        enabled: true
+        config:
+          url: http://CHANGE_ME-elasticsearch.logging:9200
+          # username/password via env if secured
+      todo:        { enabled: true }
+      learnings:   { enabled: true }
+      runbooks:    { enabled: true }
+      verify:      { enabled: true }
+      lsp:         { enabled: false }   # Haskell HLS is 1-2GB — add as a sidecar later
+      code_analyst:
+        enabled: true
+        config:
+          repo_dir: /data/repos          # ON THE PVC — cloned once, pulled fresh per RCA
+          default_branch: main
+          repos:
+            - name: backend
+              url: https://github.com/your-org/backend.git
+              branch: main
+              sparse: ["Backend"]        # sparse-checkout the monorepo subtree
+      code_session:
+        enabled: true
+        config:
+          repo_dir: /data/repos          # SAME PVC path — worktrees off the clone
+          repos: [backend]
+          allow_edit: true               # edits gated by the fix scorer + draft-PR-only
+          api_base: https://llm-gateway.example.com
+          model: open-large
+          send_timeout: 300

@@ -1,0 +1,142 @@
+# Argus control-plane Postgres (pgvector) — in-cluster StatefulSet.
+# Stores incidents, investigations, runbooks, embeddings, patterns. This is the
+# AGENT's own state, not prod app data — a PVC-backed single pod + periodic
+# pg_dump backup is adequate. For cross-cloud (AWS executors) add an internal
+# LoadBalancer Service (see postgres-internal-lb.yaml note at bottom).
+# NOTE: the argus-postgres Secret (POSTGRES_PASSWORD) is defined in the real
+# secrets.yaml (gitignored) so it stays in sync with VK_PG_DSN. Do NOT define it
+# here too — applying this file would clobber the real password.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argus-postgres-init
+  namespace: argus
+data:
+  # Runs once on first init (empty data dir). Enables pgvector in the argus DB.
+  10-extensions.sql: |
+    CREATE EXTENSION IF NOT EXISTS vector;
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: argus-postgres            # stable DNS: argus-postgres.argus.svc.cluster.local:5432
+  namespace: argus
+  labels: { app: argus-postgres }
+spec:
+  clusterIP: None                 # headless — StatefulSet stable identity
+  selector: { app: argus-postgres }
+  ports:
+    - port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: argus-postgres
+  namespace: argus
+spec:
+  serviceName: argus-postgres
+  replicas: 1
+  selector:
+    matchLabels: { app: argus-postgres }
+  template:
+    metadata:
+      labels: { app: argus-postgres }
+    spec:
+      securityContext:
+        fsGroup: 999              # postgres uid/gid in the image
+      containers:
+        - name: postgres
+          image: pgvector/pgvector:pg17     # Postgres 17 with pgvector built in
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              value: argus
+            - name: POSTGRES_USER
+              value: argus
+            - name: POSTGRES_PASSWORD
+              valueFrom: { secretKeyRef: { name: argus-postgres, key: POSTGRES_PASSWORD } }
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          args:
+            # read-committed control-plane workload; modest shared_buffers
+            - "-c"
+            - "max_connections=200"
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: initdb
+              mountPath: /docker-entrypoint-initdb.d
+          readinessProbe:
+            exec: { command: ["pg_isready", "-U", "argus", "-d", "argus"] }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            exec: { command: ["pg_isready", "-U", "argus", "-d", "argus"] }
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          resources:
+            requests: { cpu: "500m", memory: 1Gi }
+            limits: { cpu: "2", memory: 4Gi }
+      volumes:
+        - name: initdb
+          configMap: { name: argus-postgres-init }
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 20Gi          # grows with incident history + embeddings
+---
+# Daily logical backup → GCS (you own backups for an in-cluster DB).
+# Set GCS bucket + ensure the SA has objectAdmin. Restore: gsutil cp + psql.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: argus-postgres-backup
+  namespace: argus
+spec:
+  schedule: "30 18 * * *"          # 00:00 IST daily
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: backup
+              image: google/cloud-sdk:slim
+              env:
+                - name: PGPASSWORD
+                  valueFrom: { secretKeyRef: { name: argus-postgres, key: POSTGRES_PASSWORD } }
+                - name: GCS_BUCKET
+                  value: "CHANGE_ME-argus-backups"     # gs://<bucket>/postgres/
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -e
+                  apt-get update -qq && apt-get install -y -qq postgresql-client >/dev/null
+                  TS=$(date +%Y%m%d-%H%M%S)
+                  pg_dump -h argus-postgres -U argus -d argus -Fc \
+                    -f /tmp/argus-$TS.dump
+                  gsutil cp /tmp/argus-$TS.dump gs://$GCS_BUCKET/postgres/argus-$TS.dump
+---
+# CROSS-CLOUD NOTE: when AWS executors come online, ALSO apply an internal
+# LoadBalancer so the DB has a peering-routable private IP:
+#
+#   apiVersion: v1
+#   kind: Service
+#   metadata:
+#     name: argus-postgres-ilb
+#     namespace: argus
+#     annotations:
+#       networking.gke.io/load-balancer-type: "Internal"
+#   spec:
+#     type: LoadBalancer
+#     selector: { app: argus-postgres }
+#     ports: [{ port: 5432, targetPort: 5432 }]
+#
+# Until then, GCP-only uses argus-postgres.argus.svc.cluster.local (ClusterIP DNS).

@@ -1,0 +1,223 @@
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vishwakarma-data
+  namespace: monitoring
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: gp3          # change to your StorageClass
+  resources:
+    requests:
+      storage: 5Gi
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vishwakarma-config
+  namespace: monitoring
+data:
+  config.yaml: |
+    llm:
+      model: openai/gpt-4o       # any OpenAI-compatible model
+      api_base: <LLM_API_BASE>   # omit for OpenAI default
+      max_tokens: 65536
+      temperature: 0.0
+      timeout: 300
+      fast_model: openai/gpt-4o-mini   # for summarisation, chat, compaction
+
+    cluster_name: <CLUSTER_NAME>
+    max_steps: 40
+    dedup_window: 300
+
+    server:
+      host: 0.0.0.0
+      port: 5050
+
+    storage:
+      db_path: /data/vishwakarma.db
+
+    # Site knowledge base — edit via kubectl edit configmap vishwakarma-config
+    # Put cluster-specific facts here: instance IDs, metric names, proven commands
+    knowledge_path: /etc/vishwakarma/knowledge.md
+
+    toolsets:
+      kubernetes:
+        enabled: false            # use bash + kubectl instead
+      kubernetes_logs:
+        enabled: false            # use stern via bash instead
+      prometheus:
+        enabled: true
+        config:
+          url: "<PROMETHEUS_URL>"
+      elasticsearch:
+        enabled: true
+        config:
+          url: "<ELASTICSEARCH_URL>"
+      grafana:
+        enabled: false
+        config:
+          url: "<GRAFANA_OR_LOKI_URL>"
+      bash:
+        enabled: true
+        config:
+          safe_mode: false
+          allow: [kubectl, aws, stern, echo, timeout, grep, head, tail, jq, awk, sort, uniq, cat, date]
+          block: [rm, curl, wget, env, printenv, nc, netcat, python, pip]
+      learnings:
+        enabled: true
+      todo:
+        enabled: true
+      database:
+        enabled: false
+      http:
+        enabled: true
+      internet:
+        enabled: true
+
+  knowledge.md: |
+    # <YOUR CLUSTER NAME> Site Knowledge Base
+
+    ## RDS Instances (region: <region>)
+    <app-cluster>: <writer-instance> (writer), <reader-instance> (reader)
+
+    DbiResourceIds (required for Performance Insights API):
+    <instance-id> = <dbi-resource-id>
+
+    ALERT→INSTANCE: Alarm names often don't match instance IDs — map them here.
+
+    ## Redis Clusters (ElastiCache, region: <region>)
+    <cluster-id> — <description>
+
+    ## Elasticsearch
+    URL: <elasticsearch-url>
+    App logs index: <index-pattern-YYYY-MM-DD>
+    Istio logs index: <istio-index-pattern-YYYY-MM-DD>
+
+    ## Prometheus
+    URL: <prometheus-url>
+    Always use prometheus_query_range tool — never http_get.
+
+    ## Key Services
+    <service-name> → <description, dependencies>
+
+    ## Prometheus Metrics
+    5xx error rate: sum by(service,handler)(rate(http_request_duration_seconds_count{status_code=~"^5.."}[1m]))
+
+    ## IAM Gaps (always fail — skip, don't retry)
+    # Document any AWS CLI commands that fail due to missing permissions
+
+    ## Proven Commands
+    # Put verified, working commands here so the agent uses them directly
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vishwakarma
+  namespace: monitoring
+  labels:
+    app: vishwakarma
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate              # required for ReadWriteOnce PVC
+  selector:
+    matchLabels:
+      app: vishwakarma
+  template:
+    metadata:
+      labels:
+        app: vishwakarma
+    spec:
+      serviceAccountName: vishwakarma
+      terminationGracePeriodSeconds: 5
+      nodeSelector:
+        eks.amazonaws.com/nodegroup: <ON_DEMAND_NODEGROUP>   # pin to on-demand to avoid PVC reattach delays
+      containers:
+        - name: vishwakarma
+          image: <ECR_REGISTRY>/vishwakarma:<IMAGE_TAG>
+          imagePullPolicy: IfNotPresent   # safe with versioned tags; avoids redundant pulls
+          ports:
+            - containerPort: 5050
+              name: http
+          env:
+            # LLM
+            - name: VK_API_KEY
+              value: "<LLM_API_KEY>"
+            - name: VK_API_BASE
+              value: "<LLM_API_BASE>"
+            - name: VK_FAST_MODEL
+              value: "<FAST_MODEL>"
+            - name: OVERRIDE_MAX_CONTENT_SIZE
+              value: "131072"
+            - name: OVERRIDE_MAX_OUTPUT_TOKEN
+              value: "65536"
+            # Slack
+            - name: SLACK_BOT_TOKEN
+              value: "<SLACK_BOT_TOKEN>"
+            - name: SLACK_APP_TOKEN
+              value: "<SLACK_APP_TOKEN>"
+            # Config file path
+            - name: VK_CONFIG
+              value: /etc/vishwakarma/config.yaml
+          volumeMounts:
+            - name: config
+              mountPath: /etc/vishwakarma
+              readOnly: true
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: 1000m
+              memory: 2Gi
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: 5050
+            failureThreshold: 12
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 5050
+            initialDelaySeconds: 0
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 5
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 5050
+            initialDelaySeconds: 0
+            periodSeconds: 10
+            timeoutSeconds: 5
+      volumes:
+        - name: config
+          configMap:
+            name: vishwakarma-config
+        - name: data
+          persistentVolumeClaim:
+            claimName: vishwakarma-data
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vishwakarma
+  namespace: monitoring
+  labels:
+    app: vishwakarma
+spec:
+  type: ClusterIP
+  selector:
+    app: vishwakarma
+  ports:
+    - port: 5050
+      targetPort: 5050
+      name: http

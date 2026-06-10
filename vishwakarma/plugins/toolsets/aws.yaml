@@ -1,0 +1,4 @@
+name: aws
+description: "Disabled — use the bash tool to run aws CLI commands directly."
+enabled: false
+tools: []

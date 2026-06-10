@@ -1,0 +1,47 @@
+# GCP executor pool — runs in GKE, reaches GCP-side AlloyDB/Redis/cluster.
+# Scale replicas with load; each pod is one consumer in the 'executors' group.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: argus-executor-gcp
+  namespace: argus
+  labels: { app: argus-executor-gcp }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: argus-executor-gcp }
+  template:
+    metadata:
+      labels: { app: argus-executor-gcp }
+    spec:
+      terminationGracePeriodSeconds: 120   # finish the current job step
+      containers:
+        - name: executor
+          image: CHANGE_ME/vishwakarma:latest-argus
+          command: ["vk", "serve-executor", "--cloud", "gcp", "--config", "/etc/argus/config.yaml"]
+          envFrom:
+            - secretRef: { name: argus-secrets }
+          env:
+            - name: VK_CONFIG
+              value: /etc/argus/config.yaml
+          volumeMounts:
+            - { name: config, mountPath: /etc/argus }
+            - { name: data, mountPath: /data }
+          resources:
+            requests: { cpu: 500m, memory: 1Gi }
+            limits: { cpu: "2", memory: 4Gi }
+      volumes:
+        - name: config
+          configMap: { name: argus-config }
+        - name: data
+          persistentVolumeClaim: { claimName: argus-executor-gcp-data }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: argus-executor-gcp-data
+  namespace: argus
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests: { storage: 50Gi }   # repo cache + learnings + PDFs

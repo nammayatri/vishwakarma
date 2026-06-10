@@ -1,0 +1,59 @@
+# Local all-in-one test config (vk serve / vk probe). Copy to config.local.yaml
+# and fill the key. Uses your local Postgres + Redis + a local embedding model.
+# NOTHING here touches prod — the agent is read-only and the infra-mutation
+# guardrail blocks any destructive kubectl/aws/gcloud command.
+
+llm:
+  model: openai/open-large
+  fast_model: openai/open-fast
+  api_base: https://llm-gateway.example.com
+  # api_key via VK_API_KEY env (don't commit it)
+  fast_fallbacks: [openai/glm-latest, openai/minimaxai/minimax-m2]
+  model_fallbacks: [openai/minimaxai/minimax-m2]
+  max_tokens: 65536
+  timeout: 300
+
+cluster_name: local-test
+max_steps: 40
+run_until_verified: true
+
+storage:
+  # local Postgres + Redis (what we tested against). Omit dsn/redis_url to use
+  # SQLite + in-memory instead (even simpler, still works).
+  dsn: postgresql://postgres@localhost:5432/vishwakarma_local
+  redis_url: redis://localhost:6379/0
+
+# Local semantic RAG — no gateway, no egress (pre-baked model in prod image)
+embeddings:
+  provider: local
+  local_model: BAAI/bge-small-en-v1.5
+  dim: 384
+
+ui:
+  auth_disabled: true   # local dev: console open at /console
+
+toolsets:
+  bash:
+    enabled: true
+    config:
+      safe_mode: false
+      allow: [kubectl, aws, gcloud, stern, helm]   # read verbs only; mutations hard-blocked
+      block: [rm, wget, curl]
+  prometheus:
+    enabled: false        # set url + enable to test metric tools
+  database:
+    enabled: false
+  todo: { enabled: true }
+  learnings: { enabled: true }
+  runbooks: { enabled: true }
+  verify: { enabled: true }
+  code_analyst:
+    enabled: true
+    config:
+      repo_dir: /Users/vijaygupta/misc/tmp/argus-repos
+      default_branch: main
+      repos: []           # add {name,url,branch} to test code tools
+  code_session:
+    enabled: false        # needs opencode installed; allow_edit stays false
+  lsp:
+    enabled: false        # set command/root to test (e.g. pylsp)

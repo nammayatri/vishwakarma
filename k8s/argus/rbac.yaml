@@ -1,0 +1,27 @@
+# Argus pod identity. The k8s SA is bound to the GCP SA argus-agent@prod-project
+# (roles/viewer — all read-only) via Workload Identity, and to the built-in
+# `view` ClusterRole for read-only kubectl across namespaces.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: argus
+  namespace: argus
+  annotations:
+    # Workload Identity → gcloud alloydb/redis/compute/monitoring/logging run
+    # as this read-only GCP SA. (IAM binding already created.)
+    iam.gke.io/gcp-service-account: argus-agent@prod-project.iam.gserviceaccount.com
+---
+# Read-only kubectl (get/list/watch pods, logs, events, deployments, ...) across
+# all namespaces. `view` is a built-in ClusterRole — no write verbs.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: argus-view
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: view
+subjects:
+  - kind: ServiceAccount
+    name: argus
+    namespace: argus

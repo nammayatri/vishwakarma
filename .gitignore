@@ -1,0 +1,51 @@
+k8s/deployment.yaml
+k8s/rbac.yaml
+deployment.md
+knowledge.md
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# Secrets / local config
+config.yaml
+config.local.yaml
+.env
+.env.*
+.env.local
+
+# Frontend (web/dist covered by dist/ above)
+node_modules/
+
+# Runtime artifacts
+*.log
+*.db
+*.sqlite
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+
+# Tests
+.pytest_cache/
+.coverage
+htmlcov/
+k8s/deployment.yaml
+NY_CONTEXT.md
+# real (filled) argus manifests — never commit
+k8s/argus/configmap.yaml
+k8s/argus/secrets.yaml
+k8s/argus/postgres-secret.yaml
+
+# Live (private) deployment setup — real endpoints, secrets, knowledge
+deploy-live/
+
+# Local Claude Code session settings
+.claude/

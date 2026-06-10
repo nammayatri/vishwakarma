@@ -1,0 +1,407 @@
+"""
+CodeAgent — conversational coding-agent sessions the RCA agent drives.
+
+The RCA agent acts as a human-proxy: it opens a session on a repo, sends a
+question/instruction, blocks on the response, reads it, and decides the next
+message — iterating the way a developer would. Read mode is for tracing and
+understanding; edit mode (gated upstream) is for writing the fix.
+
+v1 backend: OpenCode (`opencode serve`, OpenAI-compatible provider = the
+existing LLM gateway). The adapter isolates the backend — Aider/Claude Code
+can implement the same interface later.
+
+Mechanics (probed against OpenCode 1.4.3):
+  POST /session                      → {id: "ses_..."}
+  POST /session/{id}/message        → BLOCKING; {info: {error?, tokens, cost},
+                                       parts: [{type: text|tool|reasoning, ...}]}
+  agent "plan"  — read-only (edit tools disallowed server-side)
+  agent "build" — full tools (edit mode; always in a throwaway worktree)
+
+Server scoping is per-directory: one `opencode serve` per session, cwd-bound
+to the repo (read) or a worktree (edit). Killed on end().
+
+Safety:
+  - read sessions use the plan agent — OpenCode itself refuses edits.
+  - edit sessions run in `git worktree` on branch argus/fix-<name>; the main
+    clone is never touched; worktree removed on end().
+  - provider API key is passed via the child process env, never written to disk.
+"""
+import json
+import logging
+import os
+import socket
+import subprocess
+import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, field
+from pathlib import Path
+
+log = logging.getLogger(__name__)
+
+SERVER_START_TIMEOUT = 30      # seconds to wait for opencode serve to come up
+DEFAULT_SEND_TIMEOUT = 420     # per message — OpenCode runs many internal steps
+DEFAULT_SESSION_BUDGET = 2400  # wall-clock cap per session (40 min)
+
+
+@dataclass
+class CodeSession:
+    session_id: str            # OpenCode session id
+    mode: str                  # 'read' | 'edit'
+    repo_path: str             # directory the server is scoped to (repo or worktree)
+    port: int
+    proc: subprocess.Popen
+    branch: str = ""           # edit mode: the worktree branch
+    base_repo: str = ""        # edit mode: the source clone the worktree came from
+    started_at: float = field(default_factory=time.time)
+    transcript: list = field(default_factory=list)   # [{role, text, at}] — checkpointable
+
+
+class OpenCodeAgent:
+    """Session-based adapter over a headless OpenCode server."""
+
+    def __init__(
+        self,
+        provider_id: str = "vk-gateway",
+        api_base: str = "",
+        api_key: str = "",
+        model: str = "open-large",
+        opencode_bin: str = "opencode",
+        send_timeout: int = DEFAULT_SEND_TIMEOUT,
+        session_budget: int = DEFAULT_SESSION_BUDGET,
+    ):
+        self.provider_id = provider_id
+        self.api_base = api_base
+        self.api_key = api_key
+        self.model = model
+        self.opencode_bin = opencode_bin
+        self.send_timeout = send_timeout
+        self.session_budget = session_budget
+        self._sessions: dict[str, CodeSession] = {}
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def start(self, repo_path: str, mode: str = "read", session_name: str = "") -> str:
+        """
+        Start a session on a repo. read → server scoped to the clone itself
+        (plan agent, no edits). edit → throwaway worktree on a fix branch.
+        Returns our session handle id.
+        """
+        if mode not in ("read", "edit"):
+            raise ValueError(f"mode must be read|edit, got {mode}")
+        repo = Path(repo_path).resolve()
+        if not (repo / ".git").exists():
+            raise ValueError(f"not a git repo: {repo}")
+
+        branch = ""
+        base_repo = ""
+        workdir = repo
+        if mode == "edit":
+            name = session_name or f"s{int(time.time())}"
+            branch = f"argus/fix-{name}"
+            workdir = repo.parent / f"{repo.name}-wt-{name}"
+            base_repo = str(repo)
+            # ALWAYS branch from a fresh default branch (main), never from
+            # whatever the cache HEAD happens to be. Fetch first, then base the
+            # worktree on origin/<default> so the PR diff is clean against main.
+            base_ref = self._fresh_base_ref(repo)
+            r = subprocess.run(
+                ["git", "-C", str(repo), "worktree", "add", str(workdir),
+                 "-b", branch, base_ref],
+                capture_output=True, text=True, timeout=120,
+            )
+            if r.returncode != 0:
+                raise RuntimeError(f"worktree add failed: {r.stderr.strip()[:300]}")
+
+        port = _free_port()
+        self._write_provider_config(workdir)
+        proc = subprocess.Popen(
+            [self.opencode_bin, "serve", "--port", str(port), "--pure"],
+            cwd=str(workdir),
+            env=self._child_env(),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            _wait_healthy(port, SERVER_START_TIMEOUT)
+            oc_session = _http(port, "POST", "/session",
+                               {"title": session_name or f"argus-{mode}"})
+            sid = oc_session["id"]
+        except Exception:
+            proc.kill()
+            if mode == "edit":
+                self._remove_worktree(base_repo, workdir)
+            raise
+
+        cs = CodeSession(session_id=sid, mode=mode, repo_path=str(workdir),
+                         port=port, proc=proc, branch=branch, base_repo=base_repo)
+        self._sessions[sid] = cs
+        log.info(f"CodeAgent session {sid} started ({mode}, {workdir})")
+        return sid
+
+    def send(self, session_id: str, message: str) -> str:
+        """
+        Send one instruction/question; BLOCK until OpenCode finishes its
+        internal steps; return the assistant's text. The RCA agent reads it
+        and decides the next message.
+        """
+        cs = self._get(session_id)
+        if time.time() - cs.started_at > self.session_budget:
+            raise TimeoutError(
+                f"session budget exceeded ({self.session_budget}s) — end the session")
+
+        agent = "plan" if cs.mode == "read" else "build"
+        body = {
+            "model": {"providerID": self.provider_id, "modelID": self.model},
+            "agent": agent,
+            "parts": [{"type": "text", "text": message}],
+        }
+        cs.transcript.append({"role": "user", "text": message, "at": time.time()})
+        resp = _http(cs.port, "POST", f"/session/{session_id}/message",
+                     body, timeout=self.send_timeout)
+
+        err = (resp.get("info") or {}).get("error")
+        if err:
+            detail = (err.get("data") or {}).get("message") or err.get("name") or str(err)
+            raise RuntimeError(f"OpenCode error: {detail[:300]}")
+
+        texts = [p.get("text", "") for p in resp.get("parts", [])
+                 if p.get("type") == "text"]
+        answer = "\n".join(t for t in texts if t).strip() or "(no text response)"
+        cs.transcript.append({"role": "assistant", "text": answer, "at": time.time()})
+        return answer
+
+    def end(self, session_id: str) -> dict:
+        """
+        Close the session. edit mode → collect the diff from the worktree
+        (uncommitted + committed-on-branch vs base), then clean up.
+        Returns {mode, diff, branch, transcript_len}.
+        """
+        cs = self._get(session_id)
+        diff = ""
+        try:
+            if cs.mode == "edit":
+                diff = self._collect_diff(cs)
+        finally:
+            try:
+                cs.proc.kill()
+            except Exception:
+                pass
+            if cs.mode == "edit" and cs.base_repo:
+                self._remove_worktree(cs.base_repo, Path(cs.repo_path))
+            self._sessions.pop(session_id, None)
+        log.info(f"CodeAgent session {session_id} ended ({cs.mode}, diff={len(diff)} chars)")
+        return {"mode": cs.mode, "diff": diff, "branch": cs.branch,
+                "transcript_len": len(cs.transcript)}
+
+    def transcript(self, session_id: str) -> list:
+        """For checkpointing into investigations.code_session."""
+        return self._get(session_id).transcript
+
+    def session_info(self, session_id: str) -> dict:
+        """Worktree/branch/base for an edit session (used to open a PR before end)."""
+        cs = self._get(session_id)
+        return {"mode": cs.mode, "worktree": cs.repo_path,
+                "branch": cs.branch, "base_repo": cs.base_repo}
+
+    @staticmethod
+    def _fresh_base_ref(repo) -> str:
+        """Fetch origin and return origin/<default-branch> (main/master) so an
+        edit worktree always branches from the latest main. Falls back to HEAD
+        if origin is unreachable (offline tests / local bare remotes)."""
+        import subprocess as _sp
+        # Detect the default branch from origin's HEAD, default to main.
+        default = "main"
+        try:
+            r = _sp.run(["git", "-C", str(repo), "symbolic-ref",
+                         "refs/remotes/origin/HEAD"], capture_output=True, text=True, timeout=20)
+            if r.returncode == 0 and r.stdout.strip():
+                default = r.stdout.strip().rsplit("/", 1)[-1]
+        except Exception:
+            pass
+        try:
+            import os as _os
+            _env = {**_os.environ, "GIT_TERMINAL_PROMPT": "0"}  # fail fast offline
+            f = _sp.run(["git", "-C", str(repo), "fetch", "--quiet", "origin", default],
+                        capture_output=True, text=True, timeout=120, env=_env)
+            if f.returncode == 0:
+                # confirm the ref exists
+                v = _sp.run(["git", "-C", str(repo), "rev-parse", "--verify",
+                             f"origin/{default}"], capture_output=True, text=True, timeout=20)
+                if v.returncode == 0:
+                    return f"origin/{default}"
+        except Exception:
+            pass
+        return "HEAD"   # offline fallback
+
+    def commit_fix(self, session_id: str, message: str) -> dict:
+        """
+        Commit the edit session's staged changes onto its fix branch (so the
+        branch has a real commit to push) and return the diff + numstat.
+        """
+        cs = self._get(session_id)
+        if cs.mode != "edit":
+            return {"error": "not an edit session"}
+        wt = cs.repo_path
+        subprocess.run(["git", "-C", wt, "add", "-A"], capture_output=True, timeout=60)
+        # ALWAYS check what's staged — never blindly commit. Drop agent-infra /
+        # noise files that aren't part of the actual fix (so PRs contain only the
+        # code change). opencode.json is also git-excluded, this is belt-and-braces.
+        _NOISE = {"opencode.json", ".opencode", ".aider.conf.yml", ".env"}
+        staged = subprocess.run(["git", "-C", wt, "diff", "--cached", "--name-only"],
+                                capture_output=True, text=True, timeout=30).stdout.split()
+        dropped = [f for f in staged if f in _NOISE or f.startswith(".opencode/")]
+        for f in dropped:
+            subprocess.run(["git", "-C", wt, "reset", "-q", "--", f], capture_output=True, timeout=20)
+        kept = [f for f in staged if f not in dropped]
+        log.info(f"commit_fix staging: keep={kept} drop={dropped}")
+        # Anything (real) to commit?
+        st = subprocess.run(["git", "-C", wt, "diff", "--cached", "--name-only"],
+                            capture_output=True, text=True, timeout=30).stdout
+        if not st.strip():
+            return {"error": "no changes to commit (only agent-infra files were touched)"}
+        # Commit author/email from env (durable across re-clones); fall back to the
+        # repo's configured identity. Never GPG-sign — the agent has no signing key.
+        _name = os.environ.get("VK_GIT_AUTHOR_NAME", "")
+        _email = os.environ.get("VK_GIT_AUTHOR_EMAIL", "")
+        _ident = []
+        if _name:
+            _ident += ["-c", f"user.name={_name}"]
+        if _email:
+            _ident += ["-c", f"user.email={_email}"]
+        c = subprocess.run(["git", "-C", wt, *_ident, "-c", "commit.gpgsign=false",
+                            "commit", "-m", message],
+                           capture_output=True, text=True, timeout=60)
+        if c.returncode != 0:
+            return {"error": f"commit failed: {c.stderr.strip()[:200]}"}
+        diff = subprocess.run(["git", "-C", wt, "diff", "HEAD~1", "HEAD"],
+                              capture_output=True, text=True, timeout=60).stdout
+        numstat = subprocess.run(["git", "-C", wt, "diff", "--numstat", "HEAD~1", "HEAD"],
+                                 capture_output=True, text=True, timeout=60).stdout
+        files = 0
+        lines = 0
+        for row in numstat.strip().splitlines():
+            parts = row.split("\t")
+            if len(parts) >= 2:
+                files += 1
+                for n in parts[:2]:
+                    if n.isdigit():
+                        lines += int(n)
+        return {"branch": cs.branch, "worktree": wt, "diff": diff,
+                "diff_files": files, "diff_lines": lines}
+
+    # ── Internals ─────────────────────────────────────────────────────────────
+
+    def _get(self, session_id: str) -> CodeSession:
+        cs = self._sessions.get(session_id)
+        if cs is None:
+            raise KeyError(f"unknown code session: {session_id}")
+        if cs.proc.poll() is not None:
+            raise RuntimeError(f"OpenCode server for {session_id} died")
+        return cs
+
+    def _child_env(self) -> dict:
+        import os
+        env = dict(os.environ)
+        env["VK_GATEWAY_KEY"] = self.api_key  # consumed via {env:...} in config
+        return env
+
+    def _write_provider_config(self, workdir: Path) -> None:
+        """
+        Project-scoped opencode.json pointing at the gateway. The key is an
+        env reference — it never lands on disk.
+        Skipped if the project already has an opencode.json (e.g. tests).
+        """
+        cfg_path = workdir / "opencode.json"
+        if cfg_path.exists():
+            return
+        if not self.api_base:
+            # No gateway configured — OpenCode would fail with "No api key passed
+            # in". In prod api_base resolves from config/VK_API_BASE; if it's
+            # genuinely empty, warn loudly (tests use a self-contained fake binary
+            # that needs no provider config, so don't hard-fail).
+            log.warning("code_session: no api_base — OpenCode has no LLM gateway "
+                        "(set toolsets.code_session.config.api_base or VK_API_BASE)")
+            return
+        cfg = {
+            "$schema": "https://opencode.ai/config.json",
+            "provider": {
+                self.provider_id: {
+                    "npm": "@ai-sdk/openai-compatible",
+                    "name": "VK Gateway",
+                    "options": {
+                        "baseURL": self.api_base,
+                        "apiKey": "{env:VK_GATEWAY_KEY}",
+                    },
+                    "models": {self.model: {"name": self.model}},
+                }
+            },
+            "model": f"{self.provider_id}/{self.model}",
+        }
+        cfg_path.write_text(json.dumps(cfg, indent=2))
+        # Keep this gateway config OUT of any commit/PR — it's agent infra, not a
+        # code change. Add it to the worktree's git exclude so `git add -A` skips it.
+        try:
+            gp = subprocess.run(["git", "-C", str(workdir), "rev-parse", "--git-path", "info/exclude"],
+                                capture_output=True, text=True, timeout=20)
+            ep = gp.stdout.strip()
+            if ep:
+                ep_path = Path(ep) if Path(ep).is_absolute() else (workdir / ep)
+                ep_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(ep_path, "a") as f:
+                    f.write("\nopencode.json\n")
+        except Exception as e:
+            log.debug(f"could not exclude opencode.json: {e}")
+
+    def _collect_diff(self, cs: CodeSession) -> str:
+        """Everything the session changed: stage all (captures new files), diff vs HEAD."""
+        wt = cs.repo_path
+        subprocess.run(["git", "-C", wt, "add", "-A"], capture_output=True, timeout=60)
+        r = subprocess.run(
+            ["git", "-C", wt, "diff", "--cached", "HEAD"],
+            capture_output=True, text=True, timeout=60)
+        return r.stdout
+
+    @staticmethod
+    def _remove_worktree(base_repo: str, workdir: Path) -> None:
+        try:
+            subprocess.run(
+                ["git", "-C", base_repo, "worktree", "remove", "--force", str(workdir)],
+                capture_output=True, timeout=60,
+            )
+        except Exception as e:
+            log.warning(f"worktree cleanup failed for {workdir}: {e}")
+
+
+# ── HTTP helpers ──────────────────────────────────────────────────────────────
+
+def _free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _wait_healthy(port: int, timeout: int) -> None:
+    deadline = time.time() + timeout
+    last_err = None
+    while time.time() < deadline:
+        try:
+            _http(port, "GET", "/global/health", timeout=3)
+            return
+        except Exception as e:
+            last_err = e
+            time.sleep(0.4)
+    raise TimeoutError(f"opencode serve not healthy after {timeout}s: {last_err}")
+
+
+def _http(port: int, method: str, path: str, body: dict | None = None,
+          timeout: int = 30) -> dict:
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}{path}",
+        method=method,
+        data=json.dumps(body).encode() if body is not None else None,
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = resp.read()
+    return json.loads(data) if data else {}

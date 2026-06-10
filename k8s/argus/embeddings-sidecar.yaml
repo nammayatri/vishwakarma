@@ -1,0 +1,43 @@
+# OPTIONAL — Option B: a shared embeddings server (instead of in-process local).
+# Run HuggingFace text-embeddings-inference as a Deployment + Service; point
+# the agent at it with embeddings.api_base = http://argus-embeddings.argus:80/v1
+# (provider=api). No agent code change — it's just an OpenAI-compatible endpoint.
+#
+# Option A (in-process, simpler) needs NONE of this — set provider=local +
+# local_model in the configmap and `pip install fastembed` is already in the
+# image. Use this sidecar only if you want one shared embedder across pods or
+# GPU acceleration.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: argus-embeddings
+  namespace: argus
+  labels: { app: argus-embeddings }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: argus-embeddings }
+  template:
+    metadata:
+      labels: { app: argus-embeddings }
+    spec:
+      containers:
+        - name: tei
+          image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.5
+          args: ["--model-id", "BAAI/bge-small-en-v1.5", "--port", "80"]
+          ports:
+            - containerPort: 80
+          resources:
+            requests: { cpu: "1", memory: 2Gi }
+            limits: { cpu: "2", memory: 4Gi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: argus-embeddings
+  namespace: argus
+spec:
+  selector: { app: argus-embeddings }
+  ports:
+    - port: 80
+      targetPort: 80
