@@ -26,7 +26,7 @@ _DOMAIN_TOOLSETS: dict[str, set[str]] = {
     "streaming": {"kafka"},
     "cloud": {"aws"},
     "network": {"internet", "http"},
-    "tickets": {"servicenow_tables", "cloud_alerts"},
+    "tickets": {"servicenow_tables"},
 }
 
 _DOMAIN_KEYWORDS: dict[str, tuple[str, ...]] = {
