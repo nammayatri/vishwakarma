@@ -128,6 +128,18 @@ HIGH / MEDIUM / LOW — <reason for confidence level>
 ## Immediate Fix
 <exact command or action to resolve right now, or "No action needed — self-resolved" if already cleared>
 
+## Code Fix
+<If the root cause is in application code (a bug — bad query/missing ON CONFLICT,
+unhandled case, wrong constraint, regression from a deploy, etc.):
+You MUST attempt the actual fix, not just describe it. After locating the code
+with code_search/code_semantic_search/stacktrace_to_source on the repo:
+  1. `code_session_start(repo=backend, mode=edit)`
+  2. `code_session_send` — instruct the coding agent to make the precise change.
+  3. `propose_fix(...)` — generate a DRAFT PR (or a scored propose-only diff).
+Then put the PR link / diff here. "Recommending a fix in prose is NOT enough —
+open the code_session and call propose_fix." If it is NOT a code bug (infra/
+config/data), write "N/A — not a code fix" and say what to change instead.>
+
 ## Prevention
 <what change prevents recurrence>
 
