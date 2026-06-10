@@ -175,6 +175,12 @@ def create_app(config=None) -> FastAPI:
 
     # ── /healthz ──────────────────────────────────────────────────────────────
 
+    @app.get("/", include_in_schema=False)
+    async def _root_redirect():
+        # Bare URL → the console (so Pomerium's https://argus…/ lands on the UI).
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse(url="/console")
+
     @app.get("/healthz", include_in_schema=False)
     async def healthz():
         return {"status": "ok"}
