@@ -85,14 +85,26 @@ export default function InvestigationDetail() {
         </button>
         {showTranscript && (
           <div className="space-y-2 max-h-[36rem] overflow-y-auto">
-            {msgs.map((m, i) => (
+            {msgs.map((m: any, i: number) => (
               <div key={i} className="border border-zinc-800 rounded-lg p-2">
-                <div className="text-xs text-zinc-500 mb-1">{m.role}</div>
-                <pre className="text-xs whitespace-pre-wrap text-zinc-300">
-                  {typeof m.content === "string"
-                    ? m.content.slice(0, 4000)
-                    : JSON.stringify(m.content)?.slice(0, 4000)}
-                </pre>
+                <div className="text-xs text-zinc-500 mb-1">
+                  {m.role}
+                  {m.tool_calls?.length ? ` · ${m.tool_calls.length} tool call(s)` : ""}
+                </div>
+                {m.content ? (
+                  <pre className="text-xs whitespace-pre-wrap text-zinc-300">
+                    {typeof m.content === "string"
+                      ? m.content.slice(0, 4000)
+                      : JSON.stringify(m.content)?.slice(0, 4000)}
+                  </pre>
+                ) : null}
+                {/* Assistant actions live in tool_calls — render them so the
+                    transcript shows what the agent DID, not empty boxes. */}
+                {m.tool_calls?.map((tc: any, j: number) => (
+                  <pre key={j} className="text-xs whitespace-pre-wrap text-emerald-300">
+                    → {tc.function?.name}({(tc.function?.arguments || "").slice(0, 400)})
+                  </pre>
+                ))}
               </div>
             ))}
           </div>

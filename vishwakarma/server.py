@@ -527,10 +527,19 @@ async def _resume_investigation(config, state, inv: dict) -> None:
     engine.max_steps = max(int(inv.get("step") or 0) + 25, 30)
     question = inc.get("question") or inc.get("title") or "Resume investigation"
     final = ""
+    from vishwakarma.core import eventbus
     try:
         for ev in engine.stream_investigate(question=question, incident_id=incident_id,
                                              resume_messages=messages):
-            if ev.get("type") in ("done", "max_steps_reached"):
+            et = ev.get("type", "")
+            # Stream resumed-investigation events to the console UI too (SSE).
+            if et in ("tool_call_start", "tool_call_result", "hypothesis",
+                      "compaction", "status", "done", "max_steps_reached"):
+                try:
+                    eventbus.publish(incident_id, {k: v for k, v in ev.items() if k != "messages"})
+                except Exception:
+                    pass
+            if et in ("done", "max_steps_reached"):
                 final = ev.get("content", "") or final
     except Exception as e:
         log.error(f"Reaper: resume failed for {incident_id[:8]}: {e}")
