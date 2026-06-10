@@ -579,6 +579,7 @@ class InvestigationEngine:
         compactions = 0
         tool_call_counter = 0
         all_stream_tool_outputs: list[ToolOutput] = []
+        _zero_tool_nudged = False   # refuse a final RCA before ANY investigation
         decisions = {d.tool_call_id: d for d in (approval_decisions or [])}
 
         system = build_system_prompt(
@@ -759,8 +760,28 @@ class InvestigationEngine:
                     return
 
                 if not collected_tool_calls:
-                    # No tool calls — LLM is done. Cancel any stray overlap futures
-                    # (shouldn't happen, but defensive).
+                    # Refuse to conclude before ANY investigation. If the model
+                    # tries to write an RCA from the alert/error text alone (0
+                    # tools run), push it to actually investigate + propose a fix.
+                    if not all_stream_tool_outputs and not _zero_tool_nudged:
+                        _zero_tool_nudged = True
+                        messages.append({"role": "assistant", "content": collected_content})
+                        messages.append({"role": "user", "content": (
+                            "You have NOT run any tools yet — you cannot write an RCA from the "
+                            "error text alone. INVESTIGATE now and VERIFY:\n"
+                            "1. Confirm the failure with real data — `db_query` the offending "
+                            "row(s)/constraint, check `pg_stat_activity`, and/or pull the pod "
+                            "logs (`kubectl -n atlas logs …`, the istio request-id trace).\n"
+                            "2. If a code change can fix it (e.g. a bad upsert / missing "
+                            "ON CONFLICT / wrong constraint handling), FIND the handler with "
+                            "`code_search`/`code_semantic_search` on repo `backend`, then open a "
+                            "`code_session` and `propose_fix` (draft PR) or state the exact "
+                            "file+change.\n"
+                            "Run the tools — do not answer until you have real evidence."
+                        )})
+                        yield {"type": "status", "message": "0 tools run — directing the agent to investigate + propose a fix before concluding"}
+                        continue
+                    # Genuinely done (tools were run, or already nudged once).
                     for f in overlap_futures.values():
                         f.cancel()
                     messages.append({"role": "assistant", "content": collected_content})

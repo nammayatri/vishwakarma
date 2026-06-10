@@ -81,8 +81,12 @@ class ArgusBot:
 
         # Explicit `debug …` always investigates, skipping every filter.
         explicit_debug = bool(re.match(r"^\s*debug\b", clean, re.IGNORECASE))
+        # A screenshot/image attached = a reported issue (e.g. an OA-screen bug) —
+        # never treat as trivial.
+        has_image = any(str(f.get("mimetype", "")).startswith("image/")
+                        for f in (event.get("files") or []))
 
-        if not explicit_debug:
+        if not explicit_debug and not has_image:
             # Trivial greeting / capability question / chit-chat → quick reply,
             # NOT a full investigation. Applies to BOTH direct @Argus and @mre
             # (this is the "@Argus hi" fix — don't burn an RCA on a greeting).
