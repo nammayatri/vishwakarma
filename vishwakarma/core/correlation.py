@@ -63,7 +63,43 @@ def correlation_key(labels: dict) -> str:
     cluster = norm(labels.get("cluster") or labels.get("cluster_name"))
     if cluster:
         return f"cluster:{cluster}"
+    # Fallback: many alerts carry only `alertname` (no service/namespace), e.g.
+    # GCPDriverDrainerNotProcessing + GCPNoDriverDrainerRunning are one incident.
+    # Group by the alertname's core entity tokens (cloud/state words stripped).
+    stem = _alertname_stem(labels.get("alertname", ""))
+    if stem:
+        return f"alert:{stem}"
     return ""   # too vague to correlate
+
+
+# Tokens that don't identify the SUBSYSTEM — stripped so different states of the
+# same entity share a stem (Running/NotProcessing/High/Low/...).
+_STEM_NOISE = {
+    "gcp", "aws", "prod", "production", "staging", "no", "not", "is", "are",
+    "the", "a", "high", "low", "critical", "warning", "sev1", "sev2", "sev3",
+    "increasing", "decreasing", "rising", "dropped", "drop", "down", "up",
+    "running", "processing", "dead", "alive", "failing", "failed", "failure",
+    "error", "errors", "alert", "alerts", "issue", "problem", "pod", "pods",
+    "count", "rate", "ratio", "percent", "usage", "exceeded", "threshold",
+}
+
+
+def _alertname_stem(alertname: str) -> str:
+    """Core entity tokens of an alertname, sorted+joined. Needs >=2 to group
+    (one generic token like 'redis' is too broad → '')."""
+    import re
+    if not alertname:
+        return ""
+    # split camelCase + separators: GCPDriverDrainerNotProcessing -> tokens
+    parts = re.findall(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z0-9]+|[A-Z]+", alertname)
+    toks = [p.lower() for p in parts if p]
+    sig = [t for t in toks if t not in _STEM_NOISE and len(t) > 1]
+    # dedup preserve, then sort for order-independence
+    seen = []
+    for t in sig:
+        if t not in seen:
+            seen.append(t)
+    return "+".join(sorted(seen)) if len(seen) >= 2 else ""
 
 
 def find_correlated(key: str) -> str | None:

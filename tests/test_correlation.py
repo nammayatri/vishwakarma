@@ -52,6 +52,18 @@ def test_empty_key_never_correlates(db):
     assert c.find_correlated("") is None
 
 
+def test_alertname_stem_fallback_groups_label_less_alerts():
+    """Real case: drainer alerts with only alertname (no svc/ns) must group."""
+    from vishwakarma.core.correlation import correlation_key as k
+    a = k({"alertname": "GCPDriverDrainerNotProcessing", "severity": "critical"})
+    b = k({"alertname": "GCPNoDriverDrainerRunning", "severity": "critical"})
+    assert a == b == "alert:drainer+driver"      # grouped via stem
+    assert k({"alertname": "RedisHighCPU"}) != k({"alertname": "RedisHighMemory"})
+    assert k({"alertname": "Down"}) == ""        # single generic token → no group
+    assert k({"service": "driver", "namespace": "atlas",
+              "alertname": "Whatever"}) == "svc:driver/atlas"   # labels win
+
+
 def test_record_and_list_correlated(db):
     from vishwakarma.core import correlation as c
     c.record_correlated_alert("inc-1", "High latency", {"service": "driver"})

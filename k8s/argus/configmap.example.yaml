@@ -11,7 +11,7 @@ data:
   config.yaml: |
     llm:
       model: openai/open-large
-      fast_model: openai/glm-latest        # open-fast was timing out; glm-latest is stable
+      fast_model: openai/open-large   # glm-latest was 400-erroring on compression; open-large is reliable
       api_base: https://llm-gateway.example.com
       # api_keys come from VK_API_KEYS (comma-separated) in argus-secrets — the
       # key pool round-robins across them + backs off on 429.
