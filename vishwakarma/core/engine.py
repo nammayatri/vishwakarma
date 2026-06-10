@@ -550,6 +550,7 @@ class InvestigationEngine:
         pre_investigation_findings: str | None = None,
         incident_id: str | None = None,
         tool_subset: set[str] | None = None,
+        resume_messages: list[dict] | None = None,
     ) -> Generator[dict, None, None]:
         """
         Stream investigation events as they happen.
@@ -590,12 +591,19 @@ class InvestigationEngine:
             extra_prompt=extra_system_prompt,
             all_toolsets=self.all_toolsets,
         )
-        messages = build_messages(
-            question=question,
-            history=history or [],
-            system_prompt=system,
-            images=images,
-        )
+        if resume_messages:
+            # Durable resume: continue EXACTLY from the checkpointed conversation
+            # (system + question + all prior tool turns are already inside it), so
+            # a killed investigation picks up where it stopped instead of restarting.
+            messages = list(resume_messages)
+            log.info(f"Resuming investigation from checkpoint ({len(messages)} messages)")
+        else:
+            messages = build_messages(
+                question=question,
+                history=history or [],
+                system_prompt=system,
+                images=images,
+            )
 
         # Inject sub-agent findings before the main loop starts.
         if pre_investigation_findings:

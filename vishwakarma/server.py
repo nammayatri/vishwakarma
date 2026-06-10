@@ -171,6 +171,21 @@ def create_app(config=None) -> FastAPI:
         _state["toolset_manager"] = config.make_toolset_manager()
         _state["toolset_manager"].check_all()
 
+        # All-in-one durable-job reaper: resume investigations orphaned by a pod
+        # restart / node scale-down (the orchestrator/executor topology uses Redis
+        # XAUTOCLAIM instead, so skip there).
+        if getattr(config, "role", "") in ("", "all-in-one"):
+            async def _reaper_loop():
+                await asyncio.sleep(25)   # let startup settle
+                while True:
+                    try:
+                        await _reap_orphans(config, _state)
+                    except Exception as e:
+                        log.debug(f"Reaper loop: {e}")
+                    await asyncio.sleep(300)   # sweep every 5 min
+            asyncio.create_task(_reaper_loop())
+            log.info("Durable-job reaper started (resumes orphaned investigations)")
+
         log.info(f"Vishwakarma server ready (role={getattr(config, 'role', '') or 'all-in-one'})")
 
     # ── /healthz ──────────────────────────────────────────────────────────────
@@ -460,6 +475,80 @@ async def _run_alert_investigation(config, state, issue, incident_id: str, finge
 
     async with semaphore:
         await _do_investigation(config, state, issue, incident_id, fingerprint)
+
+
+async def _resume_investigation(config, state, inv: dict) -> None:
+    """Resume one orphaned investigation from its last checkpoint — continue the
+    engine from the saved messages, then post + finish. Killed runs pick up where
+    they stopped instead of being stranded at 'running' forever."""
+    import socket
+    from vishwakarma.storage.investigations import claim_investigation, finish_investigation
+    from vishwakarma.storage.queries import get_incident, save_incident
+    incident_id = inv["id"]
+    messages = inv.get("messages")
+    inc = get_incident(incident_id) or {}
+    if not messages or not isinstance(messages, list):
+        finish_investigation(incident_id, "failed")
+        log.warning(f"Reaper: {incident_id[:8]} has no checkpoint — marked failed")
+        return
+    claim_investigation(incident_id, worker_id=socket.gethostname())
+    log.info(f"Reaper: resuming {incident_id[:8]} from step {inv.get('step')} ({len(messages)} msgs)")
+    tm = state.get("toolset_manager")
+    llm = config.make_llm()
+    engine = config.make_engine(llm=llm, toolset_manager=tm)
+    engine.max_steps = max(int(inv.get("step") or 0) + 25, 30)
+    question = inc.get("question") or inc.get("title") or "Resume investigation"
+    final = ""
+    try:
+        for ev in engine.stream_investigate(question=question, incident_id=incident_id,
+                                             resume_messages=messages):
+            if ev.get("type") in ("done", "max_steps_reached"):
+                final = ev.get("content", "") or final
+    except Exception as e:
+        log.error(f"Reaper: resume failed for {incident_id[:8]}: {e}")
+        finish_investigation(incident_id, "failed")
+        return
+    labels = inc.get("labels") or {}
+    if final:
+        try:
+            save_incident(incident_id=incident_id, title=inc.get("title", "Resumed RCA"),
+                          question=question, analysis=final, source=inc.get("source", ""),
+                          severity=inc.get("severity", "high"), labels=labels, tool_outputs=[])
+        except Exception as e:
+            log.debug(f"Reaper: save failed: {e}")
+        ch = labels.get("slack_channel")
+        if config.is_slack_configured() and ch:
+            try:
+                from vishwakarma.plugins.relays.slack.plugin import SlackDestination
+                SlackDestination({"token": config.slack_bot_token}).post_investigation(
+                    title=f"{inc.get('title', 'RCA')} (resumed)", analysis=final,
+                    source=inc.get("source", ""), severity=inc.get("severity", "high"),
+                    incident_id=incident_id, thread_ts=labels.get("slack_thread_ts"), channel=ch)
+            except Exception as e:
+                log.debug(f"Reaper: slack post failed: {e}")
+    finish_investigation(incident_id, "done")
+    log.info(f"Reaper: {incident_id[:8]} resumed + completed")
+
+
+async def _reap_orphans(config, state, stale_seconds: int = 600) -> None:
+    """Find investigations whose worker stopped heartbeating (pod died / scaled down)
+    and resume them. Skips ones the CURRENT pod is actively running."""
+    import socket
+    from vishwakarma.storage.investigations import find_orphaned
+    try:
+        orphans = find_orphaned(stale_seconds=stale_seconds, limit=10)
+    except Exception as e:
+        log.debug(f"Reaper: scan failed: {e}")
+        return
+    me = socket.gethostname()
+    for inv in orphans:
+        if inv.get("worker_id") == me:
+            continue   # our own (possibly slow) live run — not an orphan
+        log.info(f"Reaper: orphan {inv['id'][:8]} (worker={inv.get('worker_id')}, step={inv.get('step')})")
+        try:
+            await _resume_investigation(config, state, inv)
+        except Exception as e:
+            log.error(f"Reaper: error resuming {inv['id'][:8]}: {e}")
 
 
 def _extract_pr_url(tool_outputs) -> str:

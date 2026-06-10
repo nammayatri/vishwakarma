@@ -46,12 +46,14 @@ class ArgusBot:
         dispatch: Callable[[dict], str],     # returns incident_id
         classify: Callable[[str], bool],     # True = real issue report
         say: Callable[[str, str, str], None] | None = None,  # (channel, thread_ts, text)
+        fetch_thread: Callable[[str, str], list[str]] | None = None,  # (channel, thread_ts) -> messages
     ):
         self.mre_group_id = mre_group_id
         self.bot_user_id = bot_user_id
         self.dispatch = dispatch
         self.classify = classify
         self.say = say or (lambda *_: None)
+        self.fetch_thread = fetch_thread
         self._seen: dict[str, float] = {}
 
     # ── Decision logic ────────────────────────────────────────────────────────
@@ -131,11 +133,26 @@ class ArgusBot:
             for f in (event.get("files") or [])
             if str(f.get("mimetype", "")).startswith("image/") and f.get("url_private")
         ]
+        # If mentioned INSIDE an existing thread, pull the whole discussion so the
+        # RCA has the full context of what's been reported/tried, not just the @mention.
+        description = clean_text
+        thread_ts = event.get("thread_ts")
+        if thread_ts and thread_ts != event.get("ts") and self.fetch_thread:
+            try:
+                msgs = self.fetch_thread(event.get("channel", ""), thread_ts)
+                if msgs:
+                    convo = "\n".join(msgs)[:6000]
+                    description = (
+                        f"{clean_text}\n\n--- Full Slack thread (the ongoing discussion "
+                        f"this was raised in — use it as context for the RCA) ---\n{convo}"
+                    )
+            except Exception as e:
+                log.debug(f"Argus thread fetch failed: {e}")
         return {
             "id": str(uuid.uuid4()),
             "title": title,
             "source": "slack-argus",
-            "description": clean_text,
+            "description": description,
             "severity": "high",
             "labels": {
                 "slack_channel": event.get("channel", ""),
@@ -258,6 +275,24 @@ def make_dispatcher(config) -> Callable[[dict], str]:
     return dispatch
 
 
+def _fetch_thread_msgs(client, channel: str, thread_ts: str, bot_user_id: str) -> list[str]:
+    """Return the thread's messages as '<user>: text' lines (oldest→newest), so an
+    @Argus mention inside a thread investigates with the whole discussion as context."""
+    try:
+        resp = client.conversations_replies(channel=channel, ts=thread_ts, limit=100)
+    except Exception:
+        return []
+    out: list[str] = []
+    for m in resp.get("messages", []):
+        txt = (m.get("text") or "").strip()
+        if not txt:
+            continue
+        who = m.get("user") or m.get("username") or m.get("bot_id") or "?"
+        who = "Argus" if who == bot_user_id else who
+        out.append(f"<{who}>: {txt}")
+    return out
+
+
 def start_argus(config) -> None:
     """Start the Argus Slack app (Socket Mode) in a background thread."""
     bot_token = getattr(config, "argus_bot_token", "")
@@ -281,6 +316,7 @@ def start_argus(config) -> None:
         classify=make_classifier(llm),
         say=lambda ch, ts, text: app.client.chat_postMessage(
             channel=ch, thread_ts=ts, text=text),
+        fetch_thread=lambda ch, tts: _fetch_thread_msgs(app.client, ch, tts, bot_user_id),
     )
 
     @app.event("message")
