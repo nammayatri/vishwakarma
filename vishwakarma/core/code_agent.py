@@ -243,11 +243,22 @@ class OpenCodeAgent:
             return {"error": "not an edit session"}
         wt = cs.repo_path
         subprocess.run(["git", "-C", wt, "add", "-A"], capture_output=True, timeout=60)
-        # Anything to commit?
-        st = subprocess.run(["git", "-C", wt, "status", "--porcelain"],
+        # ALWAYS check what's staged — never blindly commit. Drop agent-infra /
+        # noise files that aren't part of the actual fix (so PRs contain only the
+        # code change). opencode.json is also git-excluded, this is belt-and-braces.
+        _NOISE = {"opencode.json", ".opencode", ".aider.conf.yml", ".env"}
+        staged = subprocess.run(["git", "-C", wt, "diff", "--cached", "--name-only"],
+                                capture_output=True, text=True, timeout=30).stdout.split()
+        dropped = [f for f in staged if f in _NOISE or f.startswith(".opencode/")]
+        for f in dropped:
+            subprocess.run(["git", "-C", wt, "reset", "-q", "--", f], capture_output=True, timeout=20)
+        kept = [f for f in staged if f not in dropped]
+        log.info(f"commit_fix staging: keep={kept} drop={dropped}")
+        # Anything (real) to commit?
+        st = subprocess.run(["git", "-C", wt, "diff", "--cached", "--name-only"],
                             capture_output=True, text=True, timeout=30).stdout
         if not st.strip():
-            return {"error": "no changes to commit"}
+            return {"error": "no changes to commit (only agent-infra files were touched)"}
         c = subprocess.run(["git", "-C", wt, "commit", "-m", message],
                            capture_output=True, text=True, timeout=60)
         if c.returncode != 0:
@@ -317,6 +328,19 @@ class OpenCodeAgent:
             "model": f"{self.provider_id}/{self.model}",
         }
         cfg_path.write_text(json.dumps(cfg, indent=2))
+        # Keep this gateway config OUT of any commit/PR — it's agent infra, not a
+        # code change. Add it to the worktree's git exclude so `git add -A` skips it.
+        try:
+            gp = subprocess.run(["git", "-C", str(workdir), "rev-parse", "--git-path", "info/exclude"],
+                                capture_output=True, text=True, timeout=20)
+            ep = gp.stdout.strip()
+            if ep:
+                ep_path = Path(ep) if Path(ep).is_absolute() else (workdir / ep)
+                ep_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(ep_path, "a") as f:
+                    f.write("\nopencode.json\n")
+        except Exception as e:
+            log.debug(f"could not exclude opencode.json: {e}")
 
     def _collect_diff(self, cs: CodeSession) -> str:
         """Everything the session changed: stage all (captures new files), diff vs HEAD."""
