@@ -102,7 +102,7 @@ def test_unconfigured_returns_error(repo_with_fix):
 def test_parse_owner_repo():
     from vishwakarma.core.pr_creator import parse_owner_repo
     assert parse_owner_repo("https://github.com/your-org/backend.git") == \
-        ("example-app", "example-app")
+        ("your-org", "backend")
     assert parse_owner_repo("git@github.com:org/repo.git") == ("org", "repo")
     assert parse_owner_repo("not-a-url") is None
 
