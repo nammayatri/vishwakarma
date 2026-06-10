@@ -683,6 +683,16 @@ class InvestigationEngine:
 
         try:
             for step in range(self.max_steps):
+                # Cooperative cancellation — the user aborted this investigation.
+                if incident_id:
+                    from vishwakarma.core.aborts import is_aborted
+                    if is_aborted(incident_id):
+                        log.info(f"Investigation {incident_id[:8]} aborted by user at step {step+1}")
+                        _checkpoint(step + 1)
+                        yield {"type": "done", "content": "Investigation aborted by user.",
+                               "aborted": True, "messages": messages}
+                        return
+
                 # Checkpoint: at step 20, force the LLM to decide RCA-or-continue
                 if self._should_verify(step, checkpoint_injected_stream):
                     checkpoint_injected_stream = step

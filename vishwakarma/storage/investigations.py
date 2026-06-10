@@ -19,7 +19,8 @@ log = logging.getLogger(__name__)
 
 MAX_ATTEMPTS = 3  # after this many claims, mark failed instead of retrying
 
-VALID_STATUSES = {"queued", "running", "awaiting_fix_review", "done", "failed"}
+VALID_STATUSES = {"queued", "running", "awaiting_fix_review", "done", "failed",
+                  "aborting", "aborted"}
 
 
 def create_investigation(
@@ -135,14 +136,15 @@ def heartbeat(incident_id: str) -> None:
 
 
 def finish_investigation(incident_id: str, status: str = "done") -> None:
-    """Mark terminal state. messages are kept for the incident record/UI."""
+    """Mark terminal state. messages are kept for the incident record/UI.
+    NEVER overwrites a user 'aborted' state — aborted stays aborted forever."""
     if status not in VALID_STATUSES:
         raise ValueError(f"invalid status {status}")
     now = time.time()
     conn = _get_conn()
     with _lock:
         conn.execute(
-            "UPDATE investigations SET status=?, updated_at=? WHERE id=?",
+            "UPDATE investigations SET status=?, updated_at=? WHERE id=? AND status != 'aborted'",
             (status, now, incident_id),
         )
         conn.commit()

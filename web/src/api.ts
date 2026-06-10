@@ -93,6 +93,10 @@ export const api = {
   investigations: (status?: string) =>
     req<Investigation[]>(`/investigations${status ? `?status=${status}` : ""}`),
   investigation: (id: string) => req<Investigation>(`/investigations/${id}`),
+  abortInvestigation: (id: string) =>
+    req(`/investigations/${id}/abort`, { method: "POST" }),
+  retryInvestigation: (id: string) =>
+    req(`/investigations/${id}/retry`, { method: "POST" }),
   incidents: (q?: string) =>
     req<Incident[]>(`/incidents${q ? `?q=${encodeURIComponent(q)}` : ""}`),
   incident: (id: string) => req<Incident>(`/incidents/${id}`),

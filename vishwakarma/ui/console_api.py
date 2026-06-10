@@ -147,6 +147,64 @@ def create_console_router(config, state: dict) -> APIRouter:
             inv["correlated_alerts"] = []
         return inv
 
+    @router.post("/investigations/{incident_id}/abort")
+    async def abort_investigation(incident_id: str, role: str = admin):
+        """Stop a running investigation — the engine halts at the next step."""
+        from vishwakarma.core.aborts import request_abort
+        from vishwakarma.storage.investigations import get_investigation
+        inv = get_investigation(incident_id)
+        if not inv:
+            raise HTTPException(404, "investigation not found")
+        if inv.get("status") not in ("running", "queued"):
+            return {"status": inv.get("status"), "note": "not running — nothing to abort"}
+        request_abort(incident_id)
+        # Mark TERMINAL 'aborted' — the reaper only resumes 'running', so an
+        # aborted investigation is never restarted (by reaper, deploy, or retry).
+        try:
+            import time as _t
+            from vishwakarma.storage.db import _get_conn, _lock
+            with _lock:
+                conn = _get_conn()
+                conn.execute("UPDATE investigations SET status='aborted', updated_at=? WHERE id=?",
+                             (_t.time(), incident_id))
+                conn.commit()
+        except Exception:
+            pass
+        return {"status": "aborted", "incident_id": incident_id}
+
+    @router.post("/investigations/{incident_id}/retry")
+    async def retry_investigation(incident_id: str, role: str = admin):
+        """Re-run an investigation fresh — re-fires the original alert through the pipeline."""
+        import json as _json
+        from vishwakarma.storage.queries import get_incident
+        from vishwakarma.storage.investigations import get_investigation
+        inv = get_investigation(incident_id)
+        if inv and inv.get("status") == "aborted":
+            raise HTTPException(409, "investigation was aborted — it will not be restarted")
+        inc = get_incident(incident_id)
+        if not inc:
+            raise HTTPException(404, "incident not found")
+        labels = inc.get("labels") or {}
+        if isinstance(labels, str):
+            try:
+                labels = _json.loads(labels)
+            except Exception:
+                labels = {}
+        if not labels.get("alertname"):
+            labels["alertname"] = inc.get("title", "RetryInvestigation")[:80]
+        summary = inc.get("question") or inc.get("title") or "Retry investigation"
+        payload = {"alerts": [{"status": "firing", "labels": labels,
+                               "annotations": {"summary": summary}}]}
+        try:
+            import urllib.request
+            req = urllib.request.Request("http://localhost:5050/api/alertmanager",
+                                         data=_json.dumps(payload).encode(),
+                                         headers={"Content-Type": "application/json"})
+            resp = _json.load(urllib.request.urlopen(req, timeout=30))
+            return {"status": "retriggered", "result": resp}
+        except Exception as e:
+            raise HTTPException(500, f"retry failed: {e}")
+
     # ── Incident history ──────────────────────────────────────────────────────
 
     @router.get("/incidents")

@@ -65,6 +65,30 @@ export default function InvestigationDetail() {
           step {inv.step ?? 0} · attempt {inv.attempt ?? 0} · worker {inv.worker_id || "—"} ·{" "}
           <Ago ts={inv.updated_at} />
         </span>
+        <div className="ml-auto flex gap-2">
+          {(inv.status === "running" || inv.status === "queued") && (
+            <button
+              className="btn text-red-300 border-red-800"
+              onClick={() => {
+                if (!id || !confirm("Abort this investigation? It will not be restarted.")) return;
+                api.abortInvestigation(id).then(() => api.investigation(id).then(setInv)).catch((e) => setError(String(e)));
+              }}
+            >
+              ⏹ Abort
+            </button>
+          )}
+          {inv.status !== "aborted" && inv.status !== "running" && inv.status !== "queued" && (
+            <button
+              className="btn"
+              onClick={() => {
+                if (!id) return;
+                api.retryInvestigation(id).then(() => alert("Re-triggered — a fresh investigation has started.")).catch((e) => setError(String(e)));
+              }}
+            >
+              ↻ Retry
+            </button>
+          )}
+        </div>
       </div>
 
       <Card title="Live events (SSE)">
