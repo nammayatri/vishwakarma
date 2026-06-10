@@ -177,12 +177,17 @@ def create_app(config=None) -> FastAPI:
         if getattr(config, "role", "") in ("", "all-in-one"):
             async def _reaper_loop():
                 await asyncio.sleep(25)   # let startup settle
+                # First sweep is aggressive: in all-in-one there's ONE pod, so any
+                # 'running' not owned by THIS fresh pod is orphaned (deploy/crash)
+                # — resume it within ~30s instead of waiting out the stale window.
+                first = True
                 while True:
                     try:
-                        await _reap_orphans(config, _state)
+                        await _reap_orphans(config, _state, stale_seconds=15 if first else 120)
+                        first = False
                     except Exception as e:
                         log.debug(f"Reaper loop: {e}")
-                    await asyncio.sleep(300)   # sweep every 5 min
+                    await asyncio.sleep(120)   # sweep every 2 min
             asyncio.create_task(_reaper_loop())
             log.info("Durable-job reaper started (resumes orphaned investigations)")
 
@@ -567,7 +572,7 @@ async def _resume_investigation(config, state, inv: dict) -> None:
     log.info(f"Reaper: {incident_id[:8]} resumed + completed")
 
 
-async def _reap_orphans(config, state, stale_seconds: int = 600) -> None:
+async def _reap_orphans(config, state, stale_seconds: int = 120) -> None:
     """Find investigations whose worker stopped heartbeating (pod died / scaled down)
     and resume them. Skips ones the CURRENT pod is actively running."""
     import socket
