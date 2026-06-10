@@ -174,6 +174,18 @@ class CodeSessionToolset(Toolset):
                               error=f"Unknown tool: {tool_name}")
         except Exception as e:
             err = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+            low = str(e).lower()
+            # Actionable guidance instead of a raw exception, so the LLM can recover.
+            if "no api key" in low or "authentication" in low:
+                err += (" → the coding agent has no LLM key. This is a config issue, not "
+                        "something you can fix by retrying — fall back to code_search / "
+                        "code_semantic_search to locate the code and describe the fix in the RCA.")
+            elif "session" in low and ("not found" in low or "unknown" in low):
+                err += " → that session expired/closed. Open a fresh one with code_session_start."
+            elif "timeout" in low or "timed out" in low:
+                err += " → the coding agent timed out. Send a smaller, more specific instruction, or use code_search instead."
+            elif "not in allow-list" in low or "edit mode is disabled" in low:
+                err += " → use read mode / code_search; this repo or edit mode isn't permitted here."
             return ToolOutput(tool_name=tool_name, status=ToolStatus.ERROR, error=err)
 
     # ── Handlers ──────────────────────────────────────────────────────────────

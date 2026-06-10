@@ -266,6 +266,19 @@ class BashToolset(Toolset):
                     error_msg += f"\n{stderr.strip()}"
                 if stdout.strip():
                     error_msg += f"\nstdout:\n{stdout}"
+                # Actionable guidance for common, recoverable shell failures.
+                low = stderr.lower()
+                if "command not found" in low:
+                    missing = stderr.split(":")[1].strip() if ":" in stderr else "that tool"
+                    error_msg += (f"\nHINT: '{missing}' isn't installed in this agent. Use an "
+                                  "available tool instead (e.g. the database toolset for SQL, the "
+                                  "prometheus/elasticsearch toolsets for metrics/logs, kubectl for k8s).")
+                elif "no such host" in low or "could not resolve" in low or "connection refused" in low:
+                    error_msg += ("\nHINT: that host isn't reachable from this agent (cross-cloud / "
+                                  "VPC-internal). Use the endpoint from the Site Knowledge Base for THIS cluster's cloud.")
+                elif "forbidden" in low or "cannot " in low and "kubectl" in command.lower():
+                    error_msg += ("\nHINT: read-only RBAC — that verb/resource isn't permitted. Use get/"
+                                  "describe/logs/top only.")
                 return ToolOutput(
                     status=ToolStatus.ERROR,
                     error=error_msg,

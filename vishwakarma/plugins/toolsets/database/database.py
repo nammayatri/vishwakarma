@@ -32,6 +32,29 @@ log = logging.getLogger(__name__)
 
 # Only allow read-only SQL
 ALLOWED_SQL_PREFIXES = ("SELECT", "SHOW", "DESCRIBE", "DESC", "EXPLAIN", "WITH")
+
+
+def _db_error_guidance(e: Exception) -> str:
+    """Turn a DB driver exception into an ACTIONABLE message for the LLM — tell it
+    what went wrong AND how to fix the next attempt, instead of a generic failure."""
+    msg = str(e).strip().splitlines()[0][:300] if str(e).strip() else type(e).__name__
+    low = msg.lower()
+    hint = ""
+    if "does not exist" in low and "column" in low:
+        hint = " → that column doesn't exist; list columns with SELECT column_name FROM information_schema.columns WHERE table_name='<t>' AND table_schema='<s>'."
+    elif "does not exist" in low and ("relation" in low or "table" in low):
+        hint = " → that table/relation doesn't exist; check the name+schema via information_schema.tables. Qualify as schema.table."
+    elif "syntax error" in low:
+        hint = " → SQL syntax error (the query may be truncated or malformed); resend the COMPLETE, corrected query."
+    elif "timeout" in low or "canceling statement" in low or "statement timeout" in low:
+        hint = " → query timed out; add a tighter WHERE/LIMIT, avoid full scans, or query an indexed column."
+    elif "permission denied" in low or "must be owner" in low:
+        hint = " → permission denied (read-only role); only SELECT on readable tables is allowed."
+    elif "connection" in low or "could not connect" in low or "timeout expired" in low:
+        hint = " → could not reach the DB; verify the connection name is one of the configured ones."
+    elif "type" in low and ("mismatch" in low or "cannot be" in low or "invalid input" in low):
+        hint = " → type mismatch; cast the value (e.g. ::uuid, ::text) or quote it correctly."
+    return f"Query failed: {msg}.{hint}"
 BLOCKED_SQL_KEYWORDS = re.compile(
     r"\b(INSERT|UPDATE|DELETE|DROP|TRUNCATE|ALTER|CREATE|REPLACE|MERGE|GRANT|REVOKE"
     r"|UNION|COPY|INTO\s+OUTFILE|pg_read_file|lo_import|set_config)\b",
@@ -403,7 +426,7 @@ class DatabaseToolset(Toolset):
         except Exception as e:
             log.error("db_query failed for connection '%s': %s", conn_name, e)
             self._close_conn(conn_name)
-            return ToolOutput(status=ToolStatus.ERROR, error="Query failed", invocation=invocation)
+            return ToolOutput(status=ToolStatus.ERROR, error=_db_error_guidance(e), invocation=invocation)
 
     def _list_tables(self, params: dict) -> ToolOutput:
         conn_name = params.get("connection", "")
@@ -452,7 +475,7 @@ class DatabaseToolset(Toolset):
         except Exception as e:
             log.error("db_list_tables failed for connection '%s': %s", conn_name, e)
             self._close_conn(conn_name)
-            return ToolOutput(status=ToolStatus.ERROR, error="Query failed", invocation=invocation)
+            return ToolOutput(status=ToolStatus.ERROR, error=_db_error_guidance(e), invocation=invocation)
 
     def _describe_table(self, params: dict) -> ToolOutput:
         conn_name = params.get("connection", "")
@@ -539,4 +562,4 @@ class DatabaseToolset(Toolset):
         except Exception as e:
             log.error("db_describe_table failed for connection '%s': %s", conn_name, e)
             self._close_conn(conn_name)
-            return ToolOutput(status=ToolStatus.ERROR, error="Query failed", invocation=invocation)
+            return ToolOutput(status=ToolStatus.ERROR, error=_db_error_guidance(e), invocation=invocation)
