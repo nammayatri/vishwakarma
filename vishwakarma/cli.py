@@ -642,11 +642,17 @@ def serve(
     setup_logging()
 
     # Start Slack bots in background threads — Sage (chat) + Argus (RCA
-    # trigger via @mre; no-op until argus.bot_token/app_token are configured)
-    from vishwakarma.bot.slack import start_bot
-    start_bot(cfg)
-    from vishwakarma.bot.argus import start_argus
-    start_argus(cfg)
+    # trigger via @mre; no-op until argus.bot_token/app_token are configured).
+    # Slack mentions/bots run on the GCP pod only (cloud != aws) — the AWS pod
+    # is a headless executor for AWS alerts; mentions go to GCP.
+    if cfg.cloud != "aws":
+        from vishwakarma.bot.slack import start_bot
+        start_bot(cfg)
+        from vishwakarma.bot.argus import start_argus
+        start_argus(cfg)
+    else:
+        logging.getLogger("vishwakarma.cli").info(
+            "Slack bots disabled on this AWS pod — mentions are handled by the GCP pod")
 
     # Start daily cost report scheduler
     from vishwakarma.scheduler.cost_report import start_cost_reporter

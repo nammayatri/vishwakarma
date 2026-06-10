@@ -291,7 +291,15 @@ class OpenCodeAgent:
         Skipped if the project already has an opencode.json (e.g. tests).
         """
         cfg_path = workdir / "opencode.json"
-        if cfg_path.exists() or not self.api_base:
+        if cfg_path.exists():
+            return
+        if not self.api_base:
+            # No gateway configured — OpenCode would fail with "No api key passed
+            # in". In prod api_base resolves from config/VK_API_BASE; if it's
+            # genuinely empty, warn loudly (tests use a self-contained fake binary
+            # that needs no provider config, so don't hard-fail).
+            log.warning("code_session: no api_base — OpenCode has no LLM gateway "
+                        "(set toolsets.code_session.config.api_base or VK_API_BASE)")
             return
         cfg = {
             "$schema": "https://opencode.ai/config.json",

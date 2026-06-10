@@ -363,6 +363,20 @@ def create_app(config=None) -> FastAPI:
         for issue in issues:
             fingerprint = alert_fingerprint(issue.labels)
 
+            # Per-cloud hard filter: when this pod has its own cloud set (CLOUD=gcp
+            # / aws), ONLY investigate alerts routed to that cloud — the other
+            # cloud's pod handles the rest. Safety net even if an alertmanager
+            # mis-points. (Empty config.cloud = all-in-one, handles everything.)
+            if config.cloud:
+                from vishwakarma.core.cloud_router import route_issue as _route
+                alert_cloud = _route(issue, default_cloud=config.default_cloud)
+                if alert_cloud != config.cloud:
+                    log.info(f"Skipping '{issue.title}' — routed to {alert_cloud}, "
+                             f"this pod serves {config.cloud}")
+                    triggered.append({"title": issue.title, "status": "skipped-other-cloud",
+                                      "cloud": alert_cloud})
+                    continue
+
             # Skip only if an investigation for this alert is currently running
             # (Holmes pattern). Atomic across pods when Redis is configured.
             if not _dedup.try_acquire(fingerprint):
@@ -555,14 +569,21 @@ async def _reap_orphans(config, state, stale_seconds: int = 600) -> None:
         log.debug(f"Reaper: scan failed: {e}")
         return
     me = socket.gethostname()
+    import threading
     for inv in orphans:
         if inv.get("worker_id") == me:
             continue   # our own (possibly slow) live run — not an orphan
         log.info(f"Reaper: orphan {inv['id'][:8]} (worker={inv.get('worker_id')}, step={inv.get('step')})")
-        try:
-            await _resume_investigation(config, state, inv)
-        except Exception as e:
-            log.error(f"Reaper: error resuming {inv['id'][:8]}: {e}")
+        # Run the resume in a BACKGROUND THREAD. The engine loop is synchronous;
+        # awaiting it here would block the event loop and fail the /healthz
+        # liveness probe (→ restart loop). claim_investigation re-owns it to this
+        # pod immediately, so the next sweep won't double-resume it.
+        def _bg(inv=inv):
+            try:
+                asyncio.run(_resume_investigation(config, state, inv))
+            except Exception as e:
+                log.error(f"Reaper: error resuming {inv['id'][:8]}: {e}")
+        threading.Thread(target=_bg, daemon=True).start()
 
 
 def _extract_pr_url(tool_outputs) -> str:

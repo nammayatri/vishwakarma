@@ -54,7 +54,7 @@ class CodeSessionToolset(Toolset):
         self._agent_cfg = {
             "api_base": cfg.get("api_base") or os.environ.get("VK_API_BASE", ""),
             "api_key": cfg.get("api_key") or os.environ.get("VK_API_KEY", ""),
-            "model": cfg.get("model", "open-large"),
+            "model": cfg.get("model") or os.environ.get("VK_CODE_MODEL", "kimi-latest"),
             "send_timeout": int(cfg.get("send_timeout", 420)),
         }
 

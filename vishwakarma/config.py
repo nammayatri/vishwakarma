@@ -265,6 +265,10 @@ class VishwakarmaConfig:
         orch = raw.get("orchestrator", {})
         self.default_cloud: str = _env("VK_DEFAULT_CLOUD", orch.get("default_cloud", "aws"))
         self.executor_cloud: str = _env("VK_EXECUTOR_CLOUD", raw.get("executor", {}).get("cloud", "")) or ""
+        # This pod's OWN cloud. When set (e.g. CLOUD=gcp / CLOUD=aws via VK_CLOUD),
+        # the pod ONLY investigates alerts routed to its cloud (hard filter) and
+        # only runs the Slack bots on the gcp pod. Empty = all-in-one (handles all).
+        self.cloud: str = _env("VK_CLOUD", self.executor_cloud) or ""
 
         # GitHub — draft-PR creation for the fix loop. Unset = fix path stays
         # "propose only" (no PR). Needs a GitHub App installation token or PAT.
