@@ -241,7 +241,10 @@ class BashToolset(Toolset):
 
         command = params.get("command", "").strip()
         if not command:
-            return ToolOutput(status=ToolStatus.ERROR, error="Empty command")
+            # An empty command is usually a truncated/dropped tool call — treat as
+            # a no-op (NO_DATA) so it doesn't burn a step as an "error".
+            return ToolOutput(tool_name="bash", status=ToolStatus.NO_DATA,
+                              output="(empty command — nothing to run)")
 
         # Check rules
         allowed, reason = self._is_allowed(command)

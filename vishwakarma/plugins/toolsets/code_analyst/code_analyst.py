@@ -382,11 +382,15 @@ class CodeAnalystToolset(Toolset):
         if params.get("path"):
             search_dir = self._safe_path(repo, params["path"])
 
-        if shutil.which("ast-grep") or shutil.which("sg"):
-            binary = shutil.which("ast-grep") or shutil.which("sg")
-            cmd = [binary, "run", "--pattern", pattern, str(search_dir)]
+        # Route by pattern shape: ast-grep ONLY for structural patterns (they use
+        # `$VAR` / `$$$` metavariables). Everything else is a regex/text search →
+        # ripgrep. Previously ALL patterns went to ast-grep, so a regex like
+        # `driverLicense|DriverLicense` or `upsert.*X` matched nothing.
+        sg = shutil.which("ast-grep") or shutil.which("sg")
+        if "$" in pattern and sg:
+            cmd = [sg, "run", "--pattern", pattern, str(search_dir)]
         else:
-            cmd = ["rg", "--line-number", "--max-count", "5",
+            cmd = ["rg", "--line-number", "--smart-case", "--max-count", "5",
                    "--max-columns", "300", "-m", str(max_results),
                    pattern, str(search_dir)]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=GIT_TIMEOUT)

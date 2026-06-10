@@ -35,6 +35,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     gnupg \
     ripgrep \
+    redis-tools \
+    postgresql-client \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 

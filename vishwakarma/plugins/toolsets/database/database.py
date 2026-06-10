@@ -324,10 +324,24 @@ class DatabaseToolset(Toolset):
 
     def _validate_query(self, query: str) -> tuple[bool, str]:
         stripped = query.strip().upper()
+        # psql meta-commands (\d, \dt, \l, …) aren't SQL — give a usable hint.
+        if query.strip().startswith("\\"):
+            return False, ("psql meta-commands (\\d) are not supported. Use SQL: list "
+                           "columns via information_schema.columns, indexes via pg_indexes "
+                           "WHERE tablename='<t>', tables via information_schema.tables.")
         if not any(stripped.startswith(p) for p in ALLOWED_SQL_PREFIXES):
             return False, f"Only read-only queries allowed (SELECT, SHOW, DESCRIBE, EXPLAIN). Got: {stripped[:50]}"
         if BLOCKED_SQL_KEYWORDS.search(query):
             return False, "Query contains disallowed write operation"
+        # Detect a query truncated mid-statement (LLM hit its token limit during the
+        # tool call) — running it produces a confusing syntax error. Reject with a
+        # clear retry signal instead. Trailing dangling clause/keyword or unbalanced parens.
+        q = query.strip().rstrip(";").rstrip()
+        if q.count("(") != q.count(")"):
+            return False, "Query looks truncated (unbalanced parentheses) — resend the complete query."
+        if re.search(r"\b(FROM|WHERE|GROUP\s+BY|ORDER\s+BY|HAVING|JOIN|ON|AND|OR|SET|VALUES|IN|HAVI|GROU|ORDE)\s*$",
+                     q, re.IGNORECASE):
+            return False, "Query looks truncated (ends mid-clause) — resend the complete query."
         return True, ""
 
     # ── Result truncation helper ───────────────────────────────────────────────

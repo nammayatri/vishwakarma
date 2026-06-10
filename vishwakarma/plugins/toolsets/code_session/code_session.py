@@ -46,9 +46,14 @@ class CodeSessionToolset(Toolset):
         self.repos: list[str] = cfg.get("repos", [])
         self.allow_edit: bool = bool(cfg.get("allow_edit", False))
         self._agent = None
+        import os
+        # OpenCode talks to the SAME LLM gateway as the main agent. If no explicit
+        # api_key/api_base is set for code_session, inherit the main LLM creds
+        # (VK_API_KEY / VK_API_BASE) — otherwise OpenCode fails with
+        # "Authentication Error, No api key passed in" and the code-fix path breaks.
         self._agent_cfg = {
-            "api_base": cfg.get("api_base", ""),
-            "api_key": cfg.get("api_key", ""),
+            "api_base": cfg.get("api_base") or os.environ.get("VK_API_BASE", ""),
+            "api_key": cfg.get("api_key") or os.environ.get("VK_API_KEY", ""),
             "model": cfg.get("model", "open-large"),
             "send_timeout": int(cfg.get("send_timeout", 420)),
         }
