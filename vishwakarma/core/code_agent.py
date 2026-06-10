@@ -100,8 +100,13 @@ class OpenCodeAgent:
             branch = f"argus/fix-{name}"
             workdir = repo.parent / f"{repo.name}-wt-{name}"
             base_repo = str(repo)
+            # ALWAYS branch from a fresh default branch (main), never from
+            # whatever the cache HEAD happens to be. Fetch first, then base the
+            # worktree on origin/<default> so the PR diff is clean against main.
+            base_ref = self._fresh_base_ref(repo)
             r = subprocess.run(
-                ["git", "-C", str(repo), "worktree", "add", str(workdir), "-b", branch],
+                ["git", "-C", str(repo), "worktree", "add", str(workdir),
+                 "-b", branch, base_ref],
                 capture_output=True, text=True, timeout=120,
             )
             if r.returncode != 0:
@@ -197,6 +202,36 @@ class OpenCodeAgent:
         cs = self._get(session_id)
         return {"mode": cs.mode, "worktree": cs.repo_path,
                 "branch": cs.branch, "base_repo": cs.base_repo}
+
+    @staticmethod
+    def _fresh_base_ref(repo) -> str:
+        """Fetch origin and return origin/<default-branch> (main/master) so an
+        edit worktree always branches from the latest main. Falls back to HEAD
+        if origin is unreachable (offline tests / local bare remotes)."""
+        import subprocess as _sp
+        # Detect the default branch from origin's HEAD, default to main.
+        default = "main"
+        try:
+            r = _sp.run(["git", "-C", str(repo), "symbolic-ref",
+                         "refs/remotes/origin/HEAD"], capture_output=True, text=True, timeout=20)
+            if r.returncode == 0 and r.stdout.strip():
+                default = r.stdout.strip().rsplit("/", 1)[-1]
+        except Exception:
+            pass
+        try:
+            import os as _os
+            _env = {**_os.environ, "GIT_TERMINAL_PROMPT": "0"}  # fail fast offline
+            f = _sp.run(["git", "-C", str(repo), "fetch", "--quiet", "origin", default],
+                        capture_output=True, text=True, timeout=120, env=_env)
+            if f.returncode == 0:
+                # confirm the ref exists
+                v = _sp.run(["git", "-C", str(repo), "rev-parse", "--verify",
+                             f"origin/{default}"], capture_output=True, text=True, timeout=20)
+                if v.returncode == 0:
+                    return f"origin/{default}"
+        except Exception:
+            pass
+        return "HEAD"   # offline fallback
 
     def commit_fix(self, session_id: str, message: str) -> dict:
         """

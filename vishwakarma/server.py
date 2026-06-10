@@ -462,6 +462,19 @@ async def _run_alert_investigation(config, state, issue, incident_id: str, finge
         await _do_investigation(config, state, issue, incident_id, fingerprint)
 
 
+def _extract_pr_url(tool_outputs) -> str:
+    """Find a github PR url in the propose_fix tool output (if a draft PR was opened)."""
+    import re as _re
+    pat = _re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+")
+    for o in (tool_outputs or []):
+        text = getattr(o, "output", "") or ""
+        if getattr(o, "tool_name", "") == "propose_fix" or "/pull/" in text:
+            m = pat.search(text)
+            if m:
+                return m.group(0)
+    return ""
+
+
 async def _do_investigation(config, state, issue, incident_id: str, fingerprint: str = "",
                             cross_cloud: str = "", cross_cloud_base: str = ""):
     """
@@ -1002,6 +1015,23 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
                 channel=slack_channel_id or None,   # report channel for Argus issues
             )
             slack_ts = resp.get("ts")
+            # If a draft PR was opened during the fix step, surface it
+            # prominently in the thread (the RCA PDF is already attached above).
+            pr_url = _extract_pr_url(result.tool_outputs)
+            if pr_url and (slack_ts or ack_ts):
+                try:
+                    dest._get_client().chat_postMessage(
+                        channel=resp.get("channel") or slack_channel_id,
+                        thread_ts=slack_ts or ack_ts,
+                        text=f":memo: I opened a *draft PR* with the fix: {pr_url}",
+                        blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": (
+                            f":memo: *Draft PR opened with the proposed fix*\n{pr_url}\n\n"
+                            "_It's a *draft* — I can't merge. Please compile/review it "
+                            "(CI will build + test the branch), then merge if it looks good._"
+                        )}}],
+                    )
+                except Exception as e:
+                    log.debug(f"PR-link post failed (non-fatal): {e}")
         except Exception as e:
             log.warning(f"Slack notification failed: {e}")
 
