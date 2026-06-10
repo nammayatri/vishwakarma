@@ -43,3 +43,6 @@ NY_CONTEXT.md
 k8s/argus/configmap.yaml
 k8s/argus/secrets.yaml
 k8s/argus/postgres-secret.yaml
+
+# Live (private) deployment setup — real endpoints, secrets, knowledge
+deploy-live/
