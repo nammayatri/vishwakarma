@@ -79,20 +79,32 @@ class ArgusBot:
 
         clean = self._strip_mentions(text)
 
-        # Direct @Argus or explicit debug → always investigate, no filter.
-        forced = argus_tagged or re.match(r"^\s*debug\b", clean, re.IGNORECASE)
+        # Explicit `debug …` always investigates, skipping every filter.
+        explicit_debug = bool(re.match(r"^\s*debug\b", clean, re.IGNORECASE))
 
-        if not forced:
-            # @mre context: strong prior toward issue; only clear non-issues
-            # (thanks/FYI/scheduling chatter) stay quiet.
-            try:
-                is_issue = self.classify(clean)
-            except Exception as e:
-                log.warning(f"Argus noise filter failed ({e}) — treating as issue")
-                is_issue = True
-            if not is_issue:
-                log.info(f"Argus: @mre message classified non-issue — staying quiet: {clean[:80]}")
+        if not explicit_debug:
+            # Trivial greeting / capability question / chit-chat → quick reply,
+            # NOT a full investigation. Applies to BOTH direct @Argus and @mre
+            # (this is the "@Argus hi" fix — don't burn an RCA on a greeting).
+            if self._is_trivial(clean):
+                self.say(channel, event.get("thread_ts") or ts,
+                         ":wave: I'm *Argus*. Tag me with an issue — an error/stack trace, "
+                         "an alert, a failing pod or service, or `debug <question>` — and I'll "
+                         "investigate and post an RCA. (For chat, ping *Sage*.)")
+                log.info(f"Argus: trivial message — quick reply, no investigation: {clean[:60]}")
                 return "quiet"
+
+            # @mre context (not a direct @Argus): strong prior toward issue, but
+            # let the classifier drop clear non-issues (thanks/FYI/scheduling).
+            if not argus_tagged:
+                try:
+                    is_issue = self.classify(clean)
+                except Exception as e:
+                    log.warning(f"Argus noise filter failed ({e}) — treating as issue")
+                    is_issue = True
+                if not is_issue:
+                    log.info(f"Argus: @mre message classified non-issue — quiet: {clean[:80]}")
+                    return "quiet"
 
         payload = self._build_payload(event, clean)
         try:
@@ -131,6 +143,33 @@ class ArgusBot:
                                     ("channel", "ts", "thread_ts", "user")},
                     "image_urls": image_urls},
         }
+
+    # Issue signals — if any appear, it's NOT trivial (investigate).
+    _ISSUE_SIGNALS = (
+        "error", "errors", "fail", "down", "5xx", "4xx", "500", "503", "timeout",
+        "why", "fix", "issue", "alert", "log", "logs", "pod", "crash", "oom",
+        "slow", "lag", "drop", "spike", "stuck", "exception", "broke", "broken",
+        "restart", "cannot", "can't", "not working", "throttl", "latency",
+        "high cpu", "memory", "eviction", "deadlock", "panic", "fatal", "503",
+        "investigate", "debug", "rca", "root cause", "duplicate key", "constraint",
+    )
+    _GREETINGS = {
+        "hi", "hello", "hey", "yo", "sup", "hola", "gm", "good morning",
+        "good evening", "good afternoon", "thanks", "thank you", "ty", "thx",
+        "ok", "okay", "cool", "nice", "test", "ping", "pong", "great", "lol",
+        "what can you do", "who are you", "help", "hru", "how are you",
+    }
+
+    def _is_trivial(self, clean: str) -> bool:
+        """Greeting / capability question / chit-chat with no issue content."""
+        c = clean.lower().strip(" \t:,.!?-")
+        if not c:
+            return True
+        if any(s in c for s in self._ISSUE_SIGNALS):
+            return False                      # has issue content → investigate
+        if c in self._GREETINGS:
+            return True
+        return len(c.split()) <= 4            # short + no issue signal → trivial
 
     def _strip_mentions(self, text: str) -> str:
         text = re.sub(r"<!subteam\^[A-Z0-9]+(\|[^>]*)?>", "", text)

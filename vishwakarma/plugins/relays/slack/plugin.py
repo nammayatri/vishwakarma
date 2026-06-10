@@ -131,7 +131,7 @@ class SlackDestination:
         blocks: list[dict] = [
             {
                 "type": "header",
-                "text": {"type": "plain_text", "text": f":rotating_light: RCA: {title[:150]}", "emoji": True},
+                "text": {"type": "plain_text", "text": f":rotating_light: RCA: {title}"[:148], "emoji": True},
             },
             {"type": "divider"},
             {

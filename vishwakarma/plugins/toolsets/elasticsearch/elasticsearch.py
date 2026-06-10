@@ -29,6 +29,16 @@ class ElasticsearchToolset(Toolset):
             self._session.auth = (config["username"], config["password"])
         if config.get("api_key"):
             self._session.headers["Authorization"] = f"ApiKey {config['api_key']}"
+        # Bearer / service-account token — GCP in-cluster ES uses this. Reads
+        # ES_BEARER_TOKEN env when not inline (keep tokens in secrets).
+        import os as _os
+        _bearer = config.get("bearer_token") or _os.environ.get("ES_BEARER_TOKEN", "")
+        if _bearer:
+            self._session.headers["Authorization"] = f"Bearer {_bearer}"
+        if config.get("verify_tls") is False:   # in-cluster ES often self-signed
+            self._session.verify = False
+            import urllib3
+            urllib3.disable_warnings()
 
     def check_prerequisites(self) -> tuple[bool, str]:
         try:

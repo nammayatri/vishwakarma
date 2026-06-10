@@ -509,7 +509,7 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
                 ack_blocks = [
                     {
                         "type": "header",
-                        "text": {"type": "plain_text", "text": f":rotating_light: {issue.title[:150]}", "emoji": True},
+                        "text": {"type": "plain_text", "text": f":rotating_light: {issue.title}"[:148], "emoji": True},
                     },
                     {"type": "divider"},
                     {
@@ -971,7 +971,7 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
                 channel=slack_channel_id, ts=ack_ts,
                 text=f":white_check_mark: RCA complete for {issue.title}",
                 attachments=[{"color": severity_color, "blocks": [
-                    {"type": "header", "text": {"type": "plain_text", "text": f":white_check_mark: {issue.title[:150]}", "emoji": True}},
+                    {"type": "header", "text": {"type": "plain_text", "text": f":white_check_mark: {issue.title}"[:148], "emoji": True}},
                     {"type": "divider"},
                     {"type": "context", "elements": [{"type": "mrkdwn", "text": ":thread: _Investigation complete. See thread for full RCA report + PDF._"}]},
                 ]}],
