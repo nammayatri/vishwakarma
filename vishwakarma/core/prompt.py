@@ -44,8 +44,12 @@ Always:
 INVESTIGATION_PHASES = """\
 ## Investigation Protocol
 
-**MANDATORY FIRST ACTION:** In your FIRST response, call `todo_write` AND fire all independent tool calls simultaneously in the same response — do NOT do todo_write alone as a separate step.
-- If a runbook is provided: todo_write steps MUST mirror the runbook's steps exactly
+**MANDATORY FIRST ACTION:** Your FIRST response MUST contain `todo_write` PLUS the actual
+tool calls for every independent command of the investigation's first phase — all in ONE
+response (they execute in parallel). A first response containing ONLY `todo_write` and no
+investigation tools is a protocol violation and wastes a full step.
+- If a runbook is provided: todo_write steps MUST mirror the runbook's steps exactly, and
+  the same response must fire the runbook's first-section commands (typically 4-8 calls)
 - Mark all independent tasks as `in_progress` and execute them immediately in the same response
 - Update status `in_progress` → `completed` as each step finishes
 
@@ -62,22 +66,7 @@ Then focus remaining steps on confirming/denying these hypotheses. Stop investig
 
 **STEP BUDGET:** Prioritize high-signal sources (metrics, error logs). If you've tried 3 approaches on the same angle with no data, record "checked, no data" and move on.
 
-If no runbook is provided, investigate in structured phases:
-
-### PHASE 1 — RECON (parallel, broad signals)
-Fire multiple bash/tool calls in one response simultaneously.
-Example: `kubectl get pods -n <namespace>`, `aws rds describe-db-instances`, Prometheus error rate — all at once.
-
-### PHASE 2 — HYPOTHESES
-State top 3 hypotheses BEFORE running more tools:
-```
-Hypothesis 1: <cause> — Confidence: HIGH/MEDIUM/LOW — Evidence: <what points to this>
-Hypothesis 2: <cause> — Confidence: HIGH/MEDIUM/LOW — Evidence: <what points to this>
-Hypothesis 3: <cause> — Confidence: HIGH/MEDIUM/LOW — Evidence: <what points to this>
-```
-HIGH = direct evidence; MEDIUM = strong correlation; LOW = pattern fits but unconfirmed.
-
-### ADVERSARIAL CHECK (mandatory before final answer)
+{GENERIC_PHASES}### ADVERSARIAL CHECK (mandatory before final answer)
 Before concluding, actively try to disprove your top hypothesis:
 1. Name one alternative explanation for each key piece of evidence
 2. List 2-3 things that would change your conclusion — then verify them
@@ -147,6 +136,27 @@ config/data), write "N/A — not a code fix" and say what to change instead.>
 YES / NO — <if YES, what specifically needs checking>
 """
 
+# Generic phase structure — injected ONLY when no runbook matched. When a
+# runbook is present it IS the investigation plan; the generic phases just
+# add prompt weight and compete with it.
+GENERIC_PHASES = """\
+If no runbook is provided, investigate in structured phases:
+
+### PHASE 1 — RECON (parallel, broad signals)
+Fire multiple bash/tool calls in one response simultaneously.
+Example: `kubectl get pods -n <namespace>`, `aws rds describe-db-instances`, Prometheus error rate — all at once.
+
+### PHASE 2 — HYPOTHESES
+State top 3 hypotheses BEFORE running more tools:
+```
+Hypothesis 1: <cause> — Confidence: HIGH/MEDIUM/LOW — Evidence: <what points to this>
+Hypothesis 2: <cause> — Confidence: HIGH/MEDIUM/LOW — Evidence: <what points to this>
+Hypothesis 3: <cause> — Confidence: HIGH/MEDIUM/LOW — Evidence: <what points to this>
+```
+HIGH = direct evidence; MEDIUM = strong correlation; LOW = pattern fits but unconfirmed.
+
+"""
+
 WHAT_CHANGED = """\
 ## Detecting What Changed (for K8s/app alerts without a runbook)
 
@@ -191,8 +201,13 @@ GENERAL_GUIDELINES = """\
 - K8s/AWS/system commands → `bash` tool
 - External URLs only → `http_get`
 
-**Parallel execution:**
+**Parallel execution (CRITICAL for speed — up to 16 tool calls run in parallel per response):**
 - Fire ALL independent tool calls in a SINGLE response — they run in parallel
+- When following a runbook: execute EVERY command of the current section AND all
+  sections that don't depend on earlier results in ONE response. A runbook with
+  10 independent commands should take 1-2 responses, not 10.
+- Only serialize when a command genuinely needs a previous result (e.g. an
+  instance id discovered in the prior step)
 - Start broad (metrics, events) before narrow (specific pod logs, DB queries)
 
 **Evidence quality:**
@@ -251,8 +266,12 @@ def build_system_prompt(
         parts.append(f"You are operating on cluster: **{cluster_name}**\n")
 
     if Section.PLANNING not in sections_off:
-        parts.append(INVESTIGATION_PHASES)
-        parts.append(WHAT_CHANGED)
+        # Runbook present → it IS the plan; skip the generic phase scaffold
+        # and the what-changed checklist to keep the prompt lean and focused.
+        generic = GENERIC_PHASES if not runbooks else ""
+        parts.append(INVESTIGATION_PHASES.replace("{GENERIC_PHASES}", generic))
+        if not runbooks:
+            parts.append(WHAT_CHANGED)
 
     if Section.GUIDELINES not in sections_off:
         parts.append(GENERAL_GUIDELINES)

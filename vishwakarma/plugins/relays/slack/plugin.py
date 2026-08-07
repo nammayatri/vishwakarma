@@ -8,12 +8,17 @@ Flow (matches Holmes):
 """
 import logging
 import os
+import time
 from typing import Any
 
 log = logging.getLogger(__name__)
 
 # Module-level cache for channel name → ID resolution (process lifetime)
 _channel_id_cache: dict[str, str] = {}
+# The bot token has no channels:read scope in this workspace — once
+# conversations.list fails with missing_scope, stop retrying it. IDs are
+# instead harvested from chat.postMessage responses (no extra scope needed).
+_channel_list_unavailable = False
 
 
 class SlackDestination:
@@ -39,16 +44,58 @@ class SlackDestination:
         # Check module-level cache first
         if name in _channel_id_cache:
             return _channel_id_cache[name]
+        global _channel_list_unavailable
+        if not _channel_list_unavailable:
+            try:
+                client = self._get_client()
+                for page in client.conversations_list(types="public_channel,private_channel", limit=1000):
+                    for c in page.get("channels", []):
+                        if c["name"] == name:
+                            _channel_id_cache[name] = c["id"]
+                            return c["id"]
+            except Exception as e:
+                if "missing_scope" in str(e):
+                    _channel_list_unavailable = True
+                    log.info("conversations.list unavailable (missing_scope) — will "
+                             "resolve channel IDs from chat.postMessage responses instead")
+                else:
+                    log.warning(f"Could not resolve channel '{channel}': {e}")
+        return channel  # name works for postMessage; ID is harvested from its response
+
+    def _upload_pdf(self, client, channel: str, thread_ts: str, pdf_path: str | None,
+                    title: str, initial_comment: str) -> bool:
+        """Upload the RCA PDF into a thread. One retry on transient failure.
+        Returns True on success; loud logs on every failure path so text
+        fallbacks are never silent."""
+        if not pdf_path:
+            return False
+        if not os.path.exists(pdf_path):
+            log.warning(f"PDF missing at upload time ({pdf_path}) — falling back to text")
+            return False
         try:
-            client = self._get_client()
-            for page in client.conversations_list(types="public_channel,private_channel", limit=1000):
-                for c in page.get("channels", []):
-                    if c["name"] == name:
-                        _channel_id_cache[name] = c["id"]
-                        return c["id"]
-        except Exception as e:
-            log.warning(f"Could not resolve channel '{channel}': {e}")
-        return channel  # fallback — might fail but at least chat_postMessage handles names
+            with open(pdf_path, "rb") as f:
+                pdf_bytes = f.read()
+        except OSError as e:
+            log.warning(f"PDF unreadable ({pdf_path}): {e} — falling back to text")
+            return False
+        for attempt in (1, 2):
+            try:
+                client.files_upload_v2(
+                    channel=channel,
+                    thread_ts=thread_ts,
+                    content=pdf_bytes,
+                    filename=f"rca-{title[:40].replace(' ', '-')}.pdf",
+                    title=f"RCA - {title}",
+                    initial_comment=initial_comment,
+                )
+                return True
+            except Exception as e:
+                if attempt == 1:
+                    log.warning(f"PDF upload failed (attempt 1/2), retrying: {e}")
+                    time.sleep(3)
+                else:
+                    log.warning(f"PDF upload failed (attempt 2/2), falling back to text: {e}")
+        return False
 
     def post_investigation(
         self,
@@ -73,22 +120,10 @@ class SlackDestination:
             msg_ts = thread_ts  # reply in existing thread
 
             # Upload PDF directly in thread — this is the primary deliverable
-            pdf_uploaded = False
-            if pdf_path and os.path.exists(pdf_path):
-                try:
-                    with open(pdf_path, "rb") as f:
-                        pdf_bytes = f.read()
-                    client.files_upload_v2(
-                        channel=channel,
-                        thread_ts=msg_ts,
-                        content=pdf_bytes,
-                        filename=f"rca-{title[:40].replace(' ', '-')}.pdf",
-                        title=f"RCA - {title}",
-                        initial_comment=f":page_facing_up: *{title}*",
-                    )
-                    pdf_uploaded = True
-                except Exception as e:
-                    log.warning(f"PDF upload failed: {e}")
+            pdf_uploaded = self._upload_pdf(
+                client, channel, msg_ts, pdf_path, title,
+                initial_comment=f":page_facing_up: *{title}*",
+            )
 
             # Fallback: if no PDF, post analysis as text
             if not pdf_uploaded:
@@ -147,27 +182,21 @@ class SlackDestination:
                 attachments=[{"color": color, "blocks": blocks}],
             )
             msg_ts = response["ts"]
+            # postMessage resolves #names to channel IDs in its response —
+            # required for files_upload_v2 below when channel was a name.
+            resolved = response.get("channel")
+            if resolved:
+                _channel_id_cache[channel.lstrip("#")] = resolved
+                channel = resolved
         except Exception as e:
             log.error(f"Slack post failed: {e}")
             return {}
 
         # Upload PDF directly in thread
-        pdf_uploaded = False
-        if pdf_path and os.path.exists(pdf_path):
-            try:
-                with open(pdf_path, "rb") as f:
-                    pdf_bytes = f.read()
-                client.files_upload_v2(
-                    channel=channel,
-                    thread_ts=msg_ts,
-                    content=pdf_bytes,
-                    filename=f"rca-{title[:40].replace(' ', '-')}.pdf",
-                    title=f"RCA - {title}",
-                    initial_comment=f":page_facing_up: *Full RCA Report*",
-                )
-                pdf_uploaded = True
-            except Exception as e:
-                log.warning(f"PDF upload failed, falling back to text: {e}")
+        pdf_uploaded = self._upload_pdf(
+            client, channel, msg_ts, pdf_path, title,
+            initial_comment=":page_facing_up: *Full RCA Report*",
+        )
 
         if not pdf_uploaded:
             from vishwakarma.utils.slack_format import md_to_slack, chunk_for_slack, strip_code_wrapper

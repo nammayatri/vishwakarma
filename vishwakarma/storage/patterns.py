@@ -300,32 +300,29 @@ def replay_pattern(
     if not steps:
         return None
 
-    # ── Execute pattern steps ──
-    all_output_text = ""
-    step_results = []
-    for step in steps[:5]:
+    # ── Execute pattern steps (parallel — they're independent read-only
+    # checks, and this replay blocks the alert path before the main loop) ──
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _run_step(step: dict) -> dict:
         tool_name = step.get("tool", "")
         params = step.get("params", step.get("params_template", {}))
         what_to_check = step.get("what_to_check", "")
-
         try:
             output = executor.execute(tool_name, params)
             content = str(output.output) if output.output else str(output.error or "")
-            step_results.append({
-                "tool": tool_name,
-                "what_to_check": what_to_check,
-                "output": content[:2000],
-                "status": str(output.status),
-            })
-            all_output_text += f"\n{content}"
+            return {"tool": tool_name, "what_to_check": what_to_check,
+                    "output": content[:2000], "status": str(output.status),
+                    "_full": content}
         except Exception as e:
-            step_results.append({
-                "tool": tool_name,
-                "what_to_check": what_to_check,
-                "output": f"(error: {e})",
-                "status": "error",
-            })
-            all_output_text += f"\n(error: {e})"
+            return {"tool": tool_name, "what_to_check": what_to_check,
+                    "output": f"(error: {e})", "status": "error",
+                    "_full": f"(error: {e})"}
+
+    run = steps[:5]
+    with ThreadPoolExecutor(max_workers=min(5, len(run))) as pool:
+        step_results = list(pool.map(_run_step, run))
+    all_output_text = "\n" + "\n".join(r.pop("_full") for r in step_results)
 
     # ── Deterministic keyword validation (word-boundary matching) ──
 

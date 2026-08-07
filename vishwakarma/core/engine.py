@@ -18,6 +18,7 @@ Features:
 """
 import json
 import logging
+import os
 import time
 from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -41,7 +42,10 @@ log = logging.getLogger(__name__)
 
 DEFAULT_MAX_STEPS = 40
 CHECKPOINT_STEP = 20  # inject a reflection prompt at this step to force RCA-or-continue decision
-MAX_TOOL_OUTPUT = 8000  # chars — outputs above this get compressed via fast_model
+# chars — outputs above this get compressed via fast_model. 12k ≈ 3k tokens:
+# cheap for a 128k-context model, and skipping compression both saves a
+# blocking LLM call per step and keeps raw evidence intact.
+MAX_TOOL_OUTPUT = int(os.environ.get("VK_MAX_TOOL_OUTPUT", "12000"))
 
 
 class InvestigationEngine:
@@ -70,8 +74,11 @@ class InvestigationEngine:
         # ends when the root cause is VERIFIED (explains all symptoms), not at a
         # fixed step. max_steps is the hard backstop.
         self.run_until_verified: bool = True
-        self.verify_after: int = 12       # first verification check
-        self.verify_every: int = 8        # then every N steps
+        # With parallel tool batching each step covers several runbook commands,
+        # so verification can start earlier — the checkpoint ends the run as
+        # soon as the cause is verified, it never forces a premature RCA.
+        self.verify_after: int = int(os.environ.get("VK_VERIFY_AFTER", "8"))
+        self.verify_every: int = int(os.environ.get("VK_VERIFY_EVERY", "6"))
 
     def _should_verify(self, step: int, last_verify: int) -> bool:
         """True when a verification checkpoint should be injected at this step."""
@@ -122,17 +129,22 @@ class InvestigationEngine:
         if not large:
             return executed
 
-        # Single large output — direct summarize (no batching overhead)
+        # Single large output — direct summarize (no batching overhead).
+        # Cap the raw input like the batch path does: head + tail keeps errors
+        # (which cluster at the end) without shipping a 500KB log dump.
         if len(large) == 1:
             cid, tool_name = large[0]
             output, content = executed[cid]
+            capped = content if len(content) <= 24000 else (
+                content[:16000] + "\n...[truncated middle]...\n" + content[-8000:]
+            )
             compressed = self.llm.summarize(
                 f"You are helping investigate an infrastructure incident. "
                 f"Compress the following {tool_name} output to the 20 most relevant lines. "
                 f"Preserve: error messages, stack traces, anomalous values, lines that differ from baseline, "
                 f"the LAST 5 lines of the output (errors often appear at the end), and exact timestamps. "
                 f"Remove: repetitive healthy/normal entries only.\n\n"
-                f"{content}"
+                f"{capped}"
             )
             executed[cid] = (output, compressed)
             return executed
@@ -466,9 +478,11 @@ class InvestigationEngine:
                     for cid, tname, tparams in to_execute:
                         tool_call_counter += 1
                         futures[pool.submit(_run_tool, cid, tname, tparams, tool_call_counter)] = cid
-                    for future in as_completed(futures):
+                    _deadline = time.time() + 150
+                    for future in as_completed(futures, timeout=300):
                         try:
-                            cid, tname, output, content = future.result(timeout=150)
+                            cid, tname, output, content = future.result(
+                                timeout=max(5, _deadline - time.time()))
                             executed[cid] = (output, content)
                         except Exception as tool_err:
                             cid = futures[future]
@@ -871,11 +885,15 @@ class InvestigationEngine:
                     f"{n_blocked} blocked"
                 )
 
-                # Wait for all dispatched tools to complete
+                # Wait for all dispatched tools to complete. Global deadline:
+                # 150s total for the whole batch, not 150s per future — five
+                # hung tools must not stall a step for 12+ minutes.
                 stream_results: dict[str, tuple[str, Any, str]] = {}
+                _deadline = time.time() + 150
                 for call_id, future in overlap_futures.items():
                     try:
-                        cid, tool_name, output, content = future.result(timeout=150)
+                        cid, tool_name, output, content = future.result(
+                            timeout=max(5, _deadline - time.time()))
                         stream_results[cid] = (tool_name, output, content)
                         all_stream_tool_outputs.append(output)
                         yield {

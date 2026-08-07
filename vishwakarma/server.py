@@ -589,12 +589,23 @@ async def _resume_investigation(config, state, inv: dict) -> None:
             log.debug(f"Reaper: save failed: {e}")
         ch = labels.get("slack_channel")
         if config.is_slack_configured() and ch:
+            # Resumed RCAs get a PDF too — without this the repost always
+            # falls back to a wall of text in the thread.
+            pdf_path = None
+            try:
+                from vishwakarma.bot.pdf import generate_pdf
+                pdf_path = generate_pdf(
+                    title=f"{inc.get('title', 'RCA')} (resumed)", analysis=final,
+                    source=inc.get("source", ""), severity=inc.get("severity", "high"))
+            except Exception as e:
+                log.warning(f"Reaper: PDF generation failed, posting text: {e}")
             try:
                 from vishwakarma.plugins.relays.slack.plugin import SlackDestination
                 SlackDestination({"token": config.slack_bot_token}).post_investigation(
                     title=f"{inc.get('title', 'RCA')} (resumed)", analysis=final,
                     source=inc.get("source", ""), severity=inc.get("severity", "high"),
-                    incident_id=incident_id, thread_ts=labels.get("slack_thread_ts"), channel=ch)
+                    incident_id=incident_id, thread_ts=labels.get("slack_thread_ts"), channel=ch,
+                    pdf_path=pdf_path)
             except Exception as e:
                 log.debug(f"Reaper: slack post failed: {e}")
     finish_investigation(incident_id, "done")
@@ -607,7 +618,11 @@ async def _reap_orphans(config, state, stale_seconds: int = 120) -> None:
     import socket
     from vishwakarma.storage.investigations import find_orphaned
     try:
-        orphans = find_orphaned(stale_seconds=stale_seconds, limit=10)
+        # Off the event loop — this is a network DB call and the sweep runs
+        # every 120s; blocking here stalls webhook handling.
+        loop = asyncio.get_event_loop()
+        orphans = await loop.run_in_executor(
+            None, lambda: find_orphaned(stale_seconds=stale_seconds, limit=10))
     except Exception as e:
         log.debug(f"Reaper: scan failed: {e}")
         return
@@ -715,29 +730,68 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
                     ack_kwargs["thread_ts"] = report_thread
                 resp = slack_client.chat_postMessage(**ack_kwargs)
                 ack_ts = resp["ts"]
+                # chat.postMessage accepts a #name and returns the real channel
+                # ID — use it for everything downstream (files_upload_v2 needs
+                # an ID and the token has no channels:read scope to resolve one).
+                slack_channel_id = resp.get("channel") or slack_channel_id
             except Exception as e:
                 log.warning(f"Slack ack failed (non-fatal): {e}")
+
+        # Live phase status in the thread from second zero — updated at each
+        # pre-investigation phase, then reused by the streaming loop. Without
+        # this the thread is silent through enrichment + pattern check +
+        # sub-agent scan, which can take minutes on broad alerts.
+        phase_ts = None
+
+        def _phase(text: str) -> None:
+            nonlocal phase_ts
+            if not (slack_client and slack_channel_id and ack_ts):
+                return
+            try:
+                blocks = [{"type": "context", "elements": [{"type": "mrkdwn", "text": text}]}]
+                if phase_ts:
+                    slack_client.chat_update(channel=slack_channel_id, ts=phase_ts,
+                                             text=text, blocks=blocks)
+                else:
+                    r = slack_client.chat_postMessage(channel=slack_channel_id, thread_ts=ack_ts,
+                                                      text=text, blocks=blocks)
+                    phase_ts = r["ts"]
+            except Exception as e:
+                log.debug(f"Phase status update failed: {e}")
+
+        _phase(":mag: _Gathering context — cluster state, prior incidents, runbooks..._")
 
         # Run the 4 pre-enrichment tasks in parallel
         prefetch_future = loop.run_in_executor(None, _prefetch_alert_context, issue)
         prior_future = loop.run_in_executor(None, _build_prior_context, issue)
         entities_future = loop.run_in_executor(None, _extract_alert_entities, issue, llm)
-        runbooks_future = loop.run_in_executor(None, load_matching_runbooks, alert_name, llm)
+        # Alert's cloud label, defaulting to THIS instance's cloud — each
+        # deployment (VK_CLOUD=aws|gcp) is independent and investigates only
+        # its own cloud, so unlabeled alerts get the instance's facet.
+        _cloud = issue.labels.get("cloud", "") or config.cloud or ""
 
-        prefetch_ctx, prior_ctx, entities_ctx, matched_runbooks = await _asyncio.gather(
+        def _match_runbooks_once() -> tuple[list[str], list[str]]:
+            """One hybrid retrieval for both content and ids (was run twice),
+            with the cloud facet applied."""
+            try:
+                from vishwakarma.core.runbook_match import match_runbooks
+                matched = match_runbooks(alert_name, cloud=_cloud, llm=llm)
+                if matched:
+                    return ([f"# Runbook: {m['title']}\n\n{m['content_md']}" for m in matched],
+                            [m["id"] for m in matched])
+            except Exception as e:
+                log.debug(f"Hybrid runbook match failed: {e}")
+            try:
+                return load_matching_runbooks(alert_name, llm), []
+            except Exception:
+                return [], []
+
+        runbooks_future = loop.run_in_executor(None, _match_runbooks_once)
+
+        prefetch_ctx, prior_ctx, entities_ctx, _rb_result = await _asyncio.gather(
             prefetch_future, prior_future, entities_future, runbooks_future
         )
-
-        # Capture the matched runbook ids so the ✅/❌ feedback loop can credit
-        # them (Slack buttons + console feedback bump hit/miss + self-populate
-        # the alert→runbook map).
-        matched_runbook_ids: list[str] = []
-        try:
-            from vishwakarma.core.runbook_match import match_runbooks
-            cloud = issue.labels.get("cloud", "")
-            matched_runbook_ids = [m["id"] for m in match_runbooks(alert_name, cloud=cloud)]
-        except Exception:
-            pass
+        matched_runbooks, matched_runbook_ids = _rb_result
 
         # Pre-inject learnings relevant to this alert
         learnings_mgr = state.get("learnings")
@@ -758,6 +812,8 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
         # gets the full investigation (pattern replay below still short-cuts
         # CONFIRMED patterns, which are human-validated).
         auto_resolved = False
+
+        _phase(":repeat: _Context gathered — checking confirmed incident patterns..._")
 
         # ── Pattern replay: check if a confirmed pattern matches ──
         pattern_matched = False
@@ -803,6 +859,7 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
                         f"Previously confirmed on: {time.strftime('%Y-%m-%d', time.localtime(best['last_seen']))}"
                     )
                     log.info(f"Pattern matched for {alert_name}: {best['root_cause_type']} — skipping full investigation")
+                    _phase(f":white_check_mark: _Matched confirmed pattern `{best['root_cause_type']}` — replayed targeted checks, RCA follows..._")
 
                     # Post match result
                     if slack_client and slack_channel_id and ack_ts:
@@ -865,17 +922,7 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
 
                 if domains:
                     log.info(f"Launching sub-agents for {alert_name}: {domains}")
-                    if slack_client and slack_channel_id and ack_ts:
-                        try:
-                            slack_client.chat_postMessage(
-                                channel=slack_channel_id, thread_ts=ack_ts,
-                                text=f":mag: Launching {len(domains)} parallel sub-agents: {', '.join(d.upper() for d in domains)}",
-                                blocks=[{"type": "context", "elements": [
-                                    {"type": "mrkdwn", "text": f":mag: _Launching {len(domains)} parallel sub-agents: {', '.join(d.upper() for d in domains)}_"}
-                                ]}],
-                            )
-                        except Exception:
-                            pass
+                    _phase(f":brain: _Parallel domain scan running: {', '.join(d.upper() for d in domains)} — deep investigation starts when it completes..._")
 
                     # Build a ToolExecutor from the toolset manager for sub-agents
                     sub_executor = ToolExecutor(toolsets=tm.active_toolsets())
@@ -937,22 +984,64 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
                 val = str(next(iter(params.values()), ""))
                 return val[:50].replace("\n", " ")
 
-            # Post initial status message in thread
+            # Reuse the pre-investigation phase message as the live status line
+            # (falls back to posting a fresh one if none was created).
             log.info(f"Streaming investigation: slack_client={bool(slack_client)} channel={slack_channel_id} ack_ts={ack_ts}")
             if slack_client and slack_channel_id and ack_ts:
                 try:
-                    resp = slack_client.chat_postMessage(
-                        channel=slack_channel_id,
-                        thread_ts=ack_ts,
-                        text=":hourglass: Starting deep investigation...",
-                        blocks=[{"type": "context", "elements": [
-                            {"type": "mrkdwn", "text": ":hourglass: _Starting deep investigation..._"}
-                        ]}],
-                    )
-                    status_ts = resp["ts"]
+                    txt = ":hourglass: Starting deep investigation..."
+                    blocks = [{"type": "context", "elements": [
+                        {"type": "mrkdwn", "text": ":hourglass: _Starting deep investigation..._"}
+                    ]}]
+                    if phase_ts:
+                        slack_client.chat_update(channel=slack_channel_id, ts=phase_ts,
+                                                 text=txt, blocks=blocks)
+                        status_ts = phase_ts
+                    else:
+                        resp = slack_client.chat_postMessage(
+                            channel=slack_channel_id, thread_ts=ack_ts,
+                            text=txt, blocks=blocks,
+                        )
+                        status_ts = resp["ts"]
                     log.info(f"Status message posted: ts={status_ts}")
                 except Exception as e:
                     log.warning(f"Status message failed: {e}")
+
+            # Throttled, non-blocking Slack status updates. The old code did a
+            # blocking chat_update per tool event (~2 per tool x ~5 tools x N
+            # steps = hundreds of 200-500ms round-trips inside the event loop,
+            # frequently 429'd). Latest-wins queue drained by one worker at
+            # ~1 update/1.2s (chat.update allows ~1/s/channel).
+            from concurrent.futures import ThreadPoolExecutor as _TPE
+            _slack_pool = _TPE(max_workers=1)
+            _slack_state: dict = {"pending": None, "inflight": False}
+
+            def _drain_status() -> None:
+                import time as _t
+                while True:
+                    text = _slack_state["pending"]
+                    if text is None:
+                        break
+                    _slack_state["pending"] = None
+                    try:
+                        slack_client.chat_update(
+                            channel=slack_channel_id, ts=status_ts, text=text,
+                            blocks=[{"type": "context", "elements": [
+                                {"type": "mrkdwn", "text": text}
+                            ]}],
+                        )
+                    except Exception:
+                        pass
+                    _t.sleep(1.2)
+                _slack_state["inflight"] = False
+
+            def _post_status(text: str) -> None:
+                if not (slack_client and status_ts):
+                    return
+                _slack_state["pending"] = text
+                if not _slack_state["inflight"]:
+                    _slack_state["inflight"] = True
+                    _slack_pool.submit(_drain_status)
 
             # Durable job: create + claim so the conversation checkpoints to
             # the investigations table at every step (crash-resumable).
@@ -1017,18 +1106,7 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
                     params = event.get("params", {})
                     param_str = _short_params(params)
                     tool_lines.append(f":gear: `{tool}({param_str})`")
-                    visible = tool_lines[-10:]
-                    status_text = "\n".join(visible)
-                    if slack_client and status_ts:
-                        try:
-                            slack_client.chat_update(
-                                channel=slack_channel_id, ts=status_ts, text=status_text,
-                                blocks=[{"type": "context", "elements": [
-                                    {"type": "mrkdwn", "text": status_text}
-                                ]}],
-                            )
-                        except Exception:
-                            pass
+                    _post_status("\n".join(tool_lines[-10:]))
 
                 elif etype == "tool_call_result":
                     status = event.get("status", "")
@@ -1038,18 +1116,7 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
                         if tool_name and f"`{tool_name}(" in tool_lines[i] and ":white_check_mark:" not in tool_lines[i] and ":x:" not in tool_lines[i]:
                             tool_lines[i] = tool_lines[i] + f" {marker}"
                             break
-                    visible = tool_lines[-10:]
-                    status_text = "\n".join(visible)
-                    if slack_client and status_ts:
-                        try:
-                            slack_client.chat_update(
-                                channel=slack_channel_id, ts=status_ts, text=status_text,
-                                blocks=[{"type": "context", "elements": [
-                                    {"type": "mrkdwn", "text": status_text}
-                                ]}],
-                            )
-                        except Exception:
-                            pass
+                    _post_status("\n".join(tool_lines[-10:]))
 
                 elif etype == "compaction":
                     tool_lines.append(":compression: _context compacted_")
@@ -1060,8 +1127,11 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
                 elif etype == "done":
                     analysis = event.get("content", "") or analysis
 
-            # Finalize status message
+            # Finalize status message (direct — after stopping the drain worker
+            # so a stale queued update can't overwrite the final state)
             tool_count = len([t for t in tool_lines if ":gear:" in t])
+            _slack_state["pending"] = None
+            _slack_pool.shutdown(wait=True)
             if slack_client and status_ts:
                 try:
                     final_text = "\n".join(tool_lines[-10:]) + f"\n:white_check_mark: _Done — {tool_count} tools_"
@@ -1317,10 +1387,11 @@ def _fetch_issue_images(issue, config) -> list[dict]:
     urls = raw.get("image_urls") or []
     if not urls:
         return []
-    images: list[dict] = []
     token = config.slack_bot_token or ""
     import urllib.request
-    for url in urls[:4]:  # cap — vision context is expensive
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _fetch_one(url: str) -> dict | None:
         try:
             headers = {}
             if "slack.com" in url and token:
@@ -1329,12 +1400,17 @@ def _fetch_issue_images(issue, config) -> list[dict]:
             with urllib.request.urlopen(req, timeout=15) as resp:
                 ctype = resp.headers.get("Content-Type", "image/jpeg").split(";")[0]
                 if not ctype.startswith("image/"):
-                    continue
+                    return None
                 data = resp.read()
             b64 = base64.b64encode(data).decode()
-            images.append({"url": f"data:{ctype};base64,{b64}", "detail": "auto"})
+            return {"url": f"data:{ctype};base64,{b64}", "detail": "auto"}
         except Exception as e:
             log.warning(f"Could not fetch issue image: {e}")
+            return None
+
+    capped = urls[:4]  # cap — vision context is expensive
+    with ThreadPoolExecutor(max_workers=len(capped)) as pool:
+        images = [im for im in pool.map(_fetch_one, capped) if im]
     if images:
         log.info(f"Fetched {len(images)} image(s) for investigation")
     return images

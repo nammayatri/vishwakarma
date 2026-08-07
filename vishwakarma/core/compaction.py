@@ -87,14 +87,22 @@ def _count_tokens(messages: list[dict], model: str = "gpt-4o") -> int:
         return total // 3
 
 
+_context_window_cache: dict[str, int] = {}
+
+
 def _get_context_window(model: str) -> int:
-    """Get the model's context window size."""
+    """Get the model's context window size (cached — unknown gateway aliases
+    make litellm raise on EVERY lookup otherwise)."""
+    if model in _context_window_cache:
+        return _context_window_cache[model]
     try:
         import litellm
         info = litellm.get_model_info(model)
-        return info.get("max_input_tokens") or info.get("max_tokens") or 128_000
+        win = info.get("max_input_tokens") or info.get("max_tokens") or 128_000
     except Exception:
-        return 128_000
+        win = 128_000
+    _context_window_cache[model] = win
+    return win
 
 
 def compact_messages(
@@ -113,9 +121,17 @@ def compact_messages(
         return messages, False
 
     model = llm.cfg.model if llm else "gpt-4o"
-    token_count = _count_tokens(messages, model)
     context_window = _get_context_window(model)
     threshold = int(context_window * COMPACTION_THRESHOLD_PCT / 100)
+
+    # Cheap char-based prefilter: full tokenization is O(history) and runs
+    # every step. At <2 chars/token no history under 1.5x threshold-chars can
+    # possibly exceed the token threshold — skip the exact count entirely.
+    approx_chars = sum(len(str(m.get("content") or "")) for m in messages)
+    if approx_chars < threshold * 2:
+        return messages, False
+
+    token_count = _count_tokens(messages, model)
 
     if token_count < threshold:
         return messages, False

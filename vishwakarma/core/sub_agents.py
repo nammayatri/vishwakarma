@@ -14,6 +14,7 @@ Each sub-agent:
 The main engine then synthesizes all sub-agent findings into a unified RCA.
 """
 import logging
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 from typing import Any, Callable
@@ -25,8 +26,10 @@ from vishwakarma.core.tools import ToolExecutor
 log = logging.getLogger(__name__)
 
 # Total wall-clock budget for all sub-agents combined.
-# Individual sub-agents may finish earlier; this is the hard cap.
-SUB_AGENT_TIMEOUT = 60  # seconds
+# Individual sub-agents may finish earlier; this is the hard cap. It is a
+# blocking barrier before the main investigation starts, so keep it tight —
+# a scan that hasn't found signal in 30s mostly returns "unknown" anyway.
+SUB_AGENT_TIMEOUT = int(os.environ.get("VK_SUB_AGENT_TIMEOUT", "30"))  # seconds
 
 
 # ── Domain Definitions ────────────────────────────────────────────────────────
@@ -212,7 +215,7 @@ def _create_sub_agent_llm(llm_config: LLMConfig) -> VishwakarmaLLM:
         api_version=llm_config.api_version,
         max_tokens=4096,  # sub-agents produce short summaries
         temperature=0.0,
-        timeout=55,  # slightly under the total budget
+        timeout=max(10, SUB_AGENT_TIMEOUT - 5),  # slightly under the total budget
         # Use fast_fallbacks for sub-agents too
         fast_model=llm_config.fast_model,
         fast_fallbacks=llm_config.fast_fallbacks,

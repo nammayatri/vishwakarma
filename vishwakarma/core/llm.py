@@ -209,6 +209,14 @@ class VishwakarmaLLM:
             if tools:
                 kwargs["tools"] = tools
                 kwargs["tool_choice"] = "auto"
+            # Same reasoning policy as complete(): thinking off by default —
+            # it adds 10-30s/step on GLM-class models and reduces parallel
+            # tool-call batching. VK_THINK_ON_TOOL_STEPS=true re-enables.
+            _think = os.environ.get("VK_THINK_ON_TOOL_STEPS", "").lower() in ("1", "true", "yes")
+            if not tools or not _think:
+                kwargs["extra_body"] = {
+                    "chat_template_kwargs": {"enable_thinking": False, "thinking": False}
+                }
 
             try:
                 response = completion(**kwargs)
@@ -362,7 +370,13 @@ class VishwakarmaLLM:
         """
         start = time.time()
         last_error = None
-        for i, model in enumerate(models):
+        # Index-based walk so a rate-limit wait can retry the SAME model
+        # (the old for-loop's `continue` silently advanced to the next one,
+        # wasting the sleep).
+        i = 0
+        retried_same: set[int] = set()
+        while i < len(models):
+            model = models[i]
             # Check total time budget
             elapsed = time.time() - start
             if elapsed > total_budget:
@@ -389,9 +403,13 @@ class VishwakarmaLLM:
                 if tools:
                     kwargs["tools"] = tools
                     kwargs["tool_choice"] = "auto"
-                # Disable reasoning for fast calls (summarize, compress)
-                # Works for GLM-5 (enable_thinking) and Kimi-K2.5 (thinking)
-                if not tools:
+                # Disable reasoning by default — on GLM-class models thinking
+                # adds 10-30s per step and empirically yields FEWER parallel
+                # tool calls per step (deeper progress without it). Set
+                # VK_THINK_ON_TOOL_STEPS=true to re-enable for tool steps.
+                # Works for GLM-5 (enable_thinking) and Kimi-K2.5 (thinking).
+                _think = os.environ.get("VK_THINK_ON_TOOL_STEPS", "").lower() in ("1", "true", "yes")
+                if not tools or not _think:
                     kwargs["extra_body"] = {
                         "chat_template_kwargs": {"enable_thinking": False, "thinking": False}
                     }
@@ -416,15 +434,17 @@ class VishwakarmaLLM:
                         try:
                             reset_time = datetime.strptime(reset_match.group(1), "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
                             wait_secs = (reset_time - datetime.now(timezone.utc)).total_seconds()
-                            if 0 < wait_secs <= 10:  # only wait if reset is within 10s
+                            if 0 < wait_secs <= 10 and i not in retried_same:
                                 log.info(f"Rate limit resets in {wait_secs:.0f}s — waiting")
                                 time.sleep(min(wait_secs + 0.5, 10))
-                                continue  # retry same model after rate limit reset
+                                retried_same.add(i)
+                                continue  # retry the SAME model (i unchanged)
                         except Exception:
                             pass
                 log.warning(f"Model {model} failed ({error_type}: {str(e)[:80]}), "
                            f"{'trying next' if i < len(models) - 1 else 'no more fallbacks'} "
                            f"[{time.time() - start:.1f}s elapsed]")
+                i += 1
         raise last_error  # type: ignore
 
     def _get_fast_chain(self) -> list[str]:
