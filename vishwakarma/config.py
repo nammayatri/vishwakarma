@@ -312,13 +312,38 @@ class VishwakarmaConfig:
         # Toolsets config (dict of name → {enabled, config})
         self.toolsets_config: dict[str, Any] = raw.get("toolsets", {})
 
+        # Fast triage — staged Istio→Release Monitoring→DB/Redis→pod-resource
+        # narration posted to Slack (one message per stage) ahead of the full
+        # agentic RCA. Needs the `prometheus` toolset; defaults to on whenever
+        # that toolset is enabled, override with fast_triage.enabled: false.
+        # timeout_seconds is a TOTAL budget across all 4 stages, not per-stage.
         ft = raw.get("fast_triage", {})
         _prom_enabled = bool(self.toolsets_config.get("prometheus", {}).get("enabled", False))
         self.fast_triage_enabled: bool = bool(ft.get("enabled", _prom_enabled)) and _prom_enabled
         self.fast_triage_timeout_seconds: int = int(
-            _env("VK_FAST_TRIAGE_TIMEOUT", str(ft.get("timeout_seconds", 45)))
+            _env("VK_FAST_TRIAGE_TIMEOUT", str(ft.get("timeout_seconds", 240)))
         )
+        self.fast_triage_top_n: int = int(_env("VK_FAST_TRIAGE_TOP_N", str(ft.get("top_n", 5))))
         self.fast_triage_namespace_exclude: str = ft.get("istio_namespace_exclude", "app-monitor")
+        # How long the deep investigation will wait for the fast-triage
+        # pipeline to finish before proceeding without its findings as
+        # pre-investigation evidence — separate from (and much shorter than)
+        # fast_triage_timeout_seconds, which is triage's own total budget.
+        # Slack narration from fast_triage is unaffected either way (posts as
+        # each stage completes, on its own schedule).
+        self.fast_triage_evidence_wait_seconds: int = int(
+            _env("VK_FAST_TRIAGE_EVIDENCE_WAIT", str(ft.get("evidence_wait_seconds", 90)))
+        )
+
+        # GCP Cloud Monitoring webhook — receives Cloud Monitoring incident
+        # notifications and triggers the same investigation flow as
+        # /api/alertmanager. GCP doesn't support IP-allowlisting webhooks, so
+        # this is secured with a shared secret token instead (checked via
+        # constant-time comparison); unset = endpoint stays disabled.
+        gcm = raw.get("gcp_cloud_monitoring", {})
+        self.gcp_cm_webhook_token: str = _env(
+            "VK_GCP_CM_WEBHOOK_TOKEN", gcm.get("webhook_token", "")
+        ) or ""
 
         # Custom toolset YAML paths
         self.custom_toolset_paths: list[str] = raw.get("custom_toolset_paths", [])

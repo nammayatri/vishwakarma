@@ -365,15 +365,12 @@ def create_app(config=None) -> FastAPI:
         AlertManager webhook receiver.
         Deduplicates, triggers background investigation, posts to Slack.
         """
-        import asyncio
-
         try:
             payload = await request.json()
         except Exception:
             raise HTTPException(400, "Invalid JSON")
 
         from vishwakarma.plugins.channels.alertmanager.plugin import parse_alertmanager_webhook
-        from vishwakarma.storage.queries import save_incident, alert_fingerprint
 
         # Auto-resolve: AlertManager 'resolved' status → close the matching open
         # incident(s). parse_alertmanager_webhook drops resolved alerts (we don't
@@ -393,74 +390,60 @@ def create_app(config=None) -> FastAPI:
         if not issues:
             return {"status": "no_issues"}
 
-        triggered = []
-        for issue in issues:
-            fingerprint = alert_fingerprint(issue.labels)
+        triggered = await _trigger_investigations_for_issues(config, issues)
+        return {"status": "ok", "alerts": triggered}
 
-            # Per-cloud hard filter: when this pod has its own cloud set (CLOUD=gcp
-            # / aws), ONLY investigate alerts routed to that cloud — the other
-            # cloud's pod handles the rest. Safety net even if an alertmanager
-            # mis-points. (Empty config.cloud = all-in-one, handles everything.)
-            if config.cloud:
-                from vishwakarma.core.cloud_router import route_issue as _route
-                alert_cloud = _route(issue, default_cloud=config.default_cloud)
-                if alert_cloud != config.cloud:
-                    log.info(f"Skipping '{issue.title}' — routed to {alert_cloud}, "
-                             f"this pod serves {config.cloud}")
-                    triggered.append({"title": issue.title, "status": "skipped-other-cloud",
-                                      "cloud": alert_cloud})
-                    continue
+    # ── /api/gcp-cloud-monitoring/webhook ───────────────────────────────────────
 
-            # Skip only if an investigation for this alert is currently running
-            # (Holmes pattern). Atomic across pods when Redis is configured.
-            if not _dedup.try_acquire(fingerprint):
-                log.info(f"Alert deduplicated (investigation in progress): {issue.title}")
-                triggered.append({"title": issue.title, "status": "deduplicated"})
-                continue
+    @app.post("/api/gcp-cloud-monitoring/webhook")
+    async def gcp_cloud_monitoring_webhook(request: Request, auth_token: str | None = None):
+        """
+        GCP Cloud Monitoring webhook receiver. Same dispatch as
+        /api/alertmanager (dedup, correlation, background investigation),
+        just a different alert source.
 
-            # Incident correlation: a DIFFERENT alert sharing a strong entity
-            # with an active investigation (within the window) is part of the
-            # same storm — group it instead of starting a competing one.
-            from vishwakarma.core import correlation as _corr
-            corr_key = _corr.correlation_key(issue.labels)
-            parent = _corr.find_correlated(corr_key)
-            if parent:
-                _corr.record_correlated_alert(parent, issue.title, issue.labels)
-                _corr.link(corr_key, parent)  # extend the window while the storm continues
-                _dedup.release(fingerprint)   # not investigating this one
-                log.info(f"Alert correlated into {parent} (key={corr_key}): {issue.title}")
-                triggered.append({"title": issue.title, "status": "correlated",
-                                  "parent": parent})
-                continue
+        Cloud Monitoring doesn't support IP-allowlisting for webhooks and
+        requires a public endpoint, so this is gated by a shared secret
+        instead — passed as ?auth_token=<secret> (the token-in-URL pattern
+        Cloud Monitoring's own "webhook_tokenauth" channel type uses).
+        Disabled entirely (404) unless gcp_cloud_monitoring.webhook_token is
+        configured — never accepts unauthenticated traffic.
+        """
+        import hmac
 
-            incident_id = str(uuid.uuid4())
-            if corr_key:
-                _corr.link(corr_key, incident_id)   # claim the entity window
+        if not config.gcp_cm_webhook_token:
+            raise HTTPException(404, "Not found")
+        if not hmac.compare_digest(auth_token or "", config.gcp_cm_webhook_token):
+            raise HTTPException(401, "Unauthorized")
 
-            if getattr(config, "role", "") == "orchestrator":
-                # Orchestrator topology: route to the cloud whose executors can
-                # reach this alert's data plane, enqueue, done. Executors run
-                # the investigation (including Slack ack) and release dedup.
-                import json as _json
-                from vishwakarma.core.cloud_router import route_issue
-                from vishwakarma.core import jobstream
-                cloud = route_issue(issue, default_cloud=config.default_cloud)
-                jobstream.enqueue(cloud, {
-                    "incident_id": incident_id,
-                    "fingerprint": fingerprint,
-                    "cloud": cloud,
-                    "issue": _json.loads(issue.model_dump_json()),
-                })
-                triggered.append({"title": issue.title, "status": "queued",
-                                  "cloud": cloud, "incident_id": incident_id})
-                continue
+        try:
+            payload = await request.json()
+        except Exception:
+            raise HTTPException(400, "Invalid JSON")
 
-            # All-in-one topology (vk serve): investigate in-process
-            asyncio.create_task(
-                _run_alert_investigation(config, _state, issue, incident_id, fingerprint)
-            )
-            triggered.append({"title": issue.title, "status": "investigating", "incident_id": incident_id})
+        from vishwakarma.plugins.channels.gcp_cloud_monitoring.plugin import (
+            parse_gcp_cloud_monitoring_webhook,
+        )
 
+        # Auto-resolve: a "closed" incident notification → close the matching
+        # open incident(s), mirroring the AlertManager 'resolved' handling above.
+        try:
+            from vishwakarma.storage.queries import resolve_incidents_by_labels
+            incident = payload.get("incident") or {}
+            if incident.get("state") == "closed":
+                labels = {"alertname": incident.get("policy_name", "")}
+                n = resolve_incidents_by_labels(labels)
+                if n:
+                    log.info(f"Auto-resolved {n} incident(s) — GCP incident closed: "
+                             f"{incident.get('policy_name')}")
+        except Exception as e:
+            log.debug(f"Auto-resolve on GCP incident close failed (non-fatal): {e}")
+
+        issues = parse_gcp_cloud_monitoring_webhook(payload)
+        if not issues:
+            return {"status": "no_issues"}
+
+        triggered = await _trigger_investigations_for_issues(config, issues)
         return {"status": "ok", "alerts": triggered}
 
     # ── /api/model ────────────────────────────────────────────────────────────
@@ -523,6 +506,91 @@ def create_app(config=None) -> FastAPI:
         }
 
     return app
+
+
+# ── Alert dispatch (shared by every alert-source webhook) ──────────────────────
+
+async def _trigger_investigations_for_issues(config, issues: list) -> list[dict]:
+    """
+    Per-issue dispatch shared by /api/alertmanager and
+    /api/gcp-cloud-monitoring/webhook: cloud filter, dedup, correlation, then
+    either enqueue (orchestrator topology) or start an in-process
+    investigation (all-in-one). Extracted from the original
+    /api/alertmanager handler body verbatim so alert-source plumbing doesn't
+    duplicate/drift between sources.
+    """
+    import asyncio
+    from vishwakarma.storage.queries import alert_fingerprint
+
+    triggered = []
+    for issue in issues:
+        fingerprint = alert_fingerprint(issue.labels)
+
+        # Per-cloud hard filter: when this pod has its own cloud set (CLOUD=gcp
+        # / aws), ONLY investigate alerts routed to that cloud — the other
+        # cloud's pod handles the rest. Safety net even if an alertmanager
+        # mis-points. (Empty config.cloud = all-in-one, handles everything.)
+        if config.cloud:
+            from vishwakarma.core.cloud_router import route_issue as _route
+            alert_cloud = _route(issue, default_cloud=config.default_cloud)
+            if alert_cloud != config.cloud:
+                log.info(f"Skipping '{issue.title}' — routed to {alert_cloud}, "
+                         f"this pod serves {config.cloud}")
+                triggered.append({"title": issue.title, "status": "skipped-other-cloud",
+                                  "cloud": alert_cloud})
+                continue
+
+        # Skip only if an investigation for this alert is currently running
+        # (Holmes pattern). Atomic across pods when Redis is configured.
+        if not _dedup.try_acquire(fingerprint):
+            log.info(f"Alert deduplicated (investigation in progress): {issue.title}")
+            triggered.append({"title": issue.title, "status": "deduplicated"})
+            continue
+
+        # Incident correlation: a DIFFERENT alert sharing a strong entity
+        # with an active investigation (within the window) is part of the
+        # same storm — group it instead of starting a competing one.
+        from vishwakarma.core import correlation as _corr
+        corr_key = _corr.correlation_key(issue.labels)
+        parent = _corr.find_correlated(corr_key)
+        if parent:
+            _corr.record_correlated_alert(parent, issue.title, issue.labels)
+            _corr.link(corr_key, parent)  # extend the window while the storm continues
+            _dedup.release(fingerprint)   # not investigating this one
+            log.info(f"Alert correlated into {parent} (key={corr_key}): {issue.title}")
+            triggered.append({"title": issue.title, "status": "correlated",
+                              "parent": parent})
+            continue
+
+        incident_id = str(uuid.uuid4())
+        if corr_key:
+            _corr.link(corr_key, incident_id)   # claim the entity window
+
+        if getattr(config, "role", "") == "orchestrator":
+            # Orchestrator topology: route to the cloud whose executors can
+            # reach this alert's data plane, enqueue, done. Executors run
+            # the investigation (including Slack ack) and release dedup.
+            import json as _json
+            from vishwakarma.core.cloud_router import route_issue
+            from vishwakarma.core import jobstream
+            cloud = route_issue(issue, default_cloud=config.default_cloud)
+            jobstream.enqueue(cloud, {
+                "incident_id": incident_id,
+                "fingerprint": fingerprint,
+                "cloud": cloud,
+                "issue": _json.loads(issue.model_dump_json()),
+            })
+            triggered.append({"title": issue.title, "status": "queued",
+                              "cloud": cloud, "incident_id": incident_id})
+            continue
+
+        # All-in-one topology (vk serve): investigate in-process
+        asyncio.create_task(
+            _run_alert_investigation(config, _state, issue, incident_id, fingerprint)
+        )
+        triggered.append({"title": issue.title, "status": "investigating", "incident_id": incident_id})
+
+    return triggered
 
 
 # ── Background investigation ───────────────────────────────────────────────────
@@ -763,10 +831,32 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
 
         triage_future = None
         if config.fast_triage_enabled:
-            from vishwakarma.core.fast_triage import run_fast_triage
+            from vishwakarma.core.fast_triage import run_fast_triage_staged
+
+            def _post_triage_stage(stage_name: str, summary_text: str) -> None:
+                if not (slack_client and slack_channel_id and ack_ts):
+                    return
+                try:
+                    slack_client.chat_postMessage(
+                        channel=slack_channel_id, thread_ts=ack_ts,
+                        text=summary_text,
+                        blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": summary_text}}],
+                    )
+                except Exception as e:
+                    log.debug(f"Fast triage Slack post failed ({stage_name}, non-fatal): {e}")
+
+            # Runs the 4-stage triage (Istio -> Release Monitoring -> DB/Redis
+            # -> pod CPU/Mem) in a background thread, posting one Slack
+            # message per stage as it completes. Not awaited here — Slack
+            # narration is never delayed by the critical path below. Its
+            # findings ARE awaited later, but only for a short bounded grace
+            # window (config.fast_triage_evidence_wait_seconds), so they can
+            # seed the deep investigation without the investigation start
+            # itself being able to hang on a slow/stuck triage run.
             triage_future = loop.run_in_executor(
-                None, run_fast_triage, issue, tm, llm,
-                config.fast_triage_timeout_seconds, config.fast_triage_namespace_exclude,
+                None, run_fast_triage_staged, issue, tm, llm, _post_triage_stage,
+                config.fast_triage_timeout_seconds, config.fast_triage_top_n,
+                config.fast_triage_namespace_exclude,
             )
 
         # Run the 4 pre-enrichment tasks in parallel
@@ -796,49 +886,6 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
 
         runbooks_future = loop.run_in_executor(None, _match_runbooks_once)
 
-        def _post_triage_result(triage_result: dict | None) -> None:
-            if not (triage_result and slack_client and slack_channel_id and ack_ts):
-                return
-            try:
-                slack_client.chat_postMessage(
-                    channel=slack_channel_id, thread_ts=ack_ts,
-                    text=triage_result["summary_text"],
-                    blocks=[{"type": "section", "text": {
-                        "type": "mrkdwn", "text": triage_result["summary_text"],
-                    }}],
-                )
-            except Exception as e:
-                log.debug(f"Fast triage Slack post failed (non-fatal): {e}")
-
-        # Fast triage gets a short grace window to land in time to also seed
-        # the deep investigation's context — but must never hold up the
-        # critical path (it has its own internal timeout of up to
-        # config.fast_triage_timeout_seconds, far longer than we can afford
-        # to block here). If it's not done within the grace window, detach it
-        # to a background task: it still posts to Slack whenever it finishes,
-        # just without feeding the deep investigation's prompt.
-        triage_ctx = ""
-        if triage_future is not None:
-            done, _pending = await _asyncio.wait({triage_future}, timeout=5)
-            if triage_future in done:
-                try:
-                    triage_result = await triage_future
-                except Exception as e:
-                    log.warning(f"Fast triage failed (non-fatal): {e}")
-                    triage_result = None
-                if triage_result:
-                    triage_ctx = f"## Quick Triage (automated pre-check)\n{triage_result['summary_text']}"
-                _post_triage_result(triage_result)
-            else:
-                async def _finish_triage_in_background(fut) -> None:
-                    try:
-                        result = await fut
-                    except Exception as e:
-                        log.warning(f"Fast triage failed (non-fatal): {e}")
-                        return
-                    _post_triage_result(result)
-                _asyncio.ensure_future(_finish_triage_in_background(triage_future))
-
         prefetch_ctx, prior_ctx, entities_ctx, _rb_result = await _asyncio.gather(
             prefetch_future, prior_future, entities_future, runbooks_future
         )
@@ -849,7 +896,7 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
         learnings_ctx = learnings_mgr.for_alert(alert_name) if learnings_mgr else ""
 
         # Merge all pre-investigation context into extra_system_prompt
-        extra_parts = [p for p in [entities_ctx, triage_ctx, prefetch_ctx, prior_ctx, learnings_ctx] if p]
+        extra_parts = [p for p in [entities_ctx, prefetch_ctx, prior_ctx, learnings_ctx] if p]
 
         extra_parts.append(
             "## Learned Knowledge\n"
@@ -1017,6 +1064,38 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
                                 pass
             except Exception as e:
                 log.warning(f"Sub-agent investigation failed (non-fatal, continuing with main investigation): {e}")
+
+        # ── Fold fast-triage findings into pre-investigation evidence ──
+        # Give the staged triage pipeline a bounded grace window to finish so
+        # its findings can seed the deep investigation (as pre-investigation
+        # evidence alongside any matched runbook) — often already done by
+        # this point since pattern-check + sub-agents just ran. Slack
+        # narration from fast_triage keeps posting regardless of this wait,
+        # via its own callback; only prompt-seeding is gated here.
+        if triage_future is not None:
+            try:
+                done, _pending = await _asyncio.wait(
+                    {triage_future}, timeout=config.fast_triage_evidence_wait_seconds
+                )
+                if triage_future in done:
+                    fast_triage_evidence = await triage_future
+                    if fast_triage_evidence:
+                        evidence_block = (
+                            f"## Automated Pre-Investigation Findings (Fast Triage)\n\n{fast_triage_evidence}"
+                        )
+                        sub_agent_findings_text = (
+                            f"{evidence_block}\n\n{sub_agent_findings_text}"
+                            if sub_agent_findings_text else evidence_block
+                        )
+                else:
+                    async def _finish_triage_in_background(fut) -> None:
+                        try:
+                            await fut
+                        except Exception as e:
+                            log.warning(f"Fast triage failed (non-fatal): {e}")
+                    _asyncio.ensure_future(_finish_triage_in_background(triage_future))
+            except Exception as e:
+                log.warning(f"Fast triage evidence wait failed (non-fatal): {e}")
 
         # ── Streaming investigation with real-time Slack updates ──
         # Same style as the Slack "debug" path: small context blocks,
