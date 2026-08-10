@@ -69,20 +69,6 @@ def _topk_rows(rows: list[tuple[dict, float]], n: int) -> list[tuple[dict, float
     return sorted(rows, key=lambda r: r[1], reverse=True)[:n]
 
 
-def _topk_names(rows: list[tuple[dict, float]], label_key: str, n: int) -> list[tuple[str, float]]:
-    """Rank rows by value descending, dedupe by one label, keep the top n names."""
-    seen: set[str] = set()
-    out: list[tuple[str, float]] = []
-    for labels, val in sorted(rows, key=lambda r: r[1], reverse=True):
-        name = labels.get(label_key)
-        if name and name not in seen:
-            seen.add(name)
-            out.append((name, val))
-        if len(out) >= n:
-            break
-    return out
-
-
 # ── Stage 1 — Istio mesh ────────────────────────────────────────────────────
 
 def _stage_istio(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
@@ -107,15 +93,22 @@ def _stage_istio(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
         f'sum(increase(istio_requests_total{{{scope}, response_code!~"(2..|3..|5..)"}}[5m])) '
         f'by (destination_service_name, response_code)'
     ))
-    top_5xx = _topk_names(rows_5xx, "destination_service_name", top_n)
-    top_4xx = _topk_names(rows_4xx, "destination_service_name", top_n)
+    # Keep full rows (not just service names) — response_code!~"(2..|3..|4..)"
+    # also matches response_code="0" (Istio's code for connection-level
+    # failures, e.g. paired with flags like DC/UF/UC — no HTTP status at all).
+    # Collapsing to one row per service would hide *which* failure mode
+    # dominates behind a generic "5xx" label even when it's actually
+    # connection resets, not literal HTTP 500s.
+    top_5xx_rows = _topk_rows(rows_5xx, top_n)
+    top_4xx_rows = _topk_rows(rows_4xx, top_n)
 
     if known_service:
         services = [known_service]
     else:
         services, seen = [], set()
-        for name, _val in top_5xx + top_4xx:
-            if name not in seen:
+        for labels, _val in top_5xx_rows + top_4xx_rows:
+            name = labels.get("destination_service_name")
+            if name and name not in seen:
                 seen.add(name)
                 services.append(name)
         services = services[:top_n]
@@ -130,11 +123,20 @@ def _stage_istio(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
         )
         pod_rows = _topk_rows(_query(prom, pod_q), top_n)
 
+    def _code_tag(code: str) -> str:
+        return "connection-failure" if code == "0" else f"HTTP {code}"
+
     lines = []
-    if top_5xx:
-        lines.append("5xx by service: " + ", ".join(f"{n} ({int(v)}x)" for n, v in top_5xx))
-    if top_4xx:
-        lines.append("4xx by service: " + ", ".join(f"{n} ({int(v)}x)" for n, v in top_4xx))
+    if top_5xx_rows:
+        lines.append("5xx/connection-failures by service: " + ", ".join(
+            f"{labels.get('destination_service_name', '?')} [{_code_tag(labels.get('response_code', '?'))}] ({int(v)}x)"
+            for labels, v in top_5xx_rows
+        ))
+    if top_4xx_rows:
+        lines.append("4xx by service: " + ", ".join(
+            f"{labels.get('destination_service_name', '?')} [HTTP {labels.get('response_code', '?')}] ({int(v)}x)"
+            for labels, v in top_4xx_rows
+        ))
     if pod_rows:
         pod_lines = [
             f"{labels.get('pod', '?')} [{labels.get('response_code', '?')}/{labels.get('response_flags') or '-'}] {int(v)}x"
