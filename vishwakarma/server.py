@@ -761,6 +761,14 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
 
         _phase(":mag: _Gathering context — cluster state, prior incidents, runbooks..._")
 
+        triage_future = None
+        if config.fast_triage_enabled:
+            from vishwakarma.core.fast_triage import run_fast_triage
+            triage_future = loop.run_in_executor(
+                None, run_fast_triage, issue, tm, llm,
+                config.fast_triage_timeout_seconds, config.fast_triage_namespace_exclude,
+            )
+
         # Run the 4 pre-enrichment tasks in parallel
         prefetch_future = loop.run_in_executor(None, _prefetch_alert_context, issue)
         prior_future = loop.run_in_executor(None, _build_prior_context, issue)
@@ -788,6 +796,49 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
 
         runbooks_future = loop.run_in_executor(None, _match_runbooks_once)
 
+        def _post_triage_result(triage_result: dict | None) -> None:
+            if not (triage_result and slack_client and slack_channel_id and ack_ts):
+                return
+            try:
+                slack_client.chat_postMessage(
+                    channel=slack_channel_id, thread_ts=ack_ts,
+                    text=triage_result["summary_text"],
+                    blocks=[{"type": "section", "text": {
+                        "type": "mrkdwn", "text": triage_result["summary_text"],
+                    }}],
+                )
+            except Exception as e:
+                log.debug(f"Fast triage Slack post failed (non-fatal): {e}")
+
+        # Fast triage gets a short grace window to land in time to also seed
+        # the deep investigation's context — but must never hold up the
+        # critical path (it has its own internal timeout of up to
+        # config.fast_triage_timeout_seconds, far longer than we can afford
+        # to block here). If it's not done within the grace window, detach it
+        # to a background task: it still posts to Slack whenever it finishes,
+        # just without feeding the deep investigation's prompt.
+        triage_ctx = ""
+        if triage_future is not None:
+            done, _pending = await _asyncio.wait({triage_future}, timeout=5)
+            if triage_future in done:
+                try:
+                    triage_result = await triage_future
+                except Exception as e:
+                    log.warning(f"Fast triage failed (non-fatal): {e}")
+                    triage_result = None
+                if triage_result:
+                    triage_ctx = f"## Quick Triage (automated pre-check)\n{triage_result['summary_text']}"
+                _post_triage_result(triage_result)
+            else:
+                async def _finish_triage_in_background(fut) -> None:
+                    try:
+                        result = await fut
+                    except Exception as e:
+                        log.warning(f"Fast triage failed (non-fatal): {e}")
+                        return
+                    _post_triage_result(result)
+                _asyncio.ensure_future(_finish_triage_in_background(triage_future))
+
         prefetch_ctx, prior_ctx, entities_ctx, _rb_result = await _asyncio.gather(
             prefetch_future, prior_future, entities_future, runbooks_future
         )
@@ -798,7 +849,7 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
         learnings_ctx = learnings_mgr.for_alert(alert_name) if learnings_mgr else ""
 
         # Merge all pre-investigation context into extra_system_prompt
-        extra_parts = [p for p in [entities_ctx, prefetch_ctx, prior_ctx, learnings_ctx] if p]
+        extra_parts = [p for p in [entities_ctx, triage_ctx, prefetch_ctx, prior_ctx, learnings_ctx] if p]
 
         extra_parts.append(
             "## Learned Knowledge\n"

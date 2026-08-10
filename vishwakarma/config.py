@@ -312,6 +312,14 @@ class VishwakarmaConfig:
         # Toolsets config (dict of name → {enabled, config})
         self.toolsets_config: dict[str, Any] = raw.get("toolsets", {})
 
+        ft = raw.get("fast_triage", {})
+        _prom_enabled = bool(self.toolsets_config.get("prometheus", {}).get("enabled", False))
+        self.fast_triage_enabled: bool = bool(ft.get("enabled", _prom_enabled)) and _prom_enabled
+        self.fast_triage_timeout_seconds: int = int(
+            _env("VK_FAST_TRIAGE_TIMEOUT", str(ft.get("timeout_seconds", 45)))
+        )
+        self.fast_triage_namespace_exclude: str = ft.get("istio_namespace_exclude", "app-monitor")
+
         # Custom toolset YAML paths
         self.custom_toolset_paths: list[str] = raw.get("custom_toolset_paths", [])
 
