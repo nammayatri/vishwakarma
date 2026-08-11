@@ -475,6 +475,15 @@ def create_app(config=None) -> FastAPI:
             timestamp = request.headers.get("X-Slack-Request-Timestamp", "")
             signature = request.headers.get("X-Slack-Signature", "")
             if not verify_xyne_signature(config.xyne_signing_secret, timestamp, raw_body, signature):
+                # TEMP DIAGNOSTIC (remove once Xyne's real auth scheme is confirmed):
+                # log every header name + a truncated body so the actual request
+                # shape can be compared against our assumed Slack-style signing.
+                safe_headers = {k: v for k, v in request.headers.items()
+                                 if k.lower() not in ("authorization", "cookie")}
+                log.warning(
+                    f"Xyne webhook 401 — assumed signature scheme didn't match. "
+                    f"headers={safe_headers} body[:300]={raw_body[:300]!r}"
+                )
                 raise HTTPException(401, "Unauthorized")
         elif not hmac.compare_digest(auth_token or "", config.xyne_webhook_token):
             raise HTTPException(401, "Unauthorized")
