@@ -10,11 +10,22 @@ real API (2026-08-11):
     alone — chat_postMessage/chat_update below check `ok` explicitly).
   - auth.test: works, returns {"ok", "user_id", "bot_id", "user": "Argus",
     "team": "Nammayatri", ...} — same shape Slack's auth.test returns.
-  - conversations.replies/.history/.list: endpoints EXIST but the app's
-    current token lacks the `channels:read` scope (granted:
-    ["files:write", "chat:write", "im:write"]) — thread-fetching will fail
-    with {"ok": false, "error": "missing_permission"} until that scope is
-    granted on Xyne's side.
+  - conversations.replies/.history/.list: work once `channels:read` is
+    granted.
+  - KNOWN GAP (confirmed live, 2026-08-11): the APP_MENTIONED webhook
+    payload's conversationId/messageId are UUID-format internal
+    event/delivery ids — NOT the real Xyne message ts (a different
+    cuid-style format, e.g. "cmsoj0act44c1v48c1l31jm1g", only obtainable
+    from a chat.postMessage response). Passing the webhook's ids as
+    thread_ts always fails with {"ok": false, "error": "thread_not_found"}.
+    chat_postMessage below retries without thread_ts on that specific
+    error, so the reply still lands (as a new top-level message in the
+    right channel) instead of being silently dropped — it just can't be
+    literally nested under the original mention message, since the webhook
+    never exposes a usable id for that. Once the first post in an
+    investigation falls back this way, its real returned ts is reused for
+    every later post in the same investigation (ack/phase/RCA), so the
+    whole conversation still threads together correctly from that point on.
 """
 import logging
 
@@ -66,7 +77,20 @@ class XyneWebClient:
             body["blocks"] = blocks
         if attachments:
             body["attachments"] = attachments
-        data = self._post("chat.postMessage", body)
+        try:
+            data = self._post("chat.postMessage", body)
+        except XyneApiError as e:
+            if thread_ts and str(e) == "thread_not_found":
+                # The webhook-supplied thread_ts (see module docstring) is
+                # never a real message id — fall back to a top-level post so
+                # the reply lands somewhere instead of being dropped. Its
+                # real returned ts becomes the thread root for every later
+                # post in this investigation (see server.py: ack_ts reuse).
+                log.info("Xyne thread_not_found — posting as a new top-level message instead")
+                body.pop("thread_ts", None)
+                data = self._post("chat.postMessage", body)
+            else:
+                raise
         return {"ok": True, "ts": data.get("ts", ""), "channel": data.get("channel") or channel}
 
     def chat_update(self, channel, ts, text: str = "", blocks: list | None = None,
