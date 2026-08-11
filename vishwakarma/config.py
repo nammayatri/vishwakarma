@@ -293,6 +293,22 @@ class VishwakarmaConfig:
         self.argus_app_token: str = _env("ARGUS_APP_TOKEN", argus.get("app_token", "")) or ""
         self.argus_mre_group_id: str = _env("ARGUS_MRE_GROUP_ID", argus.get("mre_group_id", "")) or ""
 
+        # Xyne — same @mention-triggered investigation flow as Argus, on Xyne's
+        # Slack-compatible REST API instead of Slack itself. Events arrive via
+        # a webhook (/api/xyne/events) rather than a socket connection, gated
+        # by signing_secret (preferred — real HMAC request-signature
+        # verification, matching what Xyne actually issued) or webhook_token
+        # (fallback shared-secret-in-URL) if signing_secret is unset.
+        # bot_user_id is optional — self-discovered via auth.test if unset.
+        # Unset base_url/bot_token = Xyne disabled entirely.
+        xyne = raw.get("xyne", {})
+        self.xyne_base_url: str = _env("XYNE_BASE_URL", xyne.get("base_url", "")) or ""
+        self.xyne_bot_token: str = _env("XYNE_BOT_TOKEN", xyne.get("bot_token", "")) or ""
+        self.xyne_bot_user_id: str = _env("XYNE_BOT_USER_ID", xyne.get("bot_user_id", "")) or ""
+        self.xyne_mre_group_id: str = _env("XYNE_MRE_GROUP_ID", xyne.get("mre_group_id", "")) or ""
+        self.xyne_signing_secret: str = _env("XYNE_SIGNING_SECRET", xyne.get("signing_secret", "")) or ""
+        self.xyne_webhook_token: str = _env("XYNE_WEBHOOK_TOKEN", xyne.get("webhook_token", "")) or ""
+
         # Embeddings provider (semantic RAG). Unset = keyword-only matching.
         emb = raw.get("embeddings", {})
         self.embeddings_api_base: str = _env("VK_EMBEDDINGS_API_BASE", emb.get("api_base", "")) or ""

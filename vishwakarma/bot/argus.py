@@ -47,6 +47,9 @@ class ArgusBot:
         classify: Callable[[str], bool],     # True = real issue report
         say: Callable[[str, str, str], None] | None = None,  # (channel, thread_ts, text)
         fetch_thread: Callable[[str, str], list[str]] | None = None,  # (channel, thread_ts) -> messages
+        platform: str = "slack",             # stamped into issue.source/labels — lets
+                                              # _do_investigation pick the right destination
+                                              # (e.g. "xyne" for the Xyne-flavored instance)
     ):
         self.mre_group_id = mre_group_id
         self.bot_user_id = bot_user_id
@@ -54,6 +57,7 @@ class ArgusBot:
         self.classify = classify
         self.say = say or (lambda *_: None)
         self.fetch_thread = fetch_thread
+        self.platform = platform
         self._seen: dict[str, float] = {}
 
     # ── Decision logic ────────────────────────────────────────────────────────
@@ -151,10 +155,15 @@ class ArgusBot:
         return {
             "id": str(uuid.uuid4()),
             "title": title,
-            "source": "slack-argus",
+            "source": f"{self.platform}-argus",
             "description": description,
             "severity": "high",
             "labels": {
+                "platform": self.platform,
+                # kept as "slack_*" even for non-Slack platforms (e.g. Xyne) —
+                # _do_investigation already reads these exact keys to resolve
+                # the reply channel/thread; only the "platform" label above
+                # determines which client/destination it uses to post there.
                 "slack_channel": event.get("channel", ""),
                 "slack_ts": event.get("ts", ""),
                 "slack_thread_ts": event.get("thread_ts") or event.get("ts", ""),

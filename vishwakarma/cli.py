@@ -659,8 +659,17 @@ def serve(
     start_cost_reporter(cfg)
 
     # Start FastAPI server
-    from vishwakarma.server import create_app
+    from vishwakarma.server import create_app, _state
     fastapi_app = create_app(cfg)
+
+    # Xyne (@mention investigation trigger, mirrors Argus) — events arrive via
+    # the /api/xyne/events webhook route registered by create_app above, so
+    # the bot instance must be stashed into _state AFTER create_app (which
+    # clears _state on entry) rather than before, unlike start_bot/start_argus
+    # which own their own Socket Mode connections independently of _state.
+    if cfg.cloud != "aws":
+        from vishwakarma.bot.xyne import start_xyne
+        _state["xyne_bot"] = start_xyne(cfg)
 
     uvicorn.run(
         fastapi_app,
@@ -697,8 +706,10 @@ def serve_orchestrator(
     from vishwakarma.bot.argus import start_argus
     start_argus(cfg)
 
-    from vishwakarma.server import create_app
+    from vishwakarma.server import create_app, _state
     fastapi_app = create_app(cfg)
+    from vishwakarma.bot.xyne import start_xyne
+    _state["xyne_bot"] = start_xyne(cfg)
     uvicorn.run(fastapi_app, host=host or cfg.host, port=port or cfg.port, log_config=None)
 
 

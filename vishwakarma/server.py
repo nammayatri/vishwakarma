@@ -446,6 +446,58 @@ def create_app(config=None) -> FastAPI:
         triggered = await _trigger_investigations_for_issues(config, issues)
         return {"status": "ok", "alerts": triggered}
 
+    # ── /api/xyne/events ─────────────────────────────────────────────────────
+
+    @app.post("/api/xyne/events")
+    async def xyne_events(request: Request, auth_token: str | None = None):
+        """
+        Xyne event webhook (bot/xyne.py). Preferred auth: real HMAC request
+        signature verification via xyne.signing_secret (Xyne issued a
+        "signing secret" alongside the app token, matching Slack's own
+        request-signing model — see verify_xyne_signature). Falls back to the
+        shared-secret-in-URL pattern (xyne.webhook_token) if no signing
+        secret is configured. Disabled (404) unless at least one is set.
+
+        Unlike the alert webhooks, this doesn't always investigate — it feeds
+        the raw event into the Xyne-flavored ArgusBot, which applies the same
+        trivial/noise filtering @mre/@Argus mentions get on Slack before
+        deciding whether to dispatch.
+        """
+        import hmac
+
+        if not (config.xyne_signing_secret or config.xyne_webhook_token):
+            raise HTTPException(404, "Not found")
+
+        raw_body = await request.body()
+
+        if config.xyne_signing_secret:
+            from vishwakarma.plugins.relays.xyne.plugin import verify_xyne_signature
+            timestamp = request.headers.get("X-Slack-Request-Timestamp", "")
+            signature = request.headers.get("X-Slack-Signature", "")
+            if not verify_xyne_signature(config.xyne_signing_secret, timestamp, raw_body, signature):
+                raise HTTPException(401, "Unauthorized")
+        elif not hmac.compare_digest(auth_token or "", config.xyne_webhook_token):
+            raise HTTPException(401, "Unauthorized")
+
+        xyne_bot = _state.get("xyne_bot")
+        if xyne_bot is None:
+            raise HTTPException(404, "Not found")
+
+        try:
+            payload = json.loads(raw_body)
+        except Exception:
+            raise HTTPException(400, "Invalid JSON")
+
+        # Xyne's inbound event shape is unconfirmed — accept either a bare
+        # Slack-style event dict or a Slack-Events-API envelope ({"event": {...}}).
+        event = payload.get("event", payload) if isinstance(payload, dict) else {}
+
+        # handle_message can call classify() (an LLM call) synchronously —
+        # run off the event loop so a slow classification can't block it.
+        loop = asyncio.get_event_loop()
+        action = await loop.run_in_executor(None, xyne_bot.handle_message, event)
+        return {"status": action}
+
     # ── /api/model ────────────────────────────────────────────────────────────
 
     @app.get("/api/model")
@@ -506,6 +558,28 @@ def create_app(config=None) -> FastAPI:
         }
 
     return app
+
+
+# ── Reply destination (Slack or Xyne) ───────────────────────────────────────────
+
+def _make_destination(config, labels: dict):
+    """
+    Pick SlackDestination or XyneDestination based on the issue's `platform`
+    label — stamped by ArgusBot (bot/argus.py) only for mention-triggered
+    issues. Alert-webhook-triggered issues (AlertManager/GCP Cloud Monitoring)
+    carry no platform label and always default to Slack.
+    """
+    if (labels or {}).get("platform") == "xyne":
+        from vishwakarma.plugins.relays.xyne.plugin import XyneDestination
+        return XyneDestination({"base_url": config.xyne_base_url, "token": config.xyne_bot_token})
+    from vishwakarma.plugins.relays.slack.plugin import SlackDestination
+    return SlackDestination({"token": config.slack_bot_token})
+
+
+def _destination_configured(config, labels: dict) -> bool:
+    if (labels or {}).get("platform") == "xyne":
+        return bool(config.xyne_base_url and config.xyne_bot_token)
+    return config.is_slack_configured()
 
 
 # ── Alert dispatch (shared by every alert-source webhook) ──────────────────────
@@ -656,7 +730,7 @@ async def _resume_investigation(config, state, inv: dict) -> None:
         except Exception as e:
             log.debug(f"Reaper: save failed: {e}")
         ch = labels.get("slack_channel")
-        if config.is_slack_configured() and ch:
+        if _destination_configured(config, labels) and ch:
             # Resumed RCAs get a PDF too — without this the repost always
             # falls back to a wall of text in the thread.
             pdf_path = None
@@ -668,8 +742,7 @@ async def _resume_investigation(config, state, inv: dict) -> None:
             except Exception as e:
                 log.warning(f"Reaper: PDF generation failed, posting text: {e}")
             try:
-                from vishwakarma.plugins.relays.slack.plugin import SlackDestination
-                SlackDestination({"token": config.slack_bot_token}).post_investigation(
+                _make_destination(config, labels).post_investigation(
                     title=f"{inc.get('title', 'RCA')} (resumed)", analysis=final,
                     source=inc.get("source", ""), severity=inc.get("severity", "high"),
                     incident_id=incident_id, thread_ts=labels.get("slack_thread_ts"), channel=ch,
@@ -767,10 +840,9 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
         report_thread = issue.labels.get("slack_thread_ts") or ""
         # Cross-cloud halves don't post individually — the synthesizer posts
         # one unified RCA.
-        if config.is_slack_configured() and not cross_cloud:
+        if _destination_configured(config, issue.labels) and not cross_cloud:
             try:
-                from vishwakarma.plugins.relays.slack.plugin import SlackDestination
-                dest = SlackDestination({"token": config.slack_bot_token})
+                dest = _make_destination(config, issue.labels)
                 slack_client = dest._get_client()
                 if report_channel:
                     slack_channel_id = report_channel        # already a channel id from the event
@@ -1370,12 +1442,11 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
         except Exception as e:
             log.debug(f"Ack update failed (non-fatal): {e}")
 
-    # Post to Slack — thread reply if fast RCA was posted, otherwise new message
+    # Post to Slack (or Xyne) — thread reply if fast RCA was posted, otherwise new message
     slack_ts = None
-    if config.is_slack_configured():
+    if _destination_configured(config, issue.labels):
         try:
-            from vishwakarma.plugins.relays.slack.plugin import SlackDestination
-            dest = SlackDestination({"token": config.slack_bot_token})
+            dest = _make_destination(config, issue.labels)
             resp = dest.post_investigation(
                 title=issue.title,
                 analysis=analysis,
@@ -1476,10 +1547,9 @@ async def _synthesize_and_post_cross_cloud(config, issue, base_incident_id: str)
         log.warning(f"Cross-cloud PDF failed: {e}")
 
     slack_ts = None
-    if config.is_slack_configured():
+    if _destination_configured(config, issue.labels):
         try:
-            from vishwakarma.plugins.relays.slack.plugin import SlackDestination
-            dest = SlackDestination({"token": config.slack_bot_token})
+            dest = _make_destination(config, issue.labels)
             channel = issue.labels.get("slack_channel") or None
             resp = dest.post_investigation(
                 title=f"{issue.title} (cross-cloud)", analysis=unified,
