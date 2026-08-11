@@ -10,11 +10,16 @@ events via a webhook route (server.py: POST /api/xyne/events) instead of a
 socket-mode connection, since Xyne is only confirmed to expose REST endpoints.
 
 Confirmed live against the real API (2026-08-11): chat.postMessage, auth.test
-work; conversations.replies/.history/.list exist but the app's current token
-lacks the `channels:read` scope (granted: files:write, chat:write, im:write)
-— thread-fetching (fetch_thread below) will fail with "missing_permission"
-until that scope is granted on Xyne's side. The inbound event shape (assumed
-Slack-Events-API-like) is still unverified — no real webhook received yet.
+work; conversations.replies/.history/.list work once the `channels:read`
+scope is granted (initially missing, later added). Request signing is
+CONFIRMED (not Slack's scheme, despite Xyne calling it a "signing secret" —
+see plugins/relays/xyne/plugin.py:verify_xyne_signature): a single
+`x-xyne-signature` header, plain hex HMAC-SHA256 of the raw body, no
+timestamp. Inbound event envelope is CONFIRMED from a live APP_MENTIONED
+webhook: {"eventType": "APP_MENTIONED", "payload": {...}} — NOT Slack's
+Events API shape. The exact payload.payload field names beyond
+`content` (HTML, mention spans with data-user-id) are still being
+finalized against real traffic — see parse_xyne_mention_event below.
 
 Config (config.yaml):
   xyne:
@@ -22,17 +27,51 @@ Config (config.yaml):
     bot_token: ...            # Bearer JWT for posting/fetching (confirmed working)
     bot_user_id: ...          # optional override — auto-discovered via auth.test if unset
     mre_group_id: ...         # optional, mirrors argus.mre_group_id
-    signing_secret: ...       # verifies inbound webhook requests (Slack v0 scheme, assumed)
+    signing_secret: ...       # verifies inbound webhook requests (confirmed HMAC-SHA256 scheme)
     webhook_token: ...        # fallback shared-secret auth if signing_secret is unset
 Env: XYNE_BASE_URL / XYNE_BOT_TOKEN / XYNE_BOT_USER_ID / XYNE_MRE_GROUP_ID /
      XYNE_SIGNING_SECRET / XYNE_WEBHOOK_TOKEN
 """
 import logging
+import re
 
 from vishwakarma.bot.argus import ArgusBot, make_classifier, make_dispatcher
 from vishwakarma.plugins.relays.xyne.plugin import XyneApiError, XyneWebClient
 
 log = logging.getLogger(__name__)
+
+
+def parse_xyne_mention_event(payload: dict) -> dict:
+    """
+    Map a Xyne APP_MENTIONED webhook payload to the Slack-event-shaped dict
+    ArgusBot.handle_message expects ({"text", "channel", "ts", "thread_ts",
+    "user"}). Xyne's mention text is HTML with data-user-id mention spans
+    (not Slack's bracket <@ID> token) — stripped to plain text here, with
+    each mentioned user_id re-inserted as a Slack-style <@ID> token so
+    ArgusBot's existing (unmodified) mention-matching logic keeps working.
+
+    Returns {} for anything that isn't a recognized APP_MENTIONED payload —
+    ArgusBot.handle_message already no-ops on an empty/missing text+ts.
+    """
+    if (payload.get("eventType") or "") != "APP_MENTIONED":
+        return {}
+    inner = payload.get("payload")
+    if not isinstance(inner, dict):
+        return {}
+
+    html = inner.get("content", "") or ""
+    text = re.sub(r"<[^>]+>", " ", html)          # strip HTML tags → plain text
+    text = re.sub(r"\s+", " ", text).strip()
+    for uid in re.findall(r'data-user-id="([^"]+)"', html):
+        text = f"<@{uid}> {text}"
+
+    return {
+        "text": text,
+        "channel": inner.get("conversationId", ""),
+        "ts": inner.get("messageId", ""),
+        "thread_ts": inner.get("threadId") or inner.get("conversationId", ""),
+        "user": inner.get("userId") or inner.get("senderId", ""),
+    }
 
 
 def _fetch_xyne_thread_msgs(client: XyneWebClient, channel: str, thread_ts: str,

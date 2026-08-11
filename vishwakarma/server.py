@@ -451,17 +451,23 @@ def create_app(config=None) -> FastAPI:
     @app.post("/api/xyne/events")
     async def xyne_events(request: Request, auth_token: str | None = None):
         """
-        Xyne event webhook (bot/xyne.py). Preferred auth: real HMAC request
-        signature verification via xyne.signing_secret (Xyne issued a
-        "signing secret" alongside the app token, matching Slack's own
-        request-signing model — see verify_xyne_signature). Falls back to the
-        shared-secret-in-URL pattern (xyne.webhook_token) if no signing
-        secret is configured. Disabled (404) unless at least one is set.
+        Xyne event webhook (bot/xyne.py). Auth: HMAC-SHA256 of the raw body
+        against xyne.signing_secret, sent as a single `x-xyne-signature`
+        header — CONFIRMED from a live request (2026-08-11; see
+        verify_xyne_signature's docstring for how this was discovered — it is
+        NOT Slack's request-signing scheme, despite the naming). Falls back
+        to the shared-secret-in-URL pattern (xyne.webhook_token) if no
+        signing secret is configured. Disabled (404) unless at least one is set.
 
         Unlike the alert webhooks, this doesn't always investigate — it feeds
         the raw event into the Xyne-flavored ArgusBot, which applies the same
         trivial/noise filtering @mre/@Argus mentions get on Slack before
         deciding whether to dispatch.
+
+        Payload shape is {"eventType": "...", "payload": {...}} — NOT Slack's
+        Events API envelope. Other eventTypes (e.g. ADDITIONAL_FORM_FIELD_UPDATED
+        from unrelated Xyne apps sharing this URL) are expected and ignored;
+        only APP_MENTIONED matters here.
         """
         import hmac
 
@@ -472,18 +478,8 @@ def create_app(config=None) -> FastAPI:
 
         if config.xyne_signing_secret:
             from vishwakarma.plugins.relays.xyne.plugin import verify_xyne_signature
-            timestamp = request.headers.get("X-Slack-Request-Timestamp", "")
-            signature = request.headers.get("X-Slack-Signature", "")
-            if not verify_xyne_signature(config.xyne_signing_secret, timestamp, raw_body, signature):
-                # TEMP DIAGNOSTIC (remove once Xyne's real auth scheme is confirmed):
-                # log every header name + a truncated body so the actual request
-                # shape can be compared against our assumed Slack-style signing.
-                safe_headers = {k: v for k, v in request.headers.items()
-                                 if k.lower() not in ("authorization", "cookie")}
-                log.warning(
-                    f"Xyne webhook 401 — assumed signature scheme didn't match. "
-                    f"headers={safe_headers} body[:300]={raw_body[:300]!r}"
-                )
+            signature = request.headers.get("x-xyne-signature", "")
+            if not verify_xyne_signature(config.xyne_signing_secret, raw_body, signature):
                 raise HTTPException(401, "Unauthorized")
         elif not hmac.compare_digest(auth_token or "", config.xyne_webhook_token):
             raise HTTPException(401, "Unauthorized")
@@ -497,9 +493,16 @@ def create_app(config=None) -> FastAPI:
         except Exception:
             raise HTTPException(400, "Invalid JSON")
 
-        # Xyne's inbound event shape is unconfirmed — accept either a bare
-        # Slack-style event dict or a Slack-Events-API envelope ({"event": {...}}).
-        event = payload.get("event", payload) if isinstance(payload, dict) else {}
+        if isinstance(payload, dict) and payload.get("eventType") == "APP_MENTIONED":
+            # TEMP DIAGNOSTIC (remove once parse_xyne_mention_event's field
+            # mapping is confirmed against enough real traffic): full body
+            # logged only for this event type — internal engineer mention
+            # text, not customer PII like the other eventTypes hitting this
+            # endpoint carry.
+            log.warning(f"Xyne APP_MENTIONED raw payload: {payload!r}")
+
+        from vishwakarma.bot.xyne import parse_xyne_mention_event
+        event = parse_xyne_mention_event(payload) if isinstance(payload, dict) else {}
 
         # handle_message can call classify() (an LLM call) synchronously —
         # run off the event loop so a slow classification can't block it.

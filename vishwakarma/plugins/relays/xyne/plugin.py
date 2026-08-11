@@ -85,28 +85,22 @@ class XyneWebClient:
         return self._post("auth.test", {})
 
 
-def verify_xyne_signature(signing_secret: str, timestamp: str, body: bytes, signature: str) -> bool:
+def verify_xyne_signature(signing_secret: str, body: bytes, signature: str) -> bool:
     """
-    Slack-compatible request signature verification (the 'v0' scheme: HMAC-SHA256
-    over "v0:{timestamp}:{body}", compared against an "X-Slack-Signature"-style
-    header). Xyne provided a signing secret matching Slack's own request-signing
-    model, so this assumes the same scheme — UNVERIFIED against a real inbound
-    Xyne webhook (none received yet); adjust here if Xyne's header names or
-    algorithm differ once a real event is observed.
+    Xyne's REAL request signature scheme — CONFIRMED from a live webhook
+    request (2026-08-11): a single `x-xyne-signature` header, no timestamp
+    header at all, value = plain hex-encoded HMAC-SHA256 of the raw request
+    body (64 hex chars observed). No "v0:" prefix, no Slack-style basestring
+    — this is NOT the Slack request-signing scheme, despite the "signing
+    secret" naming suggesting it. (Corrects the original Slack-shaped
+    assumption, which never matched a single real request.)
     """
     import hashlib
     import hmac
-    import time
 
-    if not (signing_secret and timestamp and signature):
+    if not (signing_secret and signature):
         return False
-    try:
-        if abs(time.time() - float(timestamp)) > 60 * 5:
-            return False  # stale request — replay protection, matches Slack's own rule
-    except ValueError:
-        return False
-    basestring = f"v0:{timestamp}:{body.decode('utf-8', errors='replace')}"
-    computed = "v0=" + hmac.new(signing_secret.encode(), basestring.encode(), hashlib.sha256).hexdigest()
+    computed = hmac.new(signing_secret.encode(), body, hashlib.sha256).hexdigest()
     return hmac.compare_digest(computed, signature)
 
 

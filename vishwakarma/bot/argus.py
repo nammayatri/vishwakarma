@@ -203,7 +203,9 @@ class ArgusBot:
 
     def _strip_mentions(self, text: str) -> str:
         text = re.sub(r"<!subteam\^[A-Z0-9]+(\|[^>]*)?>", "", text)
-        text = re.sub(r"<@[A-Z0-9]+>", "", text)
+        # Slack IDs are uppercase (U0AM456U726); Xyne's are lowercase
+        # (cmsoaadid08c913ivwi8351xn) — match both.
+        text = re.sub(r"<@[A-Za-z0-9]+>", "", text)
         return text.strip(" \t:,-")
 
     def _already_seen(self, ts: str) -> bool:
