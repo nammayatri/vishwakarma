@@ -45,10 +45,35 @@ def parse_xyne_mention_event(payload: dict) -> dict:
     """
     Map a Xyne APP_MENTIONED webhook payload to the Slack-event-shaped dict
     ArgusBot.handle_message expects ({"text", "channel", "ts", "thread_ts",
-    "user"}). Xyne's mention text is HTML with data-user-id mention spans
-    (not Slack's bracket <@ID> token) — stripped to plain text here, with
-    each mentioned user_id re-inserted as a Slack-style <@ID> token so
-    ArgusBot's existing (unmodified) mention-matching logic keeps working.
+    "user"}). CONFIRMED field mapping from a real live payload (2026-08-11):
+
+      payload.payload.channelId       -> channel   (verified: matched the
+                                          real Slack-side channel name
+                                          "namma-yatri-sre"; the FIRST guess,
+                                          conversationId, caused a real
+                                          "channel_not_found" failure when
+                                          posting the ack back — this field
+                                          IS conversationId, not channelId)
+      payload.payload.conversationId  -> thread_ts  (the thread this mention
+                                          was posted in; distinct from
+                                          channelId — was wrongly used AS
+                                          channel in the first version)
+      payload.payload.messageId       -> ts         (unique id of this message)
+      payload.payload.userId          -> user       (the mentioning human's id
+                                          — verified: paired with senderName
+                                          "Yashwanth S" in the real payload,
+                                          confirming this is the SENDER, not
+                                          the mentioned bot)
+      payload.payload.cleanContent    -> text base  (Xyne already provides
+                                          plain text — no HTML-stripping
+                                          needed; the raw `content` HTML field
+                                          is only used below to confirm which
+                                          user(s) were mentioned)
+
+    Xyne's mention markup is HTML (data-user-id spans), not Slack's bracket
+    <@ID> token — the mentioned id(s) are re-inserted as Slack-style <@ID>
+    tokens ahead of the clean text so ArgusBot's existing (unmodified)
+    mention-matching logic keeps working unchanged.
 
     Returns {} for anything that isn't a recognized APP_MENTIONED payload —
     ArgusBot.handle_message already no-ops on an empty/missing text+ts.
@@ -59,18 +84,21 @@ def parse_xyne_mention_event(payload: dict) -> dict:
     if not isinstance(inner, dict):
         return {}
 
+    text = (inner.get("cleanContent") or "").strip()
+    if not text:
+        html = inner.get("content", "") or ""
+        text = re.sub(r"<[^>]+>", " ", html)
+        text = re.sub(r"\s+", " ", text).strip()
     html = inner.get("content", "") or ""
-    text = re.sub(r"<[^>]+>", " ", html)          # strip HTML tags → plain text
-    text = re.sub(r"\s+", " ", text).strip()
     for uid in re.findall(r'data-user-id="([^"]+)"', html):
         text = f"<@{uid}> {text}"
 
     return {
         "text": text,
-        "channel": inner.get("conversationId", ""),
+        "channel": inner.get("channelId", ""),
         "ts": inner.get("messageId", ""),
-        "thread_ts": inner.get("threadId") or inner.get("conversationId", ""),
-        "user": inner.get("userId") or inner.get("senderId", ""),
+        "thread_ts": inner.get("conversationId", ""),
+        "user": inner.get("userId", ""),
     }
 
 

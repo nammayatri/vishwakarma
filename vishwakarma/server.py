@@ -887,7 +887,7 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
                 # an ID and the token has no channels:read scope to resolve one).
                 slack_channel_id = resp.get("channel") or slack_channel_id
             except Exception as e:
-                log.warning(f"Slack ack failed (non-fatal): {e}")
+                log.warning(f"Ack post failed (non-fatal, dest={issue.labels.get('platform') or 'slack'}): {e}")
 
         # Live phase status in the thread from second zero — updated at each
         # pre-investigation phase, then reused by the streaming loop. Without
@@ -1495,7 +1495,7 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
                 except Exception as e:
                     log.debug(f"PR-link post failed (non-fatal): {e}")
         except Exception as e:
-            log.warning(f"Slack notification failed: {e}")
+            log.warning(f"RCA post failed (dest={issue.labels.get('platform') or 'slack'}): {e}")
 
     # Save to DB
     try:
@@ -1572,7 +1572,7 @@ async def _synthesize_and_post_cross_cloud(config, issue, base_incident_id: str)
             )
             slack_ts = resp.get("ts")
         except Exception as e:
-            log.warning(f"Cross-cloud Slack post failed: {e}")
+            log.warning(f"Cross-cloud RCA post failed (dest={issue.labels.get('platform') or 'slack'}): {e}")
 
     try:
         from vishwakarma.storage.queries import save_incident
