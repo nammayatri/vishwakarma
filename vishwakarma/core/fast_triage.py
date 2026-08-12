@@ -223,9 +223,31 @@ def _stage_istio(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
 def _stage_release_monitoring(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
     """Real panels: 'Request Count / Route 5xx' + 'Request Count / Route
     non-200 non-5xx' (together = all non-200 traffic, matching the dashboard's
-    own two panels) + '5xx Error codes' (app-level)."""
+    own two panels) + '5xx Error codes' (app-level). Also 'Rides Created
+    Count' + 'Search Request Count' + 'Rides To Search Ratio' when the alert
+    carries a merchantOperatingCityId label (RideToSearchRatioDown/
+    LowCityRides* alerts are grouped `by (merchantOperatingCityId)`, so it
+    rides along on the fired alert) — same metrics + grouping the alert
+    itself fires on, so the finding directly explains *why* the ratio/count
+    condition tripped instead of only showing side-effects (mesh errors)."""
+    lines: list[str] = []
+
+    city_id = ctx.get("merchant_operating_city_id")
+    if city_id:
+        ride_rows = _query(prom, f'sum(increase(ride_created_count{{merchantOperatingCityId="{city_id}"}}[15m]))')
+        search_rows = _query(prom, f'sum(increase(search_request_count{{merchantOperatingCityId="{city_id}"}}[15m]))')
+        ride_count = ride_rows[0][1] if ride_rows else 0.0
+        search_count = search_rows[0][1] if search_rows else 0.0
+        ratio_str = f"{(ride_count / search_count * 100):.1f}%" if search_count else "n/a (0 searches)"
+        lines.append(
+            f"City {city_id} (15m): {int(ride_count)} rides / {int(search_count)} searches "
+            f"— ratio {ratio_str}"
+        )
+
     services = ctx.get("services") or []
     if not services:
+        if lines:
+            return "\n".join(lines), {}
         return "No service identified from the mesh check — skipped.", {}
     svc_match = "|".join(re.escape(s) for s in services)
 
@@ -246,7 +268,6 @@ def _stage_release_monitoring(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
     top_other = _topk_rows(rows_other, top_n)
     top_err = _topk_rows(rows_err, top_n)
 
-    lines = []
     if top_5xx:
         lines.append("5xx routes: " + ", ".join(
             f"{labels.get('method', '?')} {labels.get('handler', '?')} ({int(v)}x)" for labels, v in top_5xx
@@ -746,6 +767,7 @@ def _run_triage_stages(prom, grafana, llm, issue, on_stage_ready: Callable[[str,
         "services": [],
         "_grafana": grafana,
         "url_map_name": _sanitize(labels.get("url_map_name") or "") or None,
+        "merchant_operating_city_id": _sanitize(labels.get("merchantOperatingCityId") or "") or None,
     }
     route = _route_for_alert(issue.title)
     summaries = [
