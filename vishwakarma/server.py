@@ -682,15 +682,12 @@ async def _trigger_investigations_for_issues(config, issues: list) -> list[dict]
 # ── Background investigation ───────────────────────────────────────────────────
 
 async def _run_alert_investigation(config, state, issue, incident_id: str, fingerprint: str = ""):
-    import asyncio
-
-    semaphore = _get_semaphore()
-    queue_pos = MAX_CONCURRENT_INVESTIGATIONS - semaphore._value
-    if queue_pos >= MAX_CONCURRENT_INVESTIGATIONS:
-        log.info(f"Alert queued (concurrency limit {MAX_CONCURRENT_INVESTIGATIONS} reached): {issue.title}")
-
-    async with semaphore:
-        await _do_investigation(config, state, issue, incident_id, fingerprint)
+    # The concurrency semaphore is acquired inside _do_investigation itself,
+    # around only the expensive agentic-loop section — the ack post + fast
+    # triage kickoff at the top of _do_investigation always run immediately,
+    # unblocked by queue depth (see the semaphore acquisition further down
+    # in that function for why).
+    await _do_investigation(config, state, issue, incident_id, fingerprint)
 
 
 async def _resume_investigation(config, state, inv: dict) -> None:
@@ -943,441 +940,450 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
                 config.fast_triage_namespace_exclude,
             )
 
-        # Run the 4 pre-enrichment tasks in parallel
-        prefetch_future = loop.run_in_executor(None, _prefetch_alert_context, issue)
-        prior_future = loop.run_in_executor(None, _build_prior_context, issue)
-        entities_future = loop.run_in_executor(None, _extract_alert_entities, issue, llm)
-        # Alert's cloud label, defaulting to THIS instance's cloud — each
-        # deployment (VK_CLOUD=aws|gcp) is independent and investigates only
-        # its own cloud, so unlabeled alerts get the instance's facet.
-        _cloud = issue.labels.get("cloud", "") or config.cloud or ""
+        # Only the expensive agentic-loop section below is concurrency-gated —
+        # the ack post + fast-triage kickoff above already ran unconditionally,
+        # so they're never delayed by queue depth (see _run_alert_investigation,
+        # which no longer wraps the whole call in the semaphore).
+        semaphore = _get_semaphore()
+        queue_pos = MAX_CONCURRENT_INVESTIGATIONS - semaphore._value
+        if queue_pos >= MAX_CONCURRENT_INVESTIGATIONS:
+            log.info(f"Deep investigation queued (concurrency limit {MAX_CONCURRENT_INVESTIGATIONS} reached): {issue.title}")
+        async with semaphore:
+            # Run the 4 pre-enrichment tasks in parallel
+            prefetch_future = loop.run_in_executor(None, _prefetch_alert_context, issue)
+            prior_future = loop.run_in_executor(None, _build_prior_context, issue)
+            entities_future = loop.run_in_executor(None, _extract_alert_entities, issue, llm)
+            # Alert's cloud label, defaulting to THIS instance's cloud — each
+            # deployment (VK_CLOUD=aws|gcp) is independent and investigates only
+            # its own cloud, so unlabeled alerts get the instance's facet.
+            _cloud = issue.labels.get("cloud", "") or config.cloud or ""
 
-        def _match_runbooks_once() -> tuple[list[str], list[str]]:
-            """One hybrid retrieval for both content and ids (was run twice),
-            with the cloud facet applied."""
-            try:
-                from vishwakarma.core.runbook_match import match_runbooks
-                matched = match_runbooks(alert_name, cloud=_cloud, llm=llm)
-                if matched:
-                    return ([f"# Runbook: {m['title']}\n\n{m['content_md']}" for m in matched],
-                            [m["id"] for m in matched])
-            except Exception as e:
-                log.debug(f"Hybrid runbook match failed: {e}")
-            try:
-                return load_matching_runbooks(alert_name, llm), []
-            except Exception:
-                return [], []
+            def _match_runbooks_once() -> tuple[list[str], list[str]]:
+                """One hybrid retrieval for both content and ids (was run twice),
+                with the cloud facet applied."""
+                try:
+                    from vishwakarma.core.runbook_match import match_runbooks
+                    matched = match_runbooks(alert_name, cloud=_cloud, llm=llm)
+                    if matched:
+                        return ([f"# Runbook: {m['title']}\n\n{m['content_md']}" for m in matched],
+                                [m["id"] for m in matched])
+                except Exception as e:
+                    log.debug(f"Hybrid runbook match failed: {e}")
+                try:
+                    return load_matching_runbooks(alert_name, llm), []
+                except Exception:
+                    return [], []
 
-        runbooks_future = loop.run_in_executor(None, _match_runbooks_once)
+            runbooks_future = loop.run_in_executor(None, _match_runbooks_once)
 
-        prefetch_ctx, prior_ctx, entities_ctx, _rb_result = await _asyncio.gather(
-            prefetch_future, prior_future, entities_future, runbooks_future
-        )
-        matched_runbooks, matched_runbook_ids = _rb_result
-
-        # Pre-inject learnings relevant to this alert
-        learnings_mgr = state.get("learnings")
-        learnings_ctx = learnings_mgr.for_alert(alert_name) if learnings_mgr else ""
-
-        # Merge all pre-investigation context into extra_system_prompt
-        extra_parts = [p for p in [entities_ctx, prefetch_ctx, prior_ctx, learnings_ctx] if p]
-
-        extra_parts.append(
-            "## Learned Knowledge\n"
-            "Relevant facts from past incidents are pre-injected above (if any). "
-            "Use `learnings_list` + `learnings_read` only if you need categories not shown above."
-        )
-        extra_system_prompt = "\n\n".join(extra_parts) or None
-
-        # Fast-RCA and its evidence-driven auto-resolve were removed —
-        # preliminary classifications were too often wrong. Every alert now
-        # gets the full investigation (pattern replay below still short-cuts
-        # CONFIRMED patterns, which are human-validated).
-        auto_resolved = False
-
-        _phase(":repeat: _Context gathered — checking confirmed incident patterns..._")
-
-        # ── Pattern replay: check if a confirmed pattern matches ──
-        pattern_matched = False
-        try:
-            from vishwakarma.storage.patterns import get_patterns_for_alert, replay_pattern, mark_pattern_hit, mark_pattern_miss
-            patterns = await loop.run_in_executor(
-                None, lambda: get_patterns_for_alert(alert_name)
+            prefetch_ctx, prior_ctx, entities_ctx, _rb_result = await _asyncio.gather(
+                prefetch_future, prior_future, entities_future, runbooks_future
             )
-            if patterns:
-                # Try the most confirmed pattern first
-                best = patterns[0]
-                log.info(f"Found pattern for {alert_name}: {best['root_cause_type']} (hit_count={best['hit_count']})")
+            matched_runbooks, matched_runbook_ids = _rb_result
 
-                # Post pattern replay status
-                if slack_client and slack_channel_id and ack_ts:
-                    try:
-                        slack_client.chat_postMessage(
-                            channel=slack_channel_id, thread_ts=ack_ts,
-                            text=f":brain: Known pattern found: *{best['root_cause_type']}* (confirmed {best['hit_count']}x). Replaying investigation steps...",
-                            blocks=[{"type": "context", "elements": [
-                                {"type": "mrkdwn", "text": f":brain: _Known pattern: *{best['root_cause_type']}* (confirmed {best['hit_count']}x) — replaying {len(best['investigation_steps'])} steps..._"}
-                            ]}],
-                        )
-                    except Exception:
-                        pass
+            # Pre-inject learnings relevant to this alert
+            learnings_mgr = state.get("learnings")
+            learnings_ctx = learnings_mgr.for_alert(alert_name) if learnings_mgr else ""
 
-                validation = await loop.run_in_executor(
-                    None, lambda: replay_pattern(best, engine.executor, llm, question)
-                )
-                if validation and validation.get("matched") and validation.get("confidence") in ("high", "medium"):
-                    pattern_matched = True
-                    mark_pattern_hit(best["id"], incident_id)
-                    # Build instant RCA from pattern
-                    analysis = (
-                        f"## Root Cause\n{validation.get('root_cause', best['root_cause_detail'])}\n\n"
-                        f"## Confidence: {validation.get('confidence', 'medium').upper()}\n"
-                        f"Known pattern (confirmed {best['hit_count'] + 1}x). "
-                        f"Root cause type: {best['root_cause_type']}\n\n"
-                        f"## Evidence\n{validation.get('evidence', 'Pattern matched')}\n\n"
-                        f"## Differences from Previous\n{validation.get('differences', 'None')}\n\n"
-                        f"## Immediate Fix\n{best.get('fix', 'See previous incidents')}\n\n"
-                        f"## Investigation Method\nPattern replay — {len(best['investigation_steps'])} targeted tool calls instead of full investigation.\n"
-                        f"Previously confirmed on: {time.strftime('%Y-%m-%d', time.localtime(best['last_seen']))}"
-                    )
-                    log.info(f"Pattern matched for {alert_name}: {best['root_cause_type']} — skipping full investigation")
-                    _phase(f":white_check_mark: _Matched confirmed pattern `{best['root_cause_type']}` — replayed targeted checks, RCA follows..._")
+            # Merge all pre-investigation context into extra_system_prompt
+            extra_parts = [p for p in [entities_ctx, prefetch_ctx, prior_ctx, learnings_ctx] if p]
 
-                    # Post match result
-                    if slack_client and slack_channel_id and ack_ts:
-                        try:
-                            slack_client.chat_postMessage(
-                                channel=slack_channel_id, thread_ts=ack_ts,
-                                text=f":white_check_mark: Pattern matched! {validation.get('root_cause', '')}",
-                                blocks=[{"type": "context", "elements": [
-                                    {"type": "mrkdwn", "text": f":white_check_mark: _Pattern matched ({validation.get('confidence', '?')} confidence) — instant RCA generated_"}
-                                ]}],
-                            )
-                        except Exception:
-                            pass
+            extra_parts.append(
+                "## Learned Knowledge\n"
+                "Relevant facts from past incidents are pre-injected above (if any). "
+                "Use `learnings_list` + `learnings_read` only if you need categories not shown above."
+            )
+            extra_system_prompt = "\n\n".join(extra_parts) or None
 
-                    # Create result object for PDF + Slack posting
-                    from vishwakarma.core.models import LLMResult, InvestigationMeta
-                    result = LLMResult(
-                        answer=analysis,
-                        tool_outputs=[],
-                        messages=[],
-                        meta=InvestigationMeta(steps=len(best["investigation_steps"])),
-                    )
-                else:
-                    # Pattern didn't match current data
-                    if validation:
-                        mark_pattern_miss(best["id"])
-                    log.info(f"Pattern did not match for {alert_name} — falling back to full investigation")
-                    if slack_client and slack_channel_id and ack_ts:
-                        try:
-                            slack_client.chat_postMessage(
-                                channel=slack_channel_id, thread_ts=ack_ts,
-                                text=":x: Pattern didn't match current data — running full investigation",
-                                blocks=[{"type": "context", "elements": [
-                                    {"type": "mrkdwn", "text": ":x: _Pattern didn't match current data — different root cause. Running full investigation..._"}
-                                ]}],
-                            )
-                        except Exception:
-                            pass
-        except Exception as e:
-            log.debug(f"Pattern check failed (non-fatal): {e}")
+            # Fast-RCA and its evidence-driven auto-resolve were removed —
+            # preliminary classifications were too often wrong. Every alert now
+            # gets the full investigation (pattern replay below still short-cuts
+            # CONFIRMED patterns, which are human-validated).
+            auto_resolved = False
 
-        # ── Sub-agent parallel investigation for broad alerts ──
-        # When no runbook matched and sub-agents are enabled, spawn parallel
-        # domain-specific sub-agents to gather data before the main loop.
-        sub_agent_findings_text = None
-        if (not auto_resolved and not pattern_matched
-                and not matched_runbooks and config.sub_agents_enabled):
+            _phase(":repeat: _Context gathered — checking confirmed incident patterns..._")
+
+            # ── Pattern replay: check if a confirmed pattern matches ──
+            pattern_matched = False
             try:
-                from vishwakarma.core.sub_agents import run_sub_agents, select_domains, format_sub_agent_findings
-                from vishwakarma.core.tools import ToolExecutor
-
-                labels = issue.labels or {}
-                namespace = (
-                    labels.get("namespace")
-                    or labels.get("kubernetes_namespace")
-                    or labels.get("exported_namespace")
-                    or "atlas"
+                from vishwakarma.storage.patterns import get_patterns_for_alert, replay_pattern, mark_pattern_hit, mark_pattern_miss
+                patterns = await loop.run_in_executor(
+                    None, lambda: get_patterns_for_alert(alert_name)
                 )
-                domains = select_domains(alert_name, labels)
+                if patterns:
+                    # Try the most confirmed pattern first
+                    best = patterns[0]
+                    log.info(f"Found pattern for {alert_name}: {best['root_cause_type']} (hit_count={best['hit_count']})")
 
-                if domains:
-                    log.info(f"Launching sub-agents for {alert_name}: {domains}")
-                    _phase(f":brain: _Parallel domain scan running: {', '.join(d.upper() for d in domains)} — deep investigation starts when it completes..._")
+                    # Post pattern replay status
+                    if slack_client and slack_channel_id and ack_ts:
+                        try:
+                            slack_client.chat_postMessage(
+                                channel=slack_channel_id, thread_ts=ack_ts,
+                                text=f":brain: Known pattern found: *{best['root_cause_type']}* (confirmed {best['hit_count']}x). Replaying investigation steps...",
+                                blocks=[{"type": "context", "elements": [
+                                    {"type": "mrkdwn", "text": f":brain: _Known pattern: *{best['root_cause_type']}* (confirmed {best['hit_count']}x) — replaying {len(best['investigation_steps'])} steps..._"}
+                                ]}],
+                            )
+                        except Exception:
+                            pass
 
-                    # Build a ToolExecutor from the toolset manager for sub-agents
-                    sub_executor = ToolExecutor(toolsets=tm.active_toolsets())
-
-                    findings = await loop.run_in_executor(
-                        None,
-                        lambda: run_sub_agents(
-                            alert_context=question,
-                            namespace=namespace,
-                            domains=domains,
-                            llm_config=config.llm,
-                            toolset_manager=sub_executor,
-                        ),
+                    validation = await loop.run_in_executor(
+                        None, lambda: replay_pattern(best, engine.executor, llm, question)
                     )
+                    if validation and validation.get("matched") and validation.get("confidence") in ("high", "medium"):
+                        pattern_matched = True
+                        mark_pattern_hit(best["id"], incident_id)
+                        # Build instant RCA from pattern
+                        analysis = (
+                            f"## Root Cause\n{validation.get('root_cause', best['root_cause_detail'])}\n\n"
+                            f"## Confidence: {validation.get('confidence', 'medium').upper()}\n"
+                            f"Known pattern (confirmed {best['hit_count'] + 1}x). "
+                            f"Root cause type: {best['root_cause_type']}\n\n"
+                            f"## Evidence\n{validation.get('evidence', 'Pattern matched')}\n\n"
+                            f"## Differences from Previous\n{validation.get('differences', 'None')}\n\n"
+                            f"## Immediate Fix\n{best.get('fix', 'See previous incidents')}\n\n"
+                            f"## Investigation Method\nPattern replay — {len(best['investigation_steps'])} targeted tool calls instead of full investigation.\n"
+                            f"Previously confirmed on: {time.strftime('%Y-%m-%d', time.localtime(best['last_seen']))}"
+                        )
+                        log.info(f"Pattern matched for {alert_name}: {best['root_cause_type']} — skipping full investigation")
+                        _phase(f":white_check_mark: _Matched confirmed pattern `{best['root_cause_type']}` — replayed targeted checks, RCA follows..._")
 
-                    if findings:
-                        sub_agent_findings_text = format_sub_agent_findings(findings)
-                        log.info(f"Sub-agents returned {len(findings)} domain findings for {alert_name}")
-
+                        # Post match result
                         if slack_client and slack_channel_id and ack_ts:
                             try:
-                                domain_statuses = []
-                                for domain, summary in findings.items():
-                                    # Extract STATUS line from findings
-                                    status = "unknown"
-                                    for line in summary.split("\n"):
-                                        if line.strip().upper().startswith("STATUS:"):
-                                            status = line.split(":", 1)[1].strip().lower()
-                                            break
-                                    emoji = ":white_check_mark:" if status == "healthy" else ":warning:" if status == "degraded" else ":x:" if status == "critical" else ":grey_question:"
-                                    domain_statuses.append(f"{emoji} *{domain.upper()}*: {status}")
-                                status_text = "\n".join(domain_statuses)
                                 slack_client.chat_postMessage(
                                     channel=slack_channel_id, thread_ts=ack_ts,
-                                    text=f"Sub-agent results:\n{status_text}",
+                                    text=f":white_check_mark: Pattern matched! {validation.get('root_cause', '')}",
                                     blocks=[{"type": "context", "elements": [
-                                        {"type": "mrkdwn", "text": f":brain: _Sub-agent parallel scan complete:_\n{status_text}"}
+                                        {"type": "mrkdwn", "text": f":white_check_mark: _Pattern matched ({validation.get('confidence', '?')} confidence) — instant RCA generated_"}
+                                    ]}],
+                                )
+                            except Exception:
+                                pass
+
+                        # Create result object for PDF + Slack posting
+                        from vishwakarma.core.models import LLMResult, InvestigationMeta
+                        result = LLMResult(
+                            answer=analysis,
+                            tool_outputs=[],
+                            messages=[],
+                            meta=InvestigationMeta(steps=len(best["investigation_steps"])),
+                        )
+                    else:
+                        # Pattern didn't match current data
+                        if validation:
+                            mark_pattern_miss(best["id"])
+                        log.info(f"Pattern did not match for {alert_name} — falling back to full investigation")
+                        if slack_client and slack_channel_id and ack_ts:
+                            try:
+                                slack_client.chat_postMessage(
+                                    channel=slack_channel_id, thread_ts=ack_ts,
+                                    text=":x: Pattern didn't match current data — running full investigation",
+                                    blocks=[{"type": "context", "elements": [
+                                        {"type": "mrkdwn", "text": ":x: _Pattern didn't match current data — different root cause. Running full investigation..._"}
                                     ]}],
                                 )
                             except Exception:
                                 pass
             except Exception as e:
-                log.warning(f"Sub-agent investigation failed (non-fatal, continuing with main investigation): {e}")
+                log.debug(f"Pattern check failed (non-fatal): {e}")
 
-        # ── Fold fast-triage findings into pre-investigation evidence ──
-        # Give the staged triage pipeline a bounded grace window to finish so
-        # its findings can seed the deep investigation (as pre-investigation
-        # evidence alongside any matched runbook) — often already done by
-        # this point since pattern-check + sub-agents just ran. Slack
-        # narration from fast_triage keeps posting regardless of this wait,
-        # via its own callback; only prompt-seeding is gated here.
-        if triage_future is not None:
-            try:
-                done, _pending = await _asyncio.wait(
-                    {triage_future}, timeout=config.fast_triage_evidence_wait_seconds
-                )
-                if triage_future in done:
-                    fast_triage_evidence = await triage_future
-                    if fast_triage_evidence:
-                        evidence_block = (
-                            f"## Automated Pre-Investigation Findings (Fast Triage)\n\n{fast_triage_evidence}"
-                        )
-                        sub_agent_findings_text = (
-                            f"{evidence_block}\n\n{sub_agent_findings_text}"
-                            if sub_agent_findings_text else evidence_block
-                        )
-                else:
-                    async def _finish_triage_in_background(fut) -> None:
-                        try:
-                            await fut
-                        except Exception as e:
-                            log.warning(f"Fast triage failed (non-fatal): {e}")
-                    _asyncio.ensure_future(_finish_triage_in_background(triage_future))
-            except Exception as e:
-                log.warning(f"Fast triage evidence wait failed (non-fatal): {e}")
-
-        # ── Streaming investigation with real-time Slack updates ──
-        # Same style as the Slack "debug" path: small context blocks,
-        # real-time tool call start/result, yellow status message.
-
-        def _run_streaming_investigation():
-            """Run stream_investigate() with live Slack tool-by-tool updates."""
-            status_ts = None
-            tool_lines: list[str] = []
-            analysis = ""
-
-            def _short_params(params: dict) -> str:
-                """Shorten params for display."""
-                if not params:
-                    return ""
-                val = str(next(iter(params.values()), ""))
-                return val[:50].replace("\n", " ")
-
-            # Reuse the pre-investigation phase message as the live status line
-            # (falls back to posting a fresh one if none was created).
-            log.info(f"Streaming investigation: slack_client={bool(slack_client)} channel={slack_channel_id} ack_ts={ack_ts}")
-            if slack_client and slack_channel_id and ack_ts:
+            # ── Sub-agent parallel investigation for broad alerts ──
+            # When no runbook matched and sub-agents are enabled, spawn parallel
+            # domain-specific sub-agents to gather data before the main loop.
+            sub_agent_findings_text = None
+            if (not auto_resolved and not pattern_matched
+                    and not matched_runbooks and config.sub_agents_enabled):
                 try:
-                    txt = ":hourglass: Starting deep investigation..."
-                    blocks = [{"type": "context", "elements": [
-                        {"type": "mrkdwn", "text": ":hourglass: _Starting deep investigation..._"}
-                    ]}]
-                    if phase_ts:
-                        slack_client.chat_update(channel=slack_channel_id, ts=phase_ts,
-                                                 text=txt, blocks=blocks)
-                        status_ts = phase_ts
-                    else:
-                        resp = slack_client.chat_postMessage(
-                            channel=slack_channel_id, thread_ts=ack_ts,
-                            text=txt, blocks=blocks,
+                    from vishwakarma.core.sub_agents import run_sub_agents, select_domains, format_sub_agent_findings
+                    from vishwakarma.core.tools import ToolExecutor
+
+                    labels = issue.labels or {}
+                    namespace = (
+                        labels.get("namespace")
+                        or labels.get("kubernetes_namespace")
+                        or labels.get("exported_namespace")
+                        or "atlas"
+                    )
+                    domains = select_domains(alert_name, labels)
+
+                    if domains:
+                        log.info(f"Launching sub-agents for {alert_name}: {domains}")
+                        _phase(f":brain: _Parallel domain scan running: {', '.join(d.upper() for d in domains)} — deep investigation starts when it completes..._")
+
+                        # Build a ToolExecutor from the toolset manager for sub-agents
+                        sub_executor = ToolExecutor(toolsets=tm.active_toolsets())
+
+                        findings = await loop.run_in_executor(
+                            None,
+                            lambda: run_sub_agents(
+                                alert_context=question,
+                                namespace=namespace,
+                                domains=domains,
+                                llm_config=config.llm,
+                                toolset_manager=sub_executor,
+                            ),
                         )
-                        status_ts = resp["ts"]
-                    log.info(f"Status message posted: ts={status_ts}")
+
+                        if findings:
+                            sub_agent_findings_text = format_sub_agent_findings(findings)
+                            log.info(f"Sub-agents returned {len(findings)} domain findings for {alert_name}")
+
+                            if slack_client and slack_channel_id and ack_ts:
+                                try:
+                                    domain_statuses = []
+                                    for domain, summary in findings.items():
+                                        # Extract STATUS line from findings
+                                        status = "unknown"
+                                        for line in summary.split("\n"):
+                                            if line.strip().upper().startswith("STATUS:"):
+                                                status = line.split(":", 1)[1].strip().lower()
+                                                break
+                                        emoji = ":white_check_mark:" if status == "healthy" else ":warning:" if status == "degraded" else ":x:" if status == "critical" else ":grey_question:"
+                                        domain_statuses.append(f"{emoji} *{domain.upper()}*: {status}")
+                                    status_text = "\n".join(domain_statuses)
+                                    slack_client.chat_postMessage(
+                                        channel=slack_channel_id, thread_ts=ack_ts,
+                                        text=f"Sub-agent results:\n{status_text}",
+                                        blocks=[{"type": "context", "elements": [
+                                            {"type": "mrkdwn", "text": f":brain: _Sub-agent parallel scan complete:_\n{status_text}"}
+                                        ]}],
+                                    )
+                                except Exception:
+                                    pass
                 except Exception as e:
-                    log.warning(f"Status message failed: {e}")
+                    log.warning(f"Sub-agent investigation failed (non-fatal, continuing with main investigation): {e}")
 
-            # Throttled, non-blocking Slack status updates. The old code did a
-            # blocking chat_update per tool event (~2 per tool x ~5 tools x N
-            # steps = hundreds of 200-500ms round-trips inside the event loop,
-            # frequently 429'd). Latest-wins queue drained by one worker at
-            # ~1 update/1.2s (chat.update allows ~1/s/channel).
-            from concurrent.futures import ThreadPoolExecutor as _TPE
-            _slack_pool = _TPE(max_workers=1)
-            _slack_state: dict = {"pending": None, "inflight": False}
+            # ── Fold fast-triage findings into pre-investigation evidence ──
+            # Give the staged triage pipeline a bounded grace window to finish so
+            # its findings can seed the deep investigation (as pre-investigation
+            # evidence alongside any matched runbook) — often already done by
+            # this point since pattern-check + sub-agents just ran. Slack
+            # narration from fast_triage keeps posting regardless of this wait,
+            # via its own callback; only prompt-seeding is gated here.
+            if triage_future is not None:
+                try:
+                    done, _pending = await _asyncio.wait(
+                        {triage_future}, timeout=config.fast_triage_evidence_wait_seconds
+                    )
+                    if triage_future in done:
+                        fast_triage_evidence = await triage_future
+                        if fast_triage_evidence:
+                            evidence_block = (
+                                f"## Automated Pre-Investigation Findings (Fast Triage)\n\n{fast_triage_evidence}"
+                            )
+                            sub_agent_findings_text = (
+                                f"{evidence_block}\n\n{sub_agent_findings_text}"
+                                if sub_agent_findings_text else evidence_block
+                            )
+                    else:
+                        async def _finish_triage_in_background(fut) -> None:
+                            try:
+                                await fut
+                            except Exception as e:
+                                log.warning(f"Fast triage failed (non-fatal): {e}")
+                        _asyncio.ensure_future(_finish_triage_in_background(triage_future))
+                except Exception as e:
+                    log.warning(f"Fast triage evidence wait failed (non-fatal): {e}")
 
-            def _drain_status() -> None:
-                import time as _t
-                while True:
-                    text = _slack_state["pending"]
-                    if text is None:
-                        break
-                    _slack_state["pending"] = None
+            # ── Streaming investigation with real-time Slack updates ──
+            # Same style as the Slack "debug" path: small context blocks,
+            # real-time tool call start/result, yellow status message.
+
+            def _run_streaming_investigation():
+                """Run stream_investigate() with live Slack tool-by-tool updates."""
+                status_ts = None
+                tool_lines: list[str] = []
+                analysis = ""
+
+                def _short_params(params: dict) -> str:
+                    """Shorten params for display."""
+                    if not params:
+                        return ""
+                    val = str(next(iter(params.values()), ""))
+                    return val[:50].replace("\n", " ")
+
+                # Reuse the pre-investigation phase message as the live status line
+                # (falls back to posting a fresh one if none was created).
+                log.info(f"Streaming investigation: slack_client={bool(slack_client)} channel={slack_channel_id} ack_ts={ack_ts}")
+                if slack_client and slack_channel_id and ack_ts:
                     try:
+                        txt = ":hourglass: Starting deep investigation..."
+                        blocks = [{"type": "context", "elements": [
+                            {"type": "mrkdwn", "text": ":hourglass: _Starting deep investigation..._"}
+                        ]}]
+                        if phase_ts:
+                            slack_client.chat_update(channel=slack_channel_id, ts=phase_ts,
+                                                     text=txt, blocks=blocks)
+                            status_ts = phase_ts
+                        else:
+                            resp = slack_client.chat_postMessage(
+                                channel=slack_channel_id, thread_ts=ack_ts,
+                                text=txt, blocks=blocks,
+                            )
+                            status_ts = resp["ts"]
+                        log.info(f"Status message posted: ts={status_ts}")
+                    except Exception as e:
+                        log.warning(f"Status message failed: {e}")
+
+                # Throttled, non-blocking Slack status updates. The old code did a
+                # blocking chat_update per tool event (~2 per tool x ~5 tools x N
+                # steps = hundreds of 200-500ms round-trips inside the event loop,
+                # frequently 429'd). Latest-wins queue drained by one worker at
+                # ~1 update/1.2s (chat.update allows ~1/s/channel).
+                from concurrent.futures import ThreadPoolExecutor as _TPE
+                _slack_pool = _TPE(max_workers=1)
+                _slack_state: dict = {"pending": None, "inflight": False}
+
+                def _drain_status() -> None:
+                    import time as _t
+                    while True:
+                        text = _slack_state["pending"]
+                        if text is None:
+                            break
+                        _slack_state["pending"] = None
+                        try:
+                            slack_client.chat_update(
+                                channel=slack_channel_id, ts=status_ts, text=text,
+                                blocks=[{"type": "context", "elements": [
+                                    {"type": "mrkdwn", "text": text}
+                                ]}],
+                            )
+                        except Exception:
+                            pass
+                        _t.sleep(1.2)
+                    _slack_state["inflight"] = False
+
+                def _post_status(text: str) -> None:
+                    if not (slack_client and status_ts):
+                        return
+                    _slack_state["pending"] = text
+                    if not _slack_state["inflight"]:
+                        _slack_state["inflight"] = True
+                        _slack_pool.submit(_drain_status)
+
+                # Durable job: create + claim so the conversation checkpoints to
+                # the investigations table at every step (crash-resumable).
+                try:
+                    from vishwakarma.storage.investigations import (
+                        create_investigation, claim_investigation,
+                    )
+                    import socket
+                    create_investigation(
+                        incident_id,
+                        alert_key=issue.labels.get("alertname") or issue.title,
+                    )
+                    claim_investigation(incident_id, worker_id=socket.gethostname())
+                except Exception as inv_err:
+                    log.warning(f"Durable-job setup failed (continuing without): {inv_err}")
+
+                from vishwakarma.core import eventbus, metrics
+                metrics.inc("vk_investigations_started_total",
+                            labels={"cloud": issue.labels.get("cloud", "") or "none"})
+                eventbus.publish(incident_id, {
+                    "type": "investigation_started", "title": issue.title,
+                    "severity": issue.severity, "source": issue.source,
+                })
+
+                # Multimodal: fetch any reported screenshots (Slack url_private
+                # needs bot-token auth) → data URLs for vision-capable models.
+                investigation_images = _fetch_issue_images(issue, config)
+
+                # Curated tool subset for this alert (stable across the run →
+                # prompt-cache friendly + better tool selection).
+                tool_subset = None
+                try:
+                    from vishwakarma.core.tool_selection import select_toolset_names
+                    from vishwakarma.storage.tool_effectiveness import top_toolsets
+                    from vishwakarma.storage.runbooks import normalize_alert_key
+                    available = {ts.name for ts in engine.executor.toolsets if ts.enabled}
+                    sel_text = f"{alert_name} {issue.title} {issue.description or ''}"
+                    learned = top_toolsets(normalize_alert_key(alert_name))
+                    tool_subset = select_toolset_names(sel_text, available, learned=learned)
+                except Exception:
+                    pass
+
+                for event in engine.stream_investigate(
+                    question=question,
+                    runbooks=matched_runbooks or None,
+                    extra_system_prompt=extra_system_prompt,
+                    pre_investigation_findings=sub_agent_findings_text,
+                    incident_id=incident_id,
+                    images=investigation_images or None,
+                    tool_subset=tool_subset,
+                ):
+                    etype = event.get("type", "")
+                    # Fan out to the console UI (SSE) — fire-and-forget.
+                    if etype in ("tool_call_start", "tool_call_result", "hypothesis",
+                                 "compaction", "status", "done", "max_steps_reached"):
+                        eventbus.publish(incident_id, {
+                            k: v for k, v in event.items() if k != "messages"
+                        })
+
+                    if etype == "tool_call_start":
+                        tool = event.get("tool", "")
+                        params = event.get("params", {})
+                        param_str = _short_params(params)
+                        tool_lines.append(f":gear: `{tool}({param_str})`")
+                        _post_status("\n".join(tool_lines[-10:]))
+
+                    elif etype == "tool_call_result":
+                        status = event.get("status", "")
+                        marker = ":white_check_mark:" if status == "success" else ":x:"
+                        tool_name = event.get("tool", "")
+                        for i in range(len(tool_lines) - 1, -1, -1):
+                            if tool_name and f"`{tool_name}(" in tool_lines[i] and ":white_check_mark:" not in tool_lines[i] and ":x:" not in tool_lines[i]:
+                                tool_lines[i] = tool_lines[i] + f" {marker}"
+                                break
+                        _post_status("\n".join(tool_lines[-10:]))
+
+                    elif etype == "compaction":
+                        tool_lines.append(":compression: _context compacted_")
+
+                    elif etype == "max_steps_reached":
+                        analysis = event.get("content", "") or "Investigation reached max steps."
+
+                    elif etype == "done":
+                        analysis = event.get("content", "") or analysis
+
+                # Finalize status message (direct — after stopping the drain worker
+                # so a stale queued update can't overwrite the final state)
+                tool_count = len([t for t in tool_lines if ":gear:" in t])
+                _slack_state["pending"] = None
+                _slack_pool.shutdown(wait=True)
+                if slack_client and status_ts:
+                    try:
+                        final_text = "\n".join(tool_lines[-10:]) + f"\n:white_check_mark: _Done — {tool_count} tools_"
                         slack_client.chat_update(
-                            channel=slack_channel_id, ts=status_ts, text=text,
+                            channel=slack_channel_id, ts=status_ts, text=final_text,
                             blocks=[{"type": "context", "elements": [
-                                {"type": "mrkdwn", "text": text}
+                                {"type": "mrkdwn", "text": final_text}
                             ]}],
                         )
                     except Exception:
                         pass
-                    _t.sleep(1.2)
-                _slack_state["inflight"] = False
 
-            def _post_status(text: str) -> None:
-                if not (slack_client and status_ts):
-                    return
-                _slack_state["pending"] = text
-                if not _slack_state["inflight"]:
-                    _slack_state["inflight"] = True
-                    _slack_pool.submit(_drain_status)
-
-            # Durable job: create + claim so the conversation checkpoints to
-            # the investigations table at every step (crash-resumable).
-            try:
-                from vishwakarma.storage.investigations import (
-                    create_investigation, claim_investigation,
-                )
-                import socket
-                create_investigation(
-                    incident_id,
-                    alert_key=issue.labels.get("alertname") or issue.title,
-                )
-                claim_investigation(incident_id, worker_id=socket.gethostname())
-            except Exception as inv_err:
-                log.warning(f"Durable-job setup failed (continuing without): {inv_err}")
-
-            from vishwakarma.core import eventbus, metrics
-            metrics.inc("vk_investigations_started_total",
-                        labels={"cloud": issue.labels.get("cloud", "") or "none"})
-            eventbus.publish(incident_id, {
-                "type": "investigation_started", "title": issue.title,
-                "severity": issue.severity, "source": issue.source,
-            })
-
-            # Multimodal: fetch any reported screenshots (Slack url_private
-            # needs bot-token auth) → data URLs for vision-capable models.
-            investigation_images = _fetch_issue_images(issue, config)
-
-            # Curated tool subset for this alert (stable across the run →
-            # prompt-cache friendly + better tool selection).
-            tool_subset = None
-            try:
-                from vishwakarma.core.tool_selection import select_toolset_names
-                from vishwakarma.storage.tool_effectiveness import top_toolsets
-                from vishwakarma.storage.runbooks import normalize_alert_key
-                available = {ts.name for ts in engine.executor.toolsets if ts.enabled}
-                sel_text = f"{alert_name} {issue.title} {issue.description or ''}"
-                learned = top_toolsets(normalize_alert_key(alert_name))
-                tool_subset = select_toolset_names(sel_text, available, learned=learned)
-            except Exception:
-                pass
-
-            for event in engine.stream_investigate(
-                question=question,
-                runbooks=matched_runbooks or None,
-                extra_system_prompt=extra_system_prompt,
-                pre_investigation_findings=sub_agent_findings_text,
-                incident_id=incident_id,
-                images=investigation_images or None,
-                tool_subset=tool_subset,
-            ):
-                etype = event.get("type", "")
-                # Fan out to the console UI (SSE) — fire-and-forget.
-                if etype in ("tool_call_start", "tool_call_result", "hypothesis",
-                             "compaction", "status", "done", "max_steps_reached"):
-                    eventbus.publish(incident_id, {
-                        k: v for k, v in event.items() if k != "messages"
-                    })
-
-                if etype == "tool_call_start":
-                    tool = event.get("tool", "")
-                    params = event.get("params", {})
-                    param_str = _short_params(params)
-                    tool_lines.append(f":gear: `{tool}({param_str})`")
-                    _post_status("\n".join(tool_lines[-10:]))
-
-                elif etype == "tool_call_result":
-                    status = event.get("status", "")
-                    marker = ":white_check_mark:" if status == "success" else ":x:"
-                    tool_name = event.get("tool", "")
-                    for i in range(len(tool_lines) - 1, -1, -1):
-                        if tool_name and f"`{tool_name}(" in tool_lines[i] and ":white_check_mark:" not in tool_lines[i] and ":x:" not in tool_lines[i]:
-                            tool_lines[i] = tool_lines[i] + f" {marker}"
-                            break
-                    _post_status("\n".join(tool_lines[-10:]))
-
-                elif etype == "compaction":
-                    tool_lines.append(":compression: _context compacted_")
-
-                elif etype == "max_steps_reached":
-                    analysis = event.get("content", "") or "Investigation reached max steps."
-
-                elif etype == "done":
-                    analysis = event.get("content", "") or analysis
-
-            # Finalize status message (direct — after stopping the drain worker
-            # so a stale queued update can't overwrite the final state)
-            tool_count = len([t for t in tool_lines if ":gear:" in t])
-            _slack_state["pending"] = None
-            _slack_pool.shutdown(wait=True)
-            if slack_client and status_ts:
+                # Durable job: terminal state
                 try:
-                    final_text = "\n".join(tool_lines[-10:]) + f"\n:white_check_mark: _Done — {tool_count} tools_"
-                    slack_client.chat_update(
-                        channel=slack_channel_id, ts=status_ts, text=final_text,
-                        blocks=[{"type": "context", "elements": [
-                            {"type": "mrkdwn", "text": final_text}
-                        ]}],
-                    )
+                    from vishwakarma.storage.investigations import finish_investigation
+                    finish_investigation(incident_id, "done")
+                    from vishwakarma.core import metrics
+                    metrics.inc("vk_investigations_completed_total")
                 except Exception:
                     pass
 
-            # Durable job: terminal state
-            try:
-                from vishwakarma.storage.investigations import finish_investigation
-                finish_investigation(incident_id, "done")
-                from vishwakarma.core import metrics
-                metrics.inc("vk_investigations_completed_total")
-            except Exception:
-                pass
+                # Build a result-like object for the rest of the flow
+                from vishwakarma.core.models import LLMResult, InvestigationMeta
+                return LLMResult(
+                    answer=analysis,
+                    tool_outputs=[],
+                    messages=[],
+                    meta=InvestigationMeta(steps=tool_count),
+                )
 
-            # Build a result-like object for the rest of the flow
-            from vishwakarma.core.models import LLMResult, InvestigationMeta
-            return LLMResult(
-                answer=analysis,
-                tool_outputs=[],
-                messages=[],
-                meta=InvestigationMeta(steps=tool_count),
-            )
-
-        if not auto_resolved and not pattern_matched:
-            result = await loop.run_in_executor(None, _run_streaming_investigation)
+            if not auto_resolved and not pattern_matched:
+                result = await loop.run_in_executor(None, _run_streaming_investigation)
     except Exception as e:
         log.error(f"Alert investigation failed for {issue.title}: {e}", exc_info=True)
         try:
