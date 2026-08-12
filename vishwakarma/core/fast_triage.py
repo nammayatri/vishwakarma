@@ -663,27 +663,21 @@ def _stage_clickhouse(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
     return findings, {}
 
 
-# ── AI interpretation + driver ──────────────────────────────────────────────
+# ── Formatting + driver ──────────────────────────────────────────────────────
 
-def _ai_interpret_stage(llm, stage_name: str, alert_title: str, findings: str) -> str:
+def _format_stage_findings(stage_name: str, findings: str) -> str:
+    """Posts the stage's own findings verbatim as bullet points — no LLM
+    rewrite into prose. Each stage already builds `findings` as one line per
+    datapoint (e.g. "5xx routes: A [HTTP 500] (12x, ELEVATED vs ~2x/1h-ago)")
+    with the significance judgment (baseline-normal/ELEVATED/NEW) already
+    encoded in the line itself; running that back through an LLM to produce
+    "2-3 terse sentences" only re-narrates already-structured data into
+    vaguer paragraphs and strips the per-datapoint detail."""
     header = f":mag: *Quick Triage — {stage_name}*"
     if not findings.strip():
         return f"{header}\n(no data)"
-    if not llm or not getattr(llm.cfg, "fast_model", None):
-        return f"{header}\n```\n{findings}\n```"
-    prompt = (
-        f"You just ran the '{stage_name}' check as one step of a staged first-look "
-        "triage on a firing alert (more checks follow after this one). Given these "
-        "raw findings, write 2-3 terse plain-English sentences: what's failing or "
-        "degraded and how bad. No markdown headers, no preamble.\n\n"
-        f"Alert: {alert_title}\n\n{findings}"
-    )
-    try:
-        text = (llm.summarize(prompt) or "").strip()
-    except Exception as e:
-        log.warning(f"Fast triage stage interpretation failed ({stage_name}): {e}")
-        text = ""
-    return f"{header}\n{text or findings}"
+    bullets = "\n".join(f"• {line}" for line in findings.strip().split("\n") if line.strip())
+    return f"{header}\n{bullets}"
 
 
 _STAGE_FNS: dict[str, Callable] = {
@@ -752,7 +746,7 @@ def _run_stage(name: str, fn: Callable, prom, ctx: dict, top_n: int,
         on_stage_ready(name, text)
         return text
     ctx.update(ctx_update)
-    text = _ai_interpret_stage(llm, name, alert_title, findings)
+    text = _format_stage_findings(name, findings)
     on_stage_ready(name, text)
     return text
 
