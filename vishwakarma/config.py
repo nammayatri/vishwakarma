@@ -341,6 +341,11 @@ class VishwakarmaConfig:
         )
         self.fast_triage_top_n: int = int(_env("VK_FAST_TRIAGE_TOP_N", str(ft.get("top_n", 5))))
         self.fast_triage_namespace_exclude: str = ft.get("istio_namespace_exclude", "app-monitor")
+        # Business Impact stage — merchantOperatingCityId -> display-name map.
+        # A city has one merchant_operating_city row per onboarded merchant,
+        # so several ids legitimately map to one name; the stage sums them.
+        # Empty/unset = every city shown ranked by search volume, raw id.
+        self.fast_triage_business_impact_cities: dict[str, str] = ft.get("business_impact_cities", {}) or {}
         # How long the deep investigation will wait for the fast-triage
         # pipeline to finish before proceeding without its findings as
         # pre-investigation evidence — separate from (and much shorter than)

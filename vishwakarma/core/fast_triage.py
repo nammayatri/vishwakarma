@@ -144,30 +144,45 @@ _BUSINESS_IMPACT_TOP_CITIES = 15
 
 
 def _stage_business_impact(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
-    """Rides/searches/ratio for every merchant operating city (not just the
-    one city the fired alert happens to carry a label for) — runs for every
-    alert, regardless of which triage category matched (Istio, DB/Redis, GCP
-    Redis/AlloyDB, or the unmatched default route), so the on-call can size up
-    business impact before reading any of the category-specific dashboards.
-    Same 'Rides Created Count' / 'Search Request Count' counters as the
-    'Release Monitoring' dashboard's own panels, just grouped across all
-    cities instead of one. Ranked by search volume descending — the busiest
-    (highest-impact) cities surface first."""
+    """Rides/searches/ratio per city — runs for every alert, regardless of
+    which triage category matched (Istio, DB/Redis, GCP Redis/AlloyDB, or the
+    unmatched default route), so the on-call can size up business impact
+    before reading any of the category-specific dashboards. Same 'Rides
+    Created Count' / 'Search Request Count' counters as the 'Release
+    Monitoring' dashboard's own panels, just grouped across cities instead of
+    one.
+
+    `ctx["business_impact_cities"]` (from config: fast_triage.
+    business_impact_cities, a merchantOperatingCityId -> display-name map) is
+    the normal path — a city has one merchant_operating_city row per
+    onboarded merchant, so several ids legitimately roll up to one name (e.g.
+    5 ids -> "Bangalore"); those get summed together rather than shown as
+    separate rows. Config missing/empty falls back to every city ranked by
+    search volume under its raw id — still useful (nothing configured yet
+    shouldn't mean nothing shown), just less readable."""
     ride_rows = _query(prom, 'sum by (merchantOperatingCityId) (increase(ride_created_count[15m]))')
     search_rows = _query(prom, 'sum by (merchantOperatingCityId) (increase(search_request_count[15m]))')
-    ride_by_city = {l.get('merchantOperatingCityId', '?'): v for l, v in ride_rows}
-    search_by_city = {l.get('merchantOperatingCityId', '?'): v for l, v in search_rows}
+    ride_by_id = {l.get('merchantOperatingCityId', '?'): v for l, v in ride_rows}
+    search_by_id = {l.get('merchantOperatingCityId', '?'): v for l, v in search_rows}
 
-    city_ids = set(ride_by_city) | set(search_by_city)
-    rows = sorted(
-        ((cid, ride_by_city.get(cid, 0.0), search_by_city.get(cid, 0.0)) for cid in city_ids),
-        key=lambda r: r[2], reverse=True,
-    )[:max(top_n, _BUSINESS_IMPACT_TOP_CITIES)]
+    city_names: dict[str, str] = ctx.get("business_impact_cities") or {}
+    if city_names:
+        by_name: dict[str, list[float]] = {}
+        for city_id, name in city_names.items():
+            agg = by_name.setdefault(name, [0.0, 0.0])
+            agg[0] += ride_by_id.get(city_id, 0.0)
+            agg[1] += search_by_id.get(city_id, 0.0)
+        rows = [(name, r, s) for name, (r, s) in by_name.items()]
+    else:
+        city_ids = set(ride_by_id) | set(search_by_id)
+        rows = [(f"City {cid}", ride_by_id.get(cid, 0.0), search_by_id.get(cid, 0.0)) for cid in city_ids]
+    rows.sort(key=lambda r: r[2], reverse=True)
+    rows = rows[:max(top_n, _BUSINESS_IMPACT_TOP_CITIES)]
 
     lines = []
-    for city_id, rides, searches in rows:
+    for label, rides, searches in rows:
         ratio_str = f"{(rides / searches * 100):.1f}%" if searches else "n/a (0 searches)"
-        lines.append(f"City {city_id} (15m): {int(rides)} rides / {int(searches)} searches — ratio {ratio_str}")
+        lines.append(f"{label} (15m): {int(rides)} rides / {int(searches)} searches — ratio {ratio_str}")
     findings = "\n".join(lines) if lines else "No ride/search data found for any city."
     return findings, {}
 
@@ -791,7 +806,7 @@ def _run_stage(name: str, fn: Callable, prom, ctx: dict, top_n: int,
 
 
 def _run_triage_stages(prom, grafana, llm, issue, on_stage_ready: Callable[[str, str], None],
-                        top_n: int, namespace_exclude: str) -> str:
+                        top_n: int, namespace_exclude: str, business_impact_cities: dict[str, str]) -> str:
     labels = issue.labels or {}
     ctx = {
         "known_service": _sanitize(labels.get("service") or labels.get("job") or ""),
@@ -801,6 +816,7 @@ def _run_triage_stages(prom, grafana, llm, issue, on_stage_ready: Callable[[str,
         "_grafana": grafana,
         "url_map_name": _sanitize(labels.get("url_map_name") or "") or None,
         "merchant_operating_city_id": _sanitize(labels.get("merchantOperatingCityId") or "") or None,
+        "business_impact_cities": business_impact_cities,
     }
     # Business Impact always runs first, ahead of the alert-specific route —
     # it's independent of which category (Istio/DB-Redis/GCP-Redis/AlloyDB/
@@ -821,6 +837,7 @@ def run_fast_triage_staged(
     timeout_seconds: int = 240,
     top_n: int = 5,
     namespace_exclude: str = "app-monitor",
+    business_impact_cities: dict[str, str] | None = None,
 ) -> str:
     """
     Runs whichever stages `_route_for_alert(issue.title)` picks for this
@@ -841,6 +858,10 @@ def run_fast_triage_staged(
     seed a system prompt with the findings (e.g. as pre-investigation evidence
     for a matched runbook) can use it.
 
+    `business_impact_cities` (config: fast_triage.business_impact_cities) is
+    a merchantOperatingCityId -> display-name map for the Business Impact
+    stage — unset/empty falls back to every city under its raw id.
+
     Fails open at two levels: a single stage erroring doesn't stop the rest
     (`on_stage_ready` still gets called, noting it was skipped), and the whole
     pipeline is capped at `timeout_seconds` total — past that, whatever
@@ -855,7 +876,8 @@ def run_fast_triage_staged(
     grafana = toolset_manager.get("grafana")  # None if not configured — stackdriver-backed stages skip themselves
 
     pool = ThreadPoolExecutor(max_workers=1)
-    future = pool.submit(_run_triage_stages, prom, grafana, llm, issue, on_stage_ready, top_n, namespace_exclude)
+    future = pool.submit(_run_triage_stages, prom, grafana, llm, issue, on_stage_ready, top_n,
+                          namespace_exclude, business_impact_cities or {})
     try:
         return future.result(timeout=timeout_seconds)
     except FuturesTimeoutError:

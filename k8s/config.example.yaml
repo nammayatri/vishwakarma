@@ -28,6 +28,18 @@ server:
 storage:
   db_path: /data/vishwakarma.db     # SQLite — incident history (on PVC)
 
+# ── Fast Triage ───────────────────────────────────────────────────────────────
+# fast_triage:
+#   business_impact_cities:      # merchantOperatingCityId -> display name
+#     # A city has one merchant_operating_city row per onboarded merchant, so
+#     # several ids legitimately map to the same name — list them all, the
+#     # stage sums rides/searches across them before computing the ratio.
+#     <city-uuid-1>: Bangalore
+#     <city-uuid-2>: Bangalore
+#     <city-uuid-3>: Chennai
+#     <city-uuid-4>: Kolkata
+#     # Unset/empty = every city shown ranked by search volume, raw id.
+
 # ── Site Knowledge Base ────────────────────────────────────────────────────────
 # Injected into every investigation. Put cluster-specific facts here:
 # instance IDs, namespaces, metric names, proven commands, IAM gaps.
