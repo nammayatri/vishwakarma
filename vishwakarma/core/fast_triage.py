@@ -5,7 +5,8 @@ Mirrors the on-call's manual first response to an alert, stage by stage, each
 stage's real Grafana panel queries run directly against the same
 Prometheus/VictoriaMetrics backend the `prometheus` toolset already talks to:
 
-  - Istio mesh         — "Istio Mesh Dashboard": 5xx/4xx by service + pod-wise detail
+  - Business Impact    — "Release Monitoring": rides/searches/ratio for every city — always runs, independent of routing
+  - Istio mesh         — "Istio Mesh Dashboard": 5xx/4xx/0DC by service + pod-wise detail
   - Release Monitoring — "Release Monitoring": failing route + app error codes
   - DB/Redis           — "KV Metrics": SQL errors, Redis call-limit breaches, P99 latency
   - Pod CPU/Mem        — "Pods / CPU New": CPU/mem %, throttling, restarts
@@ -16,7 +17,10 @@ Which stage(s) run, and in what order, is chosen per-alert by `_route_for_alert`
 (alert-name pattern -> ordered stage list) — not every alert benefits from
 every dashboard (e.g. `DriverAllocatorLooksDead` has nothing to do with Istio
 5xx traffic; a node-exporter disk-full alert has no app-dashboard match at
-all). Unmatched alerts fall back to the original 4-stage default. Routing is
+all). Unmatched alerts fall back to the original 4-stage default. Business
+Impact is the one exception — it always runs first, ahead of routing, since
+sizing up ride/search impact across all cities is useful no matter which
+category the alert falls into. Routing is
 purely by alert title text — never by hardcoding a specific service/namespace
 name into the routing table itself (dashboard *queries* do reuse a panel's own
 literal filters verbatim where the real panel hardcodes one, e.g. Scheduler's
@@ -134,13 +138,54 @@ def _label(labels: dict, *names: str) -> str:
     return "?"
 
 
+# ── Stage 0 — Business Impact (always runs, independent of alert routing) ──
+
+_BUSINESS_IMPACT_TOP_CITIES = 15
+
+
+def _stage_business_impact(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
+    """Rides/searches/ratio for every merchant operating city (not just the
+    one city the fired alert happens to carry a label for) — runs for every
+    alert, regardless of which triage category matched (Istio, DB/Redis, GCP
+    Redis/AlloyDB, or the unmatched default route), so the on-call can size up
+    business impact before reading any of the category-specific dashboards.
+    Same 'Rides Created Count' / 'Search Request Count' counters as the
+    'Release Monitoring' dashboard's own panels, just grouped across all
+    cities instead of one. Ranked by search volume descending — the busiest
+    (highest-impact) cities surface first."""
+    ride_rows = _query(prom, 'sum by (merchantOperatingCityId) (increase(ride_created_count[15m]))')
+    search_rows = _query(prom, 'sum by (merchantOperatingCityId) (increase(search_request_count[15m]))')
+    ride_by_city = {l.get('merchantOperatingCityId', '?'): v for l, v in ride_rows}
+    search_by_city = {l.get('merchantOperatingCityId', '?'): v for l, v in search_rows}
+
+    city_ids = set(ride_by_city) | set(search_by_city)
+    rows = sorted(
+        ((cid, ride_by_city.get(cid, 0.0), search_by_city.get(cid, 0.0)) for cid in city_ids),
+        key=lambda r: r[2], reverse=True,
+    )[:max(top_n, _BUSINESS_IMPACT_TOP_CITIES)]
+
+    lines = []
+    for city_id, rides, searches in rows:
+        ratio_str = f"{(rides / searches * 100):.1f}%" if searches else "n/a (0 searches)"
+        lines.append(f"City {city_id} (15m): {int(rides)} rides / {int(searches)} searches — ratio {ratio_str}")
+    findings = "\n".join(lines) if lines else "No ride/search data found for any city."
+    return findings, {}
+
+
 # ── Stage 1 — Istio mesh ────────────────────────────────────────────────────
 
 def _stage_istio(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
     """Real panels: '5xx - Service Wise' + '4xx - Service Wise' (service
-    ranking) and '5xx - Pod Wise' (already broad — excludes only 2xx/3xx/4xx,
-    so it also catches response_code "0" + response_flags like DC/UF/UC,
-    i.e. connection-level failures with no HTTP status at all)."""
+    ranking) and '5xx - Pod Wise'. response_code="0" (Istio's code for
+    connection-level failures — no HTTP status at all, paired with a
+    response_flags value like DC/DR/UF/UC) is queried and reported as its own
+    "0DC" category, separate from literal HTTP 5xx, so the on-call isn't left
+    guessing which failure mode dominates behind a generic "5xx" label.
+
+    Each category is rendered as one line per service (not one comma-joined
+    line per category) so `_format_stage_findings` turns every
+    service+code+count into its own bullet — scanning "which services, which
+    codes" shouldn't require parsing a run-on sentence."""
     common = 'destination_service_name!="istio-telemetry", reporter="destination"'
     known_service = ctx.get("known_service", "")
 
@@ -151,30 +196,29 @@ def _stage_istio(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
         scope = f'{common}, destination_workload_namespace!="{namespace_exclude}"'
 
     promql_5xx = (
-        f'sum(increase(istio_requests_total{{{scope}, response_code!~"(2..|3..|4..)"}}[5m])) '
+        f'sum(increase(istio_requests_total{{{scope}, response_code=~"5.."}}[5m])) '
         f'by (destination_service_name, response_code)'
     )
     promql_4xx = (
-        f'sum(increase(istio_requests_total{{{scope}, response_code!~"(2..|3..|5..)"}}[5m])) '
+        f'sum(increase(istio_requests_total{{{scope}, response_code=~"4.."}}[5m])) '
         f'by (destination_service_name, response_code)'
     )
-    # Keep full rows (not just service names) — response_code!~"(2..|3..|4..)"
-    # also matches response_code="0" (Istio's code for connection-level
-    # failures, e.g. paired with flags like DC/UF/UC — no HTTP status at all).
-    # Collapsing to one row per service would hide *which* failure mode
-    # dominates behind a generic "5xx" label even when it's actually
-    # connection resets, not literal HTTP 500s.
+    promql_0dc = (
+        f'sum(increase(istio_requests_total{{{scope}, response_code="0"}}[5m])) '
+        f'by (destination_service_name, response_flags)'
+    )
     # Each row also carries its own 1h-ago baseline (_query_promql_with_baseline)
     # so a service's routine error-code noise (e.g. a chatty client's steady
     # 429s) doesn't read as equally alarming as a genuine new spike.
     top_5xx_rows = _query_promql_with_baseline(prom, promql_5xx, top_n)
     top_4xx_rows = _query_promql_with_baseline(prom, promql_4xx, top_n)
+    top_0dc_rows = _query_promql_with_baseline(prom, promql_0dc, top_n)
 
     if known_service:
         services = [known_service]
     else:
         services, seen = [], set()
-        for labels, _val, _base in top_5xx_rows + top_4xx_rows:
+        for labels, _val, _base in top_5xx_rows + top_4xx_rows + top_0dc_rows:
             name = labels.get("destination_service_name")
             if name and name not in seen:
                 seen.add(name)
@@ -191,29 +235,23 @@ def _stage_istio(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
         )
         pod_rows = _topk_rows(_query(prom, pod_q), top_n)
 
-    def _code_tag(code: str) -> str:
-        return "connection-failure" if code == "0" else f"HTTP {code}"
+    def _service_lines(category: str, rows: list[tuple[dict, float, float]], code_fn: Callable[[dict], str]) -> list[str]:
+        return [
+            f"{category} {labels.get('destination_service_name', '?')} [{code_fn(labels)}] "
+            f"({int(v)}x, {_sig_tag(v, base)})"
+            for labels, v, base in rows
+        ]
 
-    lines = []
-    if top_5xx_rows:
-        lines.append("5xx/connection-failures by service: " + ", ".join(
-            f"{labels.get('destination_service_name', '?')} [{_code_tag(labels.get('response_code', '?'))}] "
-            f"({int(v)}x, {_sig_tag(v, base)})"
-            for labels, v, base in top_5xx_rows
-        ))
-    if top_4xx_rows:
-        lines.append("4xx by service: " + ", ".join(
-            f"{labels.get('destination_service_name', '?')} [HTTP {labels.get('response_code', '?')}] "
-            f"({int(v)}x, {_sig_tag(v, base)})"
-            for labels, v, base in top_4xx_rows
-        ))
+    lines: list[str] = []
+    lines += _service_lines("5xx:", top_5xx_rows, lambda l: f"HTTP {l.get('response_code', '?')}")
+    lines += _service_lines("4xx:", top_4xx_rows, lambda l: f"HTTP {l.get('response_code', '?')}")
+    lines += _service_lines("0DC:", top_0dc_rows, lambda l: f"0/{l.get('response_flags') or '-'}")
     if pod_rows:
-        pod_lines = [
-            f"{labels.get('pod', '?')} [{labels.get('response_code', '?')}/{labels.get('response_flags') or '-'}] {int(v)}x"
+        lines += [
+            f"Worst pod: {labels.get('pod', '?')} [{labels.get('response_code', '?')}/{labels.get('response_flags') or '-'}] {int(v)}x"
             for labels, v in pod_rows
         ]
-        lines.append("Worst pods: " + "; ".join(pod_lines))
-    findings = "\n".join(lines) if lines else "No 5xx/4xx traffic found."
+    findings = "\n".join(lines) if lines else "No 5xx/4xx/0DC traffic found."
 
     return findings, {"services": services}
 
@@ -681,6 +719,7 @@ def _format_stage_findings(stage_name: str, findings: str) -> str:
 
 
 _STAGE_FNS: dict[str, Callable] = {
+    "Business Impact": _stage_business_impact,
     "Istio mesh": _stage_istio,
     "Release Monitoring": _stage_release_monitoring,
     "DB/Redis": _stage_db_redis,
@@ -763,10 +802,13 @@ def _run_triage_stages(prom, grafana, llm, issue, on_stage_ready: Callable[[str,
         "url_map_name": _sanitize(labels.get("url_map_name") or "") or None,
         "merchant_operating_city_id": _sanitize(labels.get("merchantOperatingCityId") or "") or None,
     }
-    route = _route_for_alert(issue.title)
+    # Business Impact always runs first, ahead of the alert-specific route —
+    # it's independent of which category (Istio/DB-Redis/GCP-Redis/AlloyDB/
+    # default) matched, so it isn't gated by `_route_for_alert` like the rest.
+    all_stages = ["Business Impact"] + _route_for_alert(issue.title)
     summaries = [
         _run_stage(name, _STAGE_FNS[name], prom, ctx, top_n, llm, issue.title, on_stage_ready)
-        for name in route
+        for name in all_stages
     ]
     return "\n\n".join(summaries)
 
