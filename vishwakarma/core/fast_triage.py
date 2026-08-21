@@ -238,12 +238,11 @@ def _stage_istio(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
 
     Every series is still analysed against its own 1h-ago baseline
     (_query_promql_with_baseline) — that's what separates a genuine new spike
-    from a chatty client's routine 429 noise — but the Slack post is kept to
-    ONE line per service with just its failing code categories, services
-    ranked by severity (elevated-vs-baseline first, worst elevation ratio,
-    then 5xx/0DC/4xx volume). Counts and baseline numbers stay out of the
-    thread: 15 lines of per-code arithmetic made the first response
-    unscannable, and the deep investigation re-derives them anyway."""
+    from a chatty client's routine 429 noise — but the Slack post carries ONLY
+    the issue -> service mapping: one line per category (5xx, 0DC, 4xx) listing
+    every affected service with its failing codes, severity-ordered (elevated
+    vs baseline first, then volume). Counts and baseline arithmetic stay out
+    of the thread; every issue type and every affected service still shows."""
     common = 'destination_service_name!="istio-telemetry", reporter="destination"'
     known_service = ctx.get("known_service", "")
 
@@ -269,55 +268,52 @@ def _stage_istio(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
     top_4xx_rows = _query_promql_with_baseline(prom, promql_4xx, top_n)
     top_0dc_rows = _query_promql_with_baseline(prom, promql_0dc, top_n)
 
-    # Per-service rollup, ordered by severity. Tags are the service's distinct
-    # failing code categories in 5xx -> 0DC -> 4xx order; services carrying a
-    # series that jumped vs its own 1h-ago baseline get the ELEVATED suffix.
-    per_svc: dict[str, dict] = {}
-
-    def _collect(rows: list[tuple[dict, float, float]], category: str,
-                 code_fn: Callable[[dict], str]) -> None:
+    def _category_line(rows: list[tuple[dict, float, float]], category: str,
+                       code_fn: Callable[[dict], str]) -> tuple[str, list[str]] | None:
+        """One line: `5xx: svc-a [HTTP 500] (ELEVATED), svc-b [HTTP 503]`.
+        Services ranked inside the category: any baseline-elevated series
+        first (worst jump wins), then raw volume. Also returns the ranked
+        service names so downstream stages can inherit the ordering."""
+        per_svc: dict[str, dict] = {}
         for labels, val, base in rows:
             name = labels.get("destination_service_name")
             if not name:
                 continue
-            entry = per_svc.setdefault(name, {
-                "tags": [], "max_elev": 1.0,
-                "volume": {"5xx": 0.0, "0DC": 0.0, "4xx": 0.0},
-            })
-            entry["volume"][category] += val
+            entry = per_svc.setdefault(name, {"max_elev": 1.0, "volume": 0.0, "codes": []})
+            entry["volume"] += val
             if _is_elevated(val, base):
                 entry["max_elev"] = max(entry["max_elev"], val / base if base > 0 else val)
-            tag = code_fn(labels)
-            if tag not in entry["tags"]:
-                entry["tags"].append(tag)
-
-    _collect(top_5xx_rows, "5xx", lambda l: f"HTTP {l.get('response_code', '?')}")
-    _collect(top_0dc_rows, "0DC", lambda l: f"0/{l.get('response_flags') or '-'}")
-    _collect(top_4xx_rows, "4xx", lambda l: f"HTTP {l.get('response_code', '?')}")
-
-    def _severity(item: tuple[str, dict]) -> tuple:
-        entry = item[1]
-        return (
-            entry["max_elev"] > 1.0,        # any elevated series first
-            entry["max_elev"],              # worst jump vs baseline wins
-            entry["volume"]["5xx"],         # then genuine server errors
-            entry["volume"]["0DC"],         # then connection-level failures
-            entry["volume"]["4xx"],
+            code = code_fn(labels)
+            if code not in entry["codes"]:
+                entry["codes"].append(code)
+        if not per_svc:
+            return None
+        ranked = sorted(
+            per_svc.items(),
+            key=lambda kv: (kv[1]["max_elev"] > 1.0, kv[1]["max_elev"], kv[1]["volume"]),
+            reverse=True,
         )
+        parts = [
+            f"{name} [{', '.join(e['codes'])}]" + (" (ELEVATED)" if e["max_elev"] > 1.0 else "")
+            for name, e in ranked
+        ]
+        return f"{category}: " + ", ".join(parts), [name for name, _e in ranked]
 
-    ranked = sorted(per_svc.items(), key=_severity, reverse=True)
-
-    lines = [
-        f"{name} — {', '.join(entry['tags'])}"
-        + (" (ELEVATED vs 1h-ago)" if entry["max_elev"] > 1.0 else "")
-        for name, entry in ranked
+    rendered = [
+        _category_line(top_5xx_rows, "5xx", lambda l: f"HTTP {l.get('response_code', '?')}"),
+        _category_line(top_0dc_rows, "0DC", lambda l: f"0/{l.get('response_flags') or '-'}"),
+        _category_line(top_4xx_rows, "4xx", lambda l: f"HTTP {l.get('response_code', '?')}"),
     ]
+    lines = [line for line, _names in (r for r in rendered if r)]
     findings = "\n".join(lines) if lines else "No 5xx/4xx/0DC traffic found."
 
     if known_service:
         services = [known_service]
     else:
-        services = [name for name, _e in ranked][:top_n]
+        services: list[str] = []
+        for _line, names in (r for r in rendered if r):
+            services += [n for n in names if n not in services]
+        services = services[:top_n]
 
     return findings, {"services": services}
 
