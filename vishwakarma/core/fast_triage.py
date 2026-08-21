@@ -5,8 +5,10 @@ Mirrors the on-call's manual first response to an alert, stage by stage, each
 stage's real Grafana panel queries run directly against the same
 Prometheus/VictoriaMetrics backend the `prometheus` toolset already talks to:
 
-  - Business Impact    — "Release Monitoring": rides/searches/ratio for every city — always runs, independent of routing
-  - Istio mesh         — "Istio Mesh Dashboard": 5xx/4xx/0DC by service + pod-wise detail
+  - Business Impact    — "Release Monitoring": rides/searches/ratio for every city, tagged
+                         dropping/rising/steady vs the previous 15m — always runs, independent of routing
+  - Istio mesh         — "Istio Mesh Dashboard": severity-ranked per-service 5xx/4xx/0DC codes —
+                         baselines analysed behind the scenes, only the sorted service names posted
   - Release Monitoring — "Release Monitoring": failing route + app error codes
   - DB/Redis           — "KV Metrics": SQL errors, Redis call-limit breaches, P99 latency
   - Pod CPU/Mem        — "Pods / CPU New": CPU/mem %, throttling, restarts
@@ -143,6 +145,22 @@ def _label(labels: dict, *names: str) -> str:
 _BUSINESS_IMPACT_TOP_CITIES = 15
 
 
+def _trend_tag(current_ratio: float, prev_ratio: float) -> str:
+    """Verdict for the current 15m ratio vs the previous 15m window: a >=10%
+    relative fall is 'dropping', a >=10% relative rise is 'rising', anything
+    in between is 'steady'. Relative (not absolute percentage points) so a
+    2pp wobble at Bangalore's ~70% baseline doesn't scream, while Chennai's
+    8% -> 5% does."""
+    if prev_ratio <= 0:
+        return "steady"
+    change = current_ratio / prev_ratio
+    if change <= 0.90:
+        return "dropping"
+    if change >= 1.10:
+        return "rising"
+    return "steady"
+
+
 def _stage_business_impact(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
     """Rides/searches/ratio per city — runs for every alert, regardless of
     which triage category matched (Istio, DB/Redis, GCP Redis/AlloyDB, or the
@@ -151,6 +169,12 @@ def _stage_business_impact(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
     Created Count' / 'Search Request Count' counters as the 'Release
     Monitoring' dashboard's own panels, just grouped across cities instead of
     one.
+
+    Each line also compares the current 15m ratio against the previous 15m
+    window ('[15m] offset 15m') and tags it dropping/rising/steady — a bare
+    ratio alone can't tell you whether the city's traffic is actually sagging
+    or just looking at you, and that trend is the first thing the on-call
+    reads this panel for.
 
     `ctx["business_impact_cities"]` (from config: fast_triage.
     business_impact_cities, a merchantOperatingCityId -> display-name map) is
@@ -162,26 +186,41 @@ def _stage_business_impact(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
     shouldn't mean nothing shown), just less readable."""
     ride_rows = _query(prom, 'sum by (merchantOperatingCityId) (increase(ride_created_count[15m]))')
     search_rows = _query(prom, 'sum by (merchantOperatingCityId) (increase(search_request_count[15m]))')
+    prev_ride_rows = _query(prom, 'sum by (merchantOperatingCityId) (increase(ride_created_count[15m] offset 15m))')
+    prev_search_rows = _query(prom, 'sum by (merchantOperatingCityId) (increase(search_request_count[15m] offset 15m))')
     ride_by_id = {l.get('merchantOperatingCityId', '?'): v for l, v in ride_rows}
     search_by_id = {l.get('merchantOperatingCityId', '?'): v for l, v in search_rows}
+    prev_ride_by_id = {l.get('merchantOperatingCityId', '?'): v for l, v in prev_ride_rows}
+    prev_search_by_id = {l.get('merchantOperatingCityId', '?'): v for l, v in prev_search_rows}
 
     city_names: dict[str, str] = ctx.get("business_impact_cities") or {}
     if city_names:
         by_name: dict[str, list[float]] = {}
         for city_id, name in city_names.items():
-            agg = by_name.setdefault(name, [0.0, 0.0])
+            agg = by_name.setdefault(name, [0.0, 0.0, 0.0, 0.0])
             agg[0] += ride_by_id.get(city_id, 0.0)
             agg[1] += search_by_id.get(city_id, 0.0)
-        rows = [(name, r, s) for name, (r, s) in by_name.items()]
+            agg[2] += prev_ride_by_id.get(city_id, 0.0)
+            agg[3] += prev_search_by_id.get(city_id, 0.0)
+        rows = [(name, *vals) for name, vals in by_name.items()]
     else:
         city_ids = set(ride_by_id) | set(search_by_id)
-        rows = [(f"City {cid}", ride_by_id.get(cid, 0.0), search_by_id.get(cid, 0.0)) for cid in city_ids]
+        rows = [(f"City {cid}", ride_by_id.get(cid, 0.0), search_by_id.get(cid, 0.0),
+                 prev_ride_by_id.get(cid, 0.0), prev_search_by_id.get(cid, 0.0))
+                for cid in city_ids]
     rows.sort(key=lambda r: r[2], reverse=True)
     rows = rows[:max(top_n, _BUSINESS_IMPACT_TOP_CITIES)]
 
     lines = []
-    for label, rides, searches in rows:
-        ratio_str = f"{(rides / searches * 100):.1f}%" if searches else "n/a (0 searches)"
+    for label, rides, searches, prev_rides, prev_searches in rows:
+        if not searches:
+            lines.append(f"{label} (15m): {int(rides)} rides / 0 searches — ratio n/a (0 searches)")
+            continue
+        ratio = rides / searches * 100
+        ratio_str = f"{ratio:.1f}%"
+        if prev_searches:
+            prev_ratio = prev_rides / prev_searches * 100
+            ratio_str += f" (prev 15m: {prev_ratio:.1f}% — {_trend_tag(ratio, prev_ratio)})"
         lines.append(f"{label} (15m): {int(rides)} rides / {int(searches)} searches — ratio {ratio_str}")
     findings = "\n".join(lines) if lines else "No ride/search data found for any city."
     return findings, {}
@@ -197,10 +236,14 @@ def _stage_istio(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
     "0DC" category, separate from literal HTTP 5xx, so the on-call isn't left
     guessing which failure mode dominates behind a generic "5xx" label.
 
-    Each category is rendered as one line per service (not one comma-joined
-    line per category) so `_format_stage_findings` turns every
-    service+code+count into its own bullet — scanning "which services, which
-    codes" shouldn't require parsing a run-on sentence."""
+    Every series is still analysed against its own 1h-ago baseline
+    (_query_promql_with_baseline) — that's what separates a genuine new spike
+    from a chatty client's routine 429 noise — but the Slack post is kept to
+    ONE line per service with just its failing code categories, services
+    ranked by severity (elevated-vs-baseline first, worst elevation ratio,
+    then 5xx/0DC/4xx volume). Counts and baseline numbers stay out of the
+    thread: 15 lines of per-code arithmetic made the first response
+    unscannable, and the deep investigation re-derives them anyway."""
     common = 'destination_service_name!="istio-telemetry", reporter="destination"'
     known_service = ctx.get("known_service", "")
 
@@ -222,51 +265,59 @@ def _stage_istio(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
         f'sum(increase(istio_requests_total{{{scope}, response_code="0"}}[5m])) '
         f'by (destination_service_name, response_flags)'
     )
-    # Each row also carries its own 1h-ago baseline (_query_promql_with_baseline)
-    # so a service's routine error-code noise (e.g. a chatty client's steady
-    # 429s) doesn't read as equally alarming as a genuine new spike.
     top_5xx_rows = _query_promql_with_baseline(prom, promql_5xx, top_n)
     top_4xx_rows = _query_promql_with_baseline(prom, promql_4xx, top_n)
     top_0dc_rows = _query_promql_with_baseline(prom, promql_0dc, top_n)
 
+    # Per-service rollup, ordered by severity. Tags are the service's distinct
+    # failing code categories in 5xx -> 0DC -> 4xx order; services carrying a
+    # series that jumped vs its own 1h-ago baseline get the ELEVATED suffix.
+    per_svc: dict[str, dict] = {}
+
+    def _collect(rows: list[tuple[dict, float, float]], category: str,
+                 code_fn: Callable[[dict], str]) -> None:
+        for labels, val, base in rows:
+            name = labels.get("destination_service_name")
+            if not name:
+                continue
+            entry = per_svc.setdefault(name, {
+                "tags": [], "max_elev": 1.0,
+                "volume": {"5xx": 0.0, "0DC": 0.0, "4xx": 0.0},
+            })
+            entry["volume"][category] += val
+            if _is_elevated(val, base):
+                entry["max_elev"] = max(entry["max_elev"], val / base if base > 0 else val)
+            tag = code_fn(labels)
+            if tag not in entry["tags"]:
+                entry["tags"].append(tag)
+
+    _collect(top_5xx_rows, "5xx", lambda l: f"HTTP {l.get('response_code', '?')}")
+    _collect(top_0dc_rows, "0DC", lambda l: f"0/{l.get('response_flags') or '-'}")
+    _collect(top_4xx_rows, "4xx", lambda l: f"HTTP {l.get('response_code', '?')}")
+
+    def _severity(item: tuple[str, dict]) -> tuple:
+        entry = item[1]
+        return (
+            entry["max_elev"] > 1.0,        # any elevated series first
+            entry["max_elev"],              # worst jump vs baseline wins
+            entry["volume"]["5xx"],         # then genuine server errors
+            entry["volume"]["0DC"],         # then connection-level failures
+            entry["volume"]["4xx"],
+        )
+
+    ranked = sorted(per_svc.items(), key=_severity, reverse=True)
+
+    lines = [
+        f"{name} — {', '.join(entry['tags'])}"
+        + (" (ELEVATED vs 1h-ago)" if entry["max_elev"] > 1.0 else "")
+        for name, entry in ranked
+    ]
+    findings = "\n".join(lines) if lines else "No 5xx/4xx/0DC traffic found."
+
     if known_service:
         services = [known_service]
     else:
-        services, seen = [], set()
-        for labels, _val, _base in top_5xx_rows + top_4xx_rows + top_0dc_rows:
-            name = labels.get("destination_service_name")
-            if name and name not in seen:
-                seen.add(name)
-                services.append(name)
-        services = services[:top_n]
-
-    pod_rows: list[tuple[dict, float]] = []
-    if services:
-        svc_match = "|".join(re.escape(s) for s in services)
-        pod_q = (
-            f'sum by (destination_service_name, pod, response_code, response_flags) '
-            f'(increase(istio_requests_total{{{common}, destination_service_name=~"{svc_match}", '
-            f'response_code!~"(2..|3..|4..)", pod!=""}}[5m]))'
-        )
-        pod_rows = _topk_rows(_query(prom, pod_q), top_n)
-
-    def _service_lines(category: str, rows: list[tuple[dict, float, float]], code_fn: Callable[[dict], str]) -> list[str]:
-        return [
-            f"{category} {labels.get('destination_service_name', '?')} [{code_fn(labels)}] "
-            f"({int(v)}x, {_sig_tag(v, base)})"
-            for labels, v, base in rows
-        ]
-
-    lines: list[str] = []
-    lines += _service_lines("5xx:", top_5xx_rows, lambda l: f"HTTP {l.get('response_code', '?')}")
-    lines += _service_lines("4xx:", top_4xx_rows, lambda l: f"HTTP {l.get('response_code', '?')}")
-    lines += _service_lines("0DC:", top_0dc_rows, lambda l: f"0/{l.get('response_flags') or '-'}")
-    if pod_rows:
-        lines += [
-            f"Worst pod: {labels.get('pod', '?')} [{labels.get('response_code', '?')}/{labels.get('response_flags') or '-'}] {int(v)}x"
-            for labels, v in pod_rows
-        ]
-    findings = "\n".join(lines) if lines else "No 5xx/4xx/0DC traffic found."
+        services = [name for name, _e in ranked][:top_n]
 
     return findings, {"services": services}
 

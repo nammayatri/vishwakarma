@@ -596,6 +596,22 @@ def _destination_configured(config, labels: dict) -> bool:
 
 # ── Alert dispatch (shared by every alert-source webhook) ──────────────────────
 
+def _alert_channel_allowed(config, issue) -> tuple[bool, str]:
+    """AlertManager's catch-all 'argus' route forwards EVERY critical/warning
+    alert (see the live alertmanager.yaml: severity critical|warning → argus,
+    regardless of which vm-rule channel it belongs to). Gate on the vm rule's
+    routing label (default `alert`, e.g. ny-system-alerts/ny-sev2-alerts/
+    ny-pt-alerts): only allow-listed channels trigger an investigation.
+
+    Applies only to source="alertmanager" issues — other sources (gcp_cloud_
+    monitoring, Slack/xyne mentions) have no such routing label and are never
+    filtered. An empty allow list disables the filter entirely."""
+    allow = config.alert_filter_allow
+    if not allow or issue.source != "alertmanager":
+        return True, ""
+    routed_to = (issue.labels or {}).get(config.alert_filter_label, "")
+    return routed_to in allow, routed_to
+
 async def _trigger_investigations_for_issues(config, issues: list) -> list[dict]:
     """
     Per-issue dispatch shared by /api/alertmanager and
@@ -610,6 +626,15 @@ async def _trigger_investigations_for_issues(config, issues: list) -> list[dict]
 
     triggered = []
     for issue in issues:
+        allowed, routed_to = _alert_channel_allowed(config, issue)
+        if not allowed:
+            log.info(f"Skipping '{issue.title}' — routed to "
+                     f"{routed_to or '(no routing label)'}; only "
+                     f"{config.alert_filter_allow} trigger an investigation")
+            triggered.append({"title": issue.title, "status": "skipped-channel-filter",
+                              "channel": routed_to})
+            continue
+
         fingerprint = alert_fingerprint(issue.labels)
 
         # Per-cloud hard filter: when this pod has its own cloud set (CLOUD=gcp

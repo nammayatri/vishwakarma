@@ -394,6 +394,20 @@ class VishwakarmaConfig:
             _env("VK_DEDUP_WINDOW", str(raw.get("dedup_window", 300)))
         )
 
+        # Alert channel allowlist — AlertManager's catch-all 'argus' receiver
+        # forwards EVERY critical/warning alert (all vm-rule routes: system,
+        # sev2, pt, data, ...). Only alerts whose routing label value is in
+        # this allowlist trigger an investigation; the rest still reach their
+        # own Slack channels via their normal receivers. Applies only to
+        # source="alertmanager" issues — GCP Cloud Monitoring / Slack mentions
+        # are unaffected. Empty allow list = no filtering.
+        # e.g. alert_filter: {allow: [ny-system-alerts, ny-sev2-alerts], label: alert}
+        af = raw.get("alert_filter", {})
+        self.alert_filter_allow: list[str] = (
+            _split_keys(_env("VK_ALERT_FILTER_ALLOW", "")) or af.get("allow") or []
+        )
+        self.alert_filter_label: str = str(_env("VK_ALERT_FILTER_LABEL", af.get("label", "alert")))
+
         # Cost report scheduler
         cost_cfg = raw.get("cost_report", {})
         self.cost_report = {

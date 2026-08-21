@@ -28,6 +28,17 @@ server:
 storage:
   db_path: /data/vishwakarma.db     # SQLite — incident history (on PVC)
 
+# ── Alert Channel Filter ──────────────────────────────────────────────────────
+# AlertManager's catch-all 'argus' route forwards EVERY critical/warning alert
+# to /api/alertmanager (all vm-rule channels: system, sev2, pt, data, ...).
+# Only investigate alerts whose routing label is in this allowlist — the rest
+# still page their own Slack channels via their normal receivers, but no RCA
+# runs for them. Applies only to AlertManager-sourced alerts; GCP Cloud
+# Monitoring / Slack mentions are unaffected. Empty allow = no filtering.
+alert_filter:
+  allow: [ny-system-alerts, ny-sev2-alerts]   # vm rule `alert` label values
+  # label: alert                              # routing label name (default: alert)
+
 # ── Fast Triage ───────────────────────────────────────────────────────────────
 # fast_triage:
 #   business_impact_cities:      # merchantOperatingCityId -> display name
