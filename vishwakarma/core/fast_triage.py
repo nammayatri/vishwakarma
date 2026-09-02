@@ -7,13 +7,18 @@ Prometheus/VictoriaMetrics backend the `prometheus` toolset already talks to:
 
   - Business Impact    — "Release Monitoring": rides/searches/ratio for every city, tagged
                          dropping/rising/steady vs the previous 15m — always runs, independent of routing
-  - Istio mesh         — "Istio Mesh Dashboard": severity-ranked per-service 5xx/4xx/0DC codes —
-                         baselines analysed behind the scenes, only the sorted service names posted
+  - Istio mesh         — "Istio Mesh Dashboard": ELEVATED-only per-service 5xx/4xx/0DC codes —
+                         baseline-normal services stay out of the Slack post entirely
   - Release Monitoring — "Release Monitoring": failing route + app error codes
-  - DB/Redis           — "KV Metrics": SQL errors, Redis call-limit breaches, P99 latency
+  - DB/Redis           — "KV Metrics": SQL errors, P99 handler latency
   - Pod CPU/Mem        — "Pods / CPU New": CPU/mem %, throttling, restarts
   - Scheduler          — "Beckn - Scheduler Dashboard": job throughput/pickup delay
   - Drainer            — "Beckn Drainer Metrics": drainer stop-status/lag/pod-count/errors
+  - Logs & Infra       — checks pod health (CrashLoopBackOff / restarts) then stern's the
+                         mesh-ELEVATED service(s) directly (bypasses the LLM loop) and
+                         classifies the infra failure mode from log text (Redis timeout,
+                         no healthy upstream, OOM, connection refused, request timeout,
+                         ...) — diagnostic only, no prescribed fix
 
 Which stage(s) run, and in what order, is chosen per-alert by `_route_for_alert`
 (alert-name pattern -> ordered stage list) — not every alert benefits from
@@ -40,6 +45,7 @@ Fails open at both the per-stage level (one bad stage doesn't kill the rest)
 and the whole-pipeline level (a hard total time budget, after which whatever
 already posted stands and the rest is silently skipped).
 """
+import json
 import logging
 import re
 from concurrent.futures import ThreadPoolExecutor
@@ -222,7 +228,7 @@ def _stage_business_impact(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
             prev_ratio = prev_rides / prev_searches * 100
             ratio_str += f" (prev 15m: {prev_ratio:.1f}% — {_trend_tag(ratio, prev_ratio)})"
         lines.append(f"{label} (15m): {int(rides)} rides / {int(searches)} searches — ratio {ratio_str}")
-    findings = "\n".join(lines) if lines else "No ride/search data found for any city."
+    findings = "\n".join(lines) if lines else ""
     return findings, {}
 
 
@@ -236,13 +242,14 @@ def _stage_istio(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
     "0DC" category, separate from literal HTTP 5xx, so the on-call isn't left
     guessing which failure mode dominates behind a generic "5xx" label.
 
-    Every series is still analysed against its own 1h-ago baseline
+    Every series is analysed against its own 1h-ago baseline
     (_query_promql_with_baseline) — that's what separates a genuine new spike
-    from a chatty client's routine 429 noise — but the Slack post carries ONLY
-    the issue -> service mapping: one line per category (5xx, 0DC, 4xx) listing
-    every affected service with its failing codes, severity-ordered (elevated
-    vs baseline first, then volume). Counts and baseline arithmetic stay out
-    of the thread; every issue type and every affected service still shows."""
+    from a chatty client's routine 429 noise. The Slack post is ELEVATED-only:
+    one line per (service, category) that's actually above its own baseline —
+    `svc — 0DC [0/DC]` — not every service present in the traffic mix. A
+    service sitting at its usual 429 rate doesn't get a line just for being
+    in the top-N; the full ranked mix (elevated or not) still flows into ctx
+    for downstream stages that need it (Release Monitoring, Pod CPU/Mem)."""
     common = 'destination_service_name!="istio-telemetry", reporter="destination"'
     known_service = ctx.get("known_service", "")
 
@@ -268,12 +275,16 @@ def _stage_istio(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
     top_4xx_rows = _query_promql_with_baseline(prom, promql_4xx, top_n)
     top_0dc_rows = _query_promql_with_baseline(prom, promql_0dc, top_n)
 
-    def _category_line(rows: list[tuple[dict, float, float]], category: str,
-                       code_fn: Callable[[dict], str]) -> tuple[str, list[str]] | None:
-        """One line: `5xx: svc-a [HTTP 500] (ELEVATED), svc-b [HTTP 503]`.
-        Services ranked inside the category: any baseline-elevated series
-        first (worst jump wins), then raw volume. Also returns the ranked
-        service names so downstream stages can inherit the ordering."""
+    def _category_rank(rows: list[tuple[dict, float, float]], category: str,
+                        code_fn: Callable[[dict], str]) -> tuple[list[str], list[str], list[str]] | None:
+        """Ranks services within one category (5xx/0DC/4xx): any
+        baseline-elevated series first (worst jump wins), then raw volume.
+        Returns (all ranked names, elevated-only names, one Slack line per
+        ELEVATED service — `svc — CATEGORY [codes]`). Baseline-normal
+        services still count toward `names` (other stages use the full mix
+        to decide what to query), but never get their own Slack line — a
+        service just sitting in the traffic mix at its usual rate isn't
+        something on-call needs to be told about."""
         per_svc: dict[str, dict] = {}
         for labels, val, base in rows:
             name = labels.get("destination_service_name")
@@ -293,29 +304,35 @@ def _stage_istio(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
             key=lambda kv: (kv[1]["max_elev"] > 1.0, kv[1]["max_elev"], kv[1]["volume"]),
             reverse=True,
         )
-        parts = [
-            f"{name} [{', '.join(e['codes'])}]" + (" (ELEVATED)" if e["max_elev"] > 1.0 else "")
-            for name, e in ranked
-        ]
-        return f"{category}: " + ", ".join(parts), [name for name, _e in ranked]
+        names = [name for name, _e in ranked]
+        elevated = [name for name, e in ranked if e["max_elev"] > 1.0]
+        elevated_lines = [f"{name} — {category} [{', '.join(per_svc[name]['codes'])}]" for name in elevated]
+        return names, elevated, elevated_lines
 
     rendered = [
-        _category_line(top_5xx_rows, "5xx", lambda l: f"HTTP {l.get('response_code', '?')}"),
-        _category_line(top_0dc_rows, "0DC", lambda l: f"0/{l.get('response_flags') or '-'}"),
-        _category_line(top_4xx_rows, "4xx", lambda l: f"HTTP {l.get('response_code', '?')}"),
+        _category_rank(top_5xx_rows, "5xx", lambda l: f"HTTP {l.get('response_code', '?')}"),
+        _category_rank(top_0dc_rows, "0DC", lambda l: f"0/{l.get('response_flags') or '-'}"),
+        _category_rank(top_4xx_rows, "4xx", lambda l: f"HTTP {l.get('response_code', '?')}"),
     ]
-    lines = [line for line, _names in (r for r in rendered if r)]
-    findings = "\n".join(lines) if lines else "No 5xx/4xx/0DC traffic found."
+    lines = [ln for r in rendered if r for ln in r[2]]
+    findings = "\n".join(lines) if lines else ""
 
     if known_service:
         services = [known_service]
+        elevated_services = [known_service]
     else:
         services: list[str] = []
-        for _line, names in (r for r in rendered if r):
+        elevated_services: list[str] = []
+        for r in rendered:
+            if r is None:
+                continue
+            names, elev, _lines = r
             services += [n for n in names if n not in services]
+            elevated_services += [n for n in elev if n not in elevated_services]
         services = services[:top_n]
+        elevated_services = elevated_services[:top_n]
 
-    return findings, {"services": services}
+    return findings, {"services": services, "elevated_services": elevated_services}
 
 
 # ── Stage 2 — Release Monitoring ────────────────────────────────────────────
@@ -348,7 +365,7 @@ def _stage_release_monitoring(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
     if not services:
         if lines:
             return "\n".join(lines), {}
-        return "No service identified from the mesh check — skipped.", {}
+        return "", {}
     svc_match = "|".join(re.escape(s) for s in services)
 
     rows_5xx = _query(prom, (
@@ -381,8 +398,17 @@ def _stage_release_monitoring(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
         lines.append("App error codes: " + ", ".join(
             f"{labels.get('ErrorCode', '?')} ({int(v)}x)" for labels, v in top_err
         ))
-    findings = "\n".join(lines) if lines else "No route-level errors found for the affected service(s)."
-    return findings, {}
+    findings = "\n".join(lines) if lines else ""
+
+    # Failing route/API names (ranked, deduped) — handed to Logs & Infra so
+    # it can grep stern output for the specific API's failure lines instead
+    # of just a generic service-wide error scan.
+    routes: list[str] = []
+    for labels, _v in (top_5xx + top_other):
+        handler = labels.get("handler")
+        if handler and handler != "?" and handler not in routes:
+            routes.append(handler)
+    return findings, {"routes": routes[:top_n]}
 
 
 # ── Stage 3 — DB/Redis choking ──────────────────────────────────────────────
@@ -390,11 +416,19 @@ def _stage_release_monitoring(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
 def _stage_db_redis(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
     """Real panels from the 'KV Metrics' dashboard (Prometheus-native app-level
     KVConnector instrumentation) — shared infra, not scoped to a specific
-    service: SQL error rate, Redis soft/hard call-limit breaches (literal
-    choking), P99 handler latency, all ranked by worst DB table."""
-    sql_err = _topk_rows(_query(prom, f'sum by (model) (increase(kv_sql_error_counter[5m]))'), top_n)
-    hard_limit = _topk_rows(_query(prom, f'sum by (model) (increase(kvRedis_hard_db_limit_exceeded[5m]))'), top_n)
-    soft_limit = _topk_rows(_query(prom, f'sum by (model) (increase(kvRedis_soft_db_limit_exceeded[5m]))'), top_n)
+    service: SQL error rate + P99 handler latency, ranked by worst DB table.
+
+    Deliberately does NOT report `kvRedis_{soft,hard}_db_limit_exceeded`
+    ("Redis limit breaches") — verified against the real source
+    (euler-hs/src/EulerHS/KVConnector/{Flow,Utils}.hs) that this is a
+    query-shape/scaling smell (a KVConnector find fanned out into >2500/5000
+    individual Redis calls for one query), not an outage/timeout signal, and
+    not actionable for on-call triage — confirmed with the user, drop it."""
+    # A `model` label exists in these count metrics as soon as it's EVER had
+    # a data point — most rows in any topk are legitimately 0x (nothing
+    # breached for that table). Drop them; only tables that actually
+    # errored in the last 5m are worth a line.
+    sql_err = [r for r in _topk_rows(_query(prom, f'sum by (model) (increase(kv_sql_error_counter[5m]))'), top_n) if r[1] > 0]
     p99 = _topk_rows(_query(prom, (
         'sort_desc(histogram_quantile(0.99, sum by (model, le) (rate(kv_handler_latency_bucket[5m]))))'
     )), top_n)
@@ -402,13 +436,9 @@ def _stage_db_redis(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
     lines = []
     if sql_err:
         lines.append("SQL errors by table: " + ", ".join(f"{l.get('model', '?')} ({int(v)}x)" for l, v in sql_err))
-    if hard_limit:
-        lines.append("Redis HARD limit breaches: " + ", ".join(f"{l.get('model', '?')} ({int(v)}x)" for l, v in hard_limit))
-    if soft_limit:
-        lines.append("Redis soft limit breaches: " + ", ".join(f"{l.get('model', '?')} ({int(v)}x)" for l, v in soft_limit))
     if p99:
         lines.append("Worst P99 handler latency: " + ", ".join(f"{l.get('model', '?')} ({v:.2f}s)" for l, v in p99))
-    findings = "\n".join(lines) if lines else "No DB/Redis error or latency pressure detected."
+    findings = "\n".join(lines) if lines else ""
     return findings, {}
 
 
@@ -423,7 +453,7 @@ def _stage_pod_resources(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
     aggregate ratio."""
     services = ctx.get("services") or []
     if not services:
-        return "No service identified from the mesh check — skipped.", {}
+        return "", {}
     svc_match = "|".join(re.escape(s) for s in services)
     namespace = ctx.get("namespace")
     ns_clause = f', namespace="{namespace}"' if namespace else ""
@@ -457,7 +487,7 @@ def _stage_pod_resources(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
         lines.append("CPU throttled %: " + ", ".join(f"{l.get('pod', '?')} ({v:.0f}%)" for l, v in throttled))
     if restarts:
         lines.append("Restarts (15m): " + ", ".join(f"{l.get('pod', '?')} ({int(v)}x)" for l, v in restarts))
-    findings = "\n".join(lines) if lines else "No CPU/mem/restart pressure detected."
+    findings = "\n".join(lines) if lines else ""
     return findings, {}
 
 
@@ -502,7 +532,7 @@ def _stage_scheduler(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
         lines.append("Job pickup delay p99: " + ", ".join(
             f"{l.get('job', '?')} ({v:.2f}s)" for l, v in pickup_delay
         ))
-    findings = "\n".join(lines) if lines else "No scheduler pipeline data found."
+    findings = "\n".join(lines) if lines else ""
     return findings, {}
 
 
@@ -566,7 +596,7 @@ def _stage_drainer(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
         lines.append("Rider query execution failures: " + ", ".join(
             f"{l.get('model', '?')}/{l.get('action', '?')} ({int(v)}x)" for l, v in rider_fail
         ))
-    findings = "\n".join(lines) if lines else "No drainer status/lag/error data found."
+    findings = "\n".join(lines) if lines else ""
     return findings, {}
 
 
@@ -674,6 +704,283 @@ def _stage_gcp_lb_5xx(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
     return findings, {}
 
 
+_INFRA_SIGNATURES: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"redis[^\n]{0,120}(timeout|timed out|connection refused|connection reset|econnreset|"
+                r"max retries|limit breach|connection (is )?closed)", re.I),
+     "Redis connection/limit issue — pod can't reliably reach Redis/Memorystore"),
+    (re.compile(r"(too many connections|connection pool exhausted|remaining connection slots are reserved)", re.I),
+     "DB connection pool exhausted"),
+    (re.compile(r"(oomkilled|out of memory|cannot allocate memory)", re.I),
+     "OOM — pod killed / allocation failed for exceeding memory limit"),
+    (re.compile(r"(no healthy upstream|upstream connect error|connection reset by peer|ucupstream)", re.I),
+     "No healthy upstream — destination pod(s) not ready / crashlooping"),
+    (re.compile(r"(context deadline exceeded|i/o timeout|dial tcp[^\n]{0,40}timeout|request timeout)", re.I),
+     "Request timeout calling a downstream dependency"),
+    (re.compile(r"connection refused", re.I),
+     "Connection refused — dependency unreachable / not accepting connections"),
+    (re.compile(r"(panic:|nullpointerexception|unhandled exception|fatal error)", re.I),
+     "Application panic / unhandled exception"),
+]
+
+
+def _find_infra_match(lines: list[str]) -> tuple[str, str, "re.Pattern"] | None:
+    """Scans from the most recent line backwards; the first line matching a
+    known signature wins — label, line and pattern all come from that SAME
+    line, so what's reported as evidence is always what actually justified
+    the label (not just "the last line", which could be unrelated noise)."""
+    for ln in reversed(lines):
+        for pattern, label in _INFRA_SIGNATURES:
+            if pattern.search(ln):
+                return label, ln, pattern
+    return None
+
+
+def _find_route_match(lines: list[str], route_terms: list[str]) -> str | None:
+    for ln in reversed(lines):
+        if any(re.search(rt, ln, re.I) for rt in route_terms):
+            return ln
+    return None
+
+
+def _snippet(line: str, pattern: "re.Pattern | None" = None, width: int = 160) -> str:
+    """A window of `line` around whatever `pattern` actually matched, not
+    just the first `width` chars — a structured JSON log line's interesting
+    part is rarely at the start, and a start-anchored slice tends to just
+    show field boilerplate (hostname/pid/...) with the real evidence cut off."""
+    m = pattern.search(line) if pattern else None
+    if not m:
+        return line[:width] + ("…" if len(line) > width else "")
+    start = max(0, m.start() - 40)
+    end = min(len(line), start + width)
+    return ("…" if start > 0 else "") + line[start:end] + ("…" if end < len(line) else "")
+
+
+def _log_targets(ctx: dict) -> list[tuple[str, str | None]]:
+    """(service, namespace) pairs to stern, in priority order:
+    1. the alert's own `service`/`job` label — explicit, always relevant
+    2. services the Istio-mesh stage flagged as ELEVATED (not just present
+       in the traffic mix — a service ranked #3 in a "5xx: a, b, c" line
+       with no (ELEVATED) tag is baseline-normal noise, not something to
+       stern)
+    3. the configured `service_hints` fallback (fast_triage.service_hints in
+       config.yaml), but ONLY when the mesh stage found no traffic at all to
+       judge (empty `services`) — if it found traffic and none of it was
+       elevated, that's a real "nothing abnormal here" signal, not a gap to
+       fill with a guess."""
+    namespace = ctx.get("namespace")
+    if ctx.get("known_service"):
+        return [(ctx["known_service"], namespace)]
+    if ctx.get("elevated_services"):
+        return [(s, namespace) for s in ctx["elevated_services"][:3]]
+    if ctx.get("services"):
+        return []  # mesh checked — nothing was actually elevated
+    hints = ctx.get("service_hints") or []
+    return [(h.get("service", ""), h.get("namespace") or namespace) for h in hints[:3] if h.get("service")]
+
+
+def _pod_health_lines(prom, targets: list[tuple[str, str | None]], top_n: int) -> list[str]:
+    """Recent container restarts + last termination reason for the pods
+    behind `targets` — kube-state-metrics, two cheap Prometheus queries, no
+    log parsing required. Tells "the pod itself is unhealthy" apart from
+    "the pod is fine but a dependency is slow/erroring", which the
+    log-signature scan below can't distinguish on its own.
+
+    NOT literally `kube_pod_container_status_waiting_reason{reason=
+    "CrashLoopBackOff"}` — confirmed live against this deployment's own
+    VictoriaMetrics (2026-09-03) that its kube-state-metrics build doesn't
+    expose that metric at all (zero series; only container_info,
+    resource_limits/requests, status_restarts_total and
+    status_terminated_reason exist here). `terminated_reason` (Error/
+    OOMKilled/ContainerStatusUnknown) paired with a live restart count is
+    the closest available proxy for the same on-call question ("is this pod
+    actually crashing") on THIS cluster — verify against your own
+    `{__name__=~"kube_pod.*"}` label values before assuming otherwise."""
+    svc_names = [_sanitize(s) for s, _ns in targets if s]
+    svc_names = [s for s in svc_names if s]
+    if not svc_names:
+        return []
+    svc_match = "|".join(re.escape(s) for s in svc_names)
+    namespace = next((ns for _s, ns in targets if ns), None)
+    ns_clause = f', namespace="{_sanitize(namespace)}"' if namespace else ""
+
+    terminated = _query(prom, (
+        f'kube_pod_container_status_terminated_reason{{reason=~"Error|OOMKilled|ContainerStatusUnknown", '
+        f'pod=~"({svc_match}).*"{ns_clause}}} == 1'
+    ))
+    restarts = _topk_rows(_query(prom, (
+        f'topk({top_n}, sum by (pod) (increase(kube_pod_container_status_restarts_total{{'
+        f'pod=~"({svc_match}).*"{ns_clause}}}[15m])))'
+    )), top_n)
+
+    reason_by_pod: dict[str, str] = {}
+    for labels, _v in terminated:
+        pod = labels.get("pod", "?")
+        reason_by_pod.setdefault(pod, labels.get("reason", "?"))
+
+    lines = []
+    reported: set[str] = set()
+    for labels, v in restarts:
+        if v <= 0:
+            continue
+        pod = labels.get("pod", "?")
+        reported.add(pod)
+        line = f"{pod}: {int(v)} container restart(s) in last 15m"
+        reason = reason_by_pod.get(pod)
+        if reason:
+            line += f" (last termination: {reason})"
+        lines.append(line)
+    for pod, reason in reason_by_pod.items():
+        if pod in reported:
+            continue
+        lines.append(f"{pod}: last termination: {reason}")
+    return lines
+
+
+_ES_LOGS_INDEX = "beckn-logs-*"
+
+
+def _es_top_errors(es_tool, svc: str, size: int = 3, since: str = "now-10m") -> list[str]:
+    """Volume-ranked error categories for `svc` from the beckn-logs-*
+    Elasticsearch index (fluentd-shipped app logs) — confirmed live against
+    this deployment's real schema: Rust/bunyan-format services (their
+    `hostname` field IS the pod name) log a `response_code`/`tag` pair per
+    error (e.g. tag "[INCOMING API - ERROR]", response_code
+    "INVALID_REQUEST") — this ranks those by doc_count so on-call sees which
+    error DOMINATES ("INVALID_REQUEST (16666x), UNSERVICEABLE (4637x)"), not
+    just one sampled line. Haskell-format services embed their error text in
+    free-form `log_message` instead of a clean field, so this naturally
+    returns nothing for them — not a gap: their app-level error codes are
+    already ranked by the Release Monitoring stage's `error_counter` metric.
+    Fails open (returns []) on any ES error/timeout/shape surprise."""
+    query = {
+        "bool": {
+            "filter": [
+                {"range": {"@timestamp": {"gte": since}}},
+                {"wildcard": {"hostname.keyword": f"{svc}*"}},
+                {"bool": {"should": [
+                    {"range": {"level": {"gte": 50}}},
+                    {"wildcard": {"tag.keyword": "*ERROR*"}},
+                ], "minimum_should_match": 1}},
+            ]
+        }
+    }
+    aggs = {"top_response_code": {"terms": {"field": "response_code.keyword", "size": size}}}
+    try:
+        out = es_tool.execute("elasticsearch_aggregate", {
+            "index": _ES_LOGS_INDEX, "query": query, "aggs": aggs, "size": 0,
+        })
+    except Exception as e:
+        log.debug(f"ES top-error query failed for {svc}: {e}")
+        return []
+    from vishwakarma.core.models import ToolStatus
+    if out.status != ToolStatus.SUCCESS or not out.output:
+        return []
+    try:
+        agg_results = json.loads(out.output)
+    except Exception:
+        return []
+    buckets = agg_results.get("top_response_code", {}).get("buckets", [])
+    return [f"{b['key']} ({b['doc_count']}x)" for b in buckets if b.get("key") and b.get("doc_count")]
+
+
+def _stage_logs_infra(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
+    """Real log dig — NOT routed through the LLM/agentic loop, so it lands
+    inside the same few-second quick-triage window as the metric stages
+    instead of waiting on the (up to 40-step, minutes-long) deep
+    investigation. For `_log_targets` (known_service -> mesh-ELEVATED
+    services only -> configured service_hints fallback): first checks pod
+    health directly (CrashLoopBackOff / recent restarts, via Prometheus —
+    always runs, no toolset dependency), then runs `stern` via the bash
+    toolset with a grep pattern built from the known infra-failure
+    signatures plus any failing route/API names `_stage_release_monitoring`
+    already ranked — so what comes back is already narrowed to
+    plausibly-relevant lines instead of a generic "error|timeout|..."
+    bag-of-words that matches half of any structured JSON log stream. Only
+    posts a line when it actually resolves to a pod-health issue, a
+    classified infra condition, or a route/API-specific hit — unclassifiable
+    noise (or no elevated service at all) contributes nothing rather than a
+    wall of raw JSON. Caps at 3 services and a short stern window to stay
+    well inside budget."""
+    targets = _log_targets(ctx)
+    if not targets:
+        if ctx.get("services") and not ctx.get("elevated_services"):
+            return "", {}
+        return "", {}
+
+    lines = _pod_health_lines(prom, targets, top_n)
+
+    es_tool = ctx.get("_es")
+    if es_tool is not None:
+        for raw_svc, _ns in targets:
+            svc = _sanitize(raw_svc)
+            if not svc:
+                continue
+            top_errors = _es_top_errors(es_tool, svc)
+            if top_errors:
+                lines.append(f"{svc}: top errors (ES, last 10m) — " + ", ".join(top_errors))
+
+    bash_tool = ctx.get("_bash")
+    if bash_tool is None:
+        findings = "\n".join(lines) if lines else ""
+        return findings, {}
+
+    # Route/handler label values reach here from Prometheus, not from a
+    # fixed set of choices — they get embedded inside a single-quoted shell
+    # argument below, so anything that could break out of that quoting
+    # (', `, $, \, newline) is dropped rather than escaped. re.escape()
+    # neutralizes regex metacharacters but NOT shell quoting, so this check
+    # has to happen before the pattern is built, not be assumed away by it.
+    routes = ctx.get("routes") or []
+    _unsafe_in_shell_quotes = re.compile(r"['`$\\\n]")
+    route_terms = [
+        re.escape(r) for r in routes
+        if r and r != "?" and not _unsafe_in_shell_quotes.search(r)
+    ]
+    sig_terms = [p.pattern for p, _ in _INFRA_SIGNATURES]
+    grep_pattern = "|".join(f"({t})" for t in sig_terms + route_terms)
+
+    from vishwakarma.core.models import ToolStatus
+
+    for raw_svc, raw_ns in targets:
+        svc = _sanitize(raw_svc)
+        if not svc:
+            continue
+        ns = _sanitize(raw_ns) if raw_ns else ""
+        ns_flag = f"-n {ns}" if ns else "-A"
+        cmd = (
+            f"stern '{svc}' {ns_flag} --since=10m --no-follow "
+            f"--template '{{{{.Message}}}}{{{{\"\\n\"}}}}' 2>/dev/null "
+            f"| grep -iE '{grep_pattern}' | tail -50"
+        )
+        try:
+            out = bash_tool.execute("bash", {"command": cmd})
+        except Exception as e:
+            log.debug(f"Log dig failed for {svc}: {e}")
+            continue
+        if out.status != ToolStatus.SUCCESS:
+            continue
+        text = (out.output or "").strip()
+        if not text:
+            continue
+        matched = text.splitlines()
+
+        infra_hit = _find_infra_match(matched)
+        if infra_hit:
+            label, ln, pattern = infra_hit
+            lines.append(f"{svc}: {label} — e.g. \"{_snippet(ln, pattern)}\"")
+            continue
+        if route_terms:
+            route_ln = _find_route_match(matched, route_terms)
+            if route_ln:
+                lines.append(f"{svc}: API failure — e.g. \"{_snippet(route_ln)}\"")
+                continue
+        # Matched the retrieval grep (so there WAS something error-shaped)
+        # but nothing classified — deliberately not reported; a raw
+        # unclassified dump is exactly the noise this stage should avoid.
+    findings = "\n".join(lines) if lines else ""
+    return findings, {}
+
+
 def _stage_gcp_redis(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
     """Real panels from 'GCP Memorystore for Valkey': CPU/Memory maximum
     utilization (memorystore.googleapis.com/instance/{cpu,memory}/
@@ -705,7 +1012,7 @@ def _stage_gcp_redis(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
         lines.append("Memory util (max): " + _fmt(mem, lambda v: f"{v * 100:.0f}%"))
     if net_out:
         lines.append("Network out: " + _fmt(net_out, lambda v: f"{v / 1e6:.2f} MB/s"))
-    findings = "\n".join(lines) if lines else "No Redis/Memorystore instance metrics found."
+    findings = "\n".join(lines) if lines else ""
     return findings, {}
 
 
@@ -734,7 +1041,7 @@ def _stage_gcp_alloydb(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
         if rows:
             worst = max(v for _l, v in rows)
             lines.append(f"{instance_id}: {worst * 100:.0f}% (worst node)")
-    findings = "\n".join(lines) if lines else "No AlloyDB node CPU metrics found."
+    findings = "\n".join(lines) if lines else ""
     return findings, {}
 
 
@@ -759,7 +1066,7 @@ def _stage_clickhouse(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
         lines.append("Memory resident: " + ", ".join(f"{l.get('instance', '?')} ({v / 1e9:.2f} GB)" for l, v in mem))
     if failed:
         lines.append("Failed query rate: " + ", ".join(f"{l.get('instance', '?')} ({v:.2f}/s)" for l, v in failed))
-    findings = "\n".join(lines) if lines else "No ClickHouse disk/memory/query data found."
+    findings = "\n".join(lines) if lines else ""
     return findings, {}
 
 
@@ -792,40 +1099,22 @@ _STAGE_FNS: dict[str, Callable] = {
     "GCP LB 5xx": _stage_gcp_lb_5xx,
     "GCP Redis": _stage_gcp_redis,
     "GCP AlloyDB": _stage_gcp_alloydb,
+    "Logs & Infra": _stage_logs_infra,
 }
 
-_DEFAULT_ROUTE: list[str] = ["Istio mesh", "Release Monitoring", "DB/Redis", "Pod CPU/Mem"]
+_DEFAULT_ROUTE: list[str] = ["Istio mesh", "Release Monitoring", "DB/Redis", "Pod CPU/Mem", "Logs & Infra"]
 
-# Ordered (pattern, stage-list) pairs, checked top to bottom — first match
-# wins. Matched against the alert's own title text, case-insensitively.
-# Derived from the real VictoriaMetrics alert rules (beckn-alerts + node-exporter
-# groups) and confirmed live against each dashboard's actual panel queries.
 _ALERT_ROUTES: list[tuple[re.Pattern, list[str]]] = [
-    # Scheduler dashboard owns the driver-offer-allocator job pipeline —
-    # Istio 5xx/4xx traffic is irrelevant to a stalled job executor.
     (re.compile(r"DriverAllocatorLooksDead", re.I), ["Scheduler"]),
-    # All 8 drainer-family alerts (driver + rider/customer variants) map to
-    # the one Drainer Metrics dashboard, not the generic service dashboards.
     (re.compile(r"(NoDriverDrainerRunning|NoRiderDrainerRunning|NoDriverDrainerPodRunning|"
                 r"NoCustomerDrainerPodRunning|DriverDrainerLagIncreasing|CustomerDrainerLagIncreasing|"
                 r"CustomerDrainerNotProcessing|DriverDrainerNotProcessing)", re.I), ["Drainer"]),
-    # Ride/search ratio + low-city-rides alerts are traffic-shape symptoms —
-    # check the mesh for what's actually erroring first, then the app-level
-    # route/error-code detail (confirmed order with the user).
-    (re.compile(r"(RideToSearchRatioDown|LowCityRides)", re.I), ["Istio mesh", "Release Monitoring"]),
-    # node-exporter alerts are host/OS-level (disk, network iface, conntrack,
-    # clock, RAID, fd limits) — none of the 4 app dashboards apply, and
-    # running them would just add noise ahead of the deep investigation.
+    (re.compile(r"(RideToSearchRatioDown|LowCityRides)", re.I), ["Istio mesh", "Release Monitoring", "Logs & Infra"]),
     (re.compile(r"^Node[A-Z]", re.I), []),
-    # GCP-native Cloud Monitoring alert policies (ny-prod project) — a
-    # different layer entirely from the VictoriaMetrics beckn-alerts above.
-    (re.compile(r"GCP ELB 5xx Alert", re.I), ["GCP LB 5xx"]),
-    (re.compile(r"Redis\s*High\s*(Network Out|Memory|CPU)", re.I), ["GCP Redis"]),
-    (re.compile(r"Alloy\s?DB.*CPU", re.I), ["GCP AlloyDB"]),
+    (re.compile(r"GCP ELB 5xx Alert", re.I), ["Istio mesh", "GCP LB 5xx", "Logs & Infra"]),
+    (re.compile(r"Redis\s*High\s*(Network Out|Memory|CPU)", re.I), ["GCP Redis", "Logs & Infra"]),
+    (re.compile(r"Alloy\s?DB.*CPU", re.I), ["GCP AlloyDB", "Logs & Infra"]),
     (re.compile(r"Clickhouse disk usage", re.I), ["ClickHouse"]),
-    # VM Instance (tummoc-db-v2) CPU/Mem/Disk — no matching dashboard found
-    # yet (searched Grafana for vm instance/compute engine/tummoc/mtc) —
-    # skip rather than invent queries with nothing to verify them against.
     (re.compile(r"VM Instance.*tummoc-db-v2", re.I), []),
 ]
 
@@ -847,13 +1136,35 @@ def _run_stage(name: str, fn: Callable, prom, ctx: dict, top_n: int,
         on_stage_ready(name, text)
         return text
     ctx.update(ctx_update)
+    if not (findings or "").strip():
+        # Genuinely nothing to report (every "no X found"/"skipped" case is
+        # `""`, by convention, across every stage function) — stay silent
+        # rather than post a "(no data)" placeholder message. Also excluded
+        # from the joined evidence text fed to the deep investigation: a
+        # "nothing here" line isn't worth the tokens there either.
+        return ""
     text = _format_stage_findings(name, findings)
     on_stage_ready(name, text)
     return text
 
 
-def _run_triage_stages(prom, grafana, llm, issue, on_stage_ready: Callable[[str, str], None],
-                        top_n: int, namespace_exclude: str, business_impact_cities: dict[str, str]) -> str:
+def _resolve_service_hints(title: str, service_hints: dict[str, list[dict]]) -> list[dict]:
+    """First alert-title regex match wins, same style as `_route_for_alert`
+    — lets on-call encode "if it's X, go check Y" (fast_triage.service_hints
+    in config.yaml) as the Logs & Infra stage's last-resort fallback when
+    live discovery finds no service at all."""
+    for pattern, hints in service_hints.items():
+        try:
+            if re.search(pattern, title or "", re.I):
+                return hints
+        except re.error:
+            log.warning(f"Invalid service_hints regex, skipping: {pattern!r}")
+    return []
+
+
+def _run_triage_stages(prom, grafana, bash_tool, es_tool, llm, issue, on_stage_ready: Callable[[str, str], None],
+                        top_n: int, namespace_exclude: str, business_impact_cities: dict[str, str],
+                        service_hints: dict[str, list[dict]]) -> str:
     labels = issue.labels or {}
     ctx = {
         "known_service": _sanitize(labels.get("service") or labels.get("job") or ""),
@@ -861,9 +1172,12 @@ def _run_triage_stages(prom, grafana, llm, issue, on_stage_ready: Callable[[str,
         "namespace_exclude": namespace_exclude,
         "services": [],
         "_grafana": grafana,
+        "_bash": bash_tool,
+        "_es": es_tool,
         "url_map_name": _sanitize(labels.get("url_map_name") or "") or None,
         "merchant_operating_city_id": _sanitize(labels.get("merchantOperatingCityId") or "") or None,
         "business_impact_cities": business_impact_cities,
+        "service_hints": _resolve_service_hints(issue.title, service_hints or {}),
     }
     # Business Impact always runs first, ahead of the alert-specific route —
     # it's independent of which category (Istio/DB-Redis/GCP-Redis/AlloyDB/
@@ -873,7 +1187,7 @@ def _run_triage_stages(prom, grafana, llm, issue, on_stage_ready: Callable[[str,
         _run_stage(name, _STAGE_FNS[name], prom, ctx, top_n, llm, issue.title, on_stage_ready)
         for name in all_stages
     ]
-    return "\n\n".join(summaries)
+    return "\n\n".join(s for s in summaries if s)
 
 
 def run_fast_triage_staged(
@@ -885,6 +1199,7 @@ def run_fast_triage_staged(
     top_n: int = 5,
     namespace_exclude: str = "app-monitor",
     business_impact_cities: dict[str, str] | None = None,
+    service_hints: dict[str, list[dict]] | None = None,
 ) -> str:
     """
     Runs whichever stages `_route_for_alert(issue.title)` picks for this
@@ -909,6 +1224,13 @@ def run_fast_triage_staged(
     a merchantOperatingCityId -> display-name map for the Business Impact
     stage — unset/empty falls back to every city under its raw id.
 
+    `service_hints` (config: fast_triage.service_hints) is an alert-title
+    regex -> [{"service": ..., "namespace": ...}] map — the Logs & Infra
+    stage's last-resort fallback when live discovery (Istio mesh ranking,
+    the alert's own `service` label) finds nothing, e.g. a Redis-spike alert
+    that carries no service label of its own but on-call knows to check
+    location-tracking-service for.
+
     Fails open at two levels: a single stage erroring doesn't stop the rest
     (`on_stage_ready` still gets called, noting it was skipped), and the whole
     pipeline is capped at `timeout_seconds` total — past that, whatever
@@ -921,10 +1243,12 @@ def run_fast_triage_staged(
     if prom is None:
         return ""
     grafana = toolset_manager.get("grafana")  # None if not configured — stackdriver-backed stages skip themselves
+    bash_tool = toolset_manager.get("bash")  # None if not configured — Logs & Infra's stern dig skips itself
+    es_tool = toolset_manager.get("elasticsearch")  # None if not configured — ES top-errors skips itself
 
     pool = ThreadPoolExecutor(max_workers=1)
-    future = pool.submit(_run_triage_stages, prom, grafana, llm, issue, on_stage_ready, top_n,
-                          namespace_exclude, business_impact_cities or {})
+    future = pool.submit(_run_triage_stages, prom, grafana, bash_tool, es_tool, llm, issue, on_stage_ready, top_n,
+                          namespace_exclude, business_impact_cities or {}, service_hints or {})
     try:
         return future.result(timeout=timeout_seconds)
     except FuturesTimeoutError:
