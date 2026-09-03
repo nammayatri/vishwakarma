@@ -987,11 +987,16 @@ def _stage_gcp_redis(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
     maximum_utilization, already a 0-1 ratio per the dashboard's own
     percentunit formatting) and network-out throughput
     (.../stats/total_net_output_bytes_count) — covers Redis High CPU/Memory/
-    Network Out from the one managed-instance dashboard."""
+    Network Out from the one managed-instance dashboard. Also grouped by
+    node_id (a clustered/multi-shard Valkey instance has per-node series) so
+    each instance reports avg + worst-node with that node's own id, same as
+    the AlloyDB stage — falls back to just avg/worst with no node tag for a
+    standalone instance where node_id doesn't resolve (label key unconfirmed
+    live for this metric; `_label()` fails open rather than assume one)."""
     grafana = ctx.get("_grafana")
     if grafana is None:
         return "Grafana toolset not configured — stackdriver-backed check skipped.", {}
-    group_bys = ["resource.label.instance_id"]
+    group_bys = ["resource.label.instance_id", "resource.label.node_id"]
     cpu = _stackdriver_query(grafana, "memorystore.googleapis.com/instance/cpu/maximum_utilization",
                               None, group_bys, "ALIGN_MEAN", "REDUCE_NONE", "300s", "now-5m", "now")
     mem = _stackdriver_query(grafana, "memorystore.googleapis.com/instance/memory/maximum_utilization",
@@ -1000,10 +1005,19 @@ def _stage_gcp_redis(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
                                   None, group_bys, "ALIGN_RATE", "REDUCE_SUM", "300s", "now-5m", "now")
 
     def _fmt(rows, unit_fn):
-        return ", ".join(
-            f"{_label(l, 'resource.label.instance_id', 'instance_id')} ({unit_fn(v)})"
-            for l, v in _topk_rows(rows, top_n)
-        )
+        by_instance: dict[str, list[tuple[dict, float]]] = {}
+        for labels, v in rows:
+            inst = _label(labels, "resource.label.instance_id", "instance_id")
+            by_instance.setdefault(inst, []).append((labels, v))
+        ranked = sorted(by_instance.items(), key=lambda kv: max(v for _l, v in kv[1]), reverse=True)[:top_n]
+        parts = []
+        for inst, entries in ranked:
+            avg = sum(v for _l, v in entries) / len(entries)
+            worst_labels, worst = max(entries, key=lambda e: e[1])
+            node = _label(worst_labels, "resource.label.node_id", "node_id")
+            node_tag = f", node {node}" if node != "?" else ""
+            parts.append(f"{inst} (avg {unit_fn(avg)}, worst {unit_fn(worst)}{node_tag})")
+        return ", ".join(parts)
 
     lines = []
     if cpu:
@@ -1023,7 +1037,9 @@ def _stage_gcp_alloydb(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
     own >90% condition), scoped to the dashboard's own literal instance_id
     filters (driver/rider-db-cluster-primary/-reader-pool) — covers all 4
     AlloyDB CPU-High alerts plus the general 'Alloy DB CPU Util Above 90%'
-    from one stage."""
+    from one stage. Reports both avg (cluster-wide skew/hotspot signal) and
+    worst node, with that worst node's own node_id so on-call doesn't have
+    to go look it up separately."""
     grafana = ctx.get("_grafana")
     if grafana is None:
         return "Grafana toolset not configured — stackdriver-backed check skipped.", {}
@@ -1039,8 +1055,10 @@ def _stage_gcp_alloydb(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
             ["resource.label.node_id"], "ALIGN_MEAN", "REDUCE_NONE", "60s", "now-5m", "now",
         )
         if rows:
-            worst = max(v for _l, v in rows)
-            lines.append(f"{instance_id}: {worst * 100:.0f}% (worst node)")
+            avg = sum(v for _l, v in rows) / len(rows)
+            worst_labels, worst = max(rows, key=lambda r: r[1])
+            worst_node = _label(worst_labels, "resource.label.node_id", "node_id")
+            lines.append(f"{instance_id}: avg {avg * 100:.0f}%, worst {worst * 100:.0f}% (node {worst_node})")
     findings = "\n".join(lines) if lines else ""
     return findings, {}
 
