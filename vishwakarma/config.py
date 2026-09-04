@@ -293,6 +293,22 @@ class VishwakarmaConfig:
         self.argus_app_token: str = _env("ARGUS_APP_TOKEN", argus.get("app_token", "")) or ""
         self.argus_mre_group_id: str = _env("ARGUS_MRE_GROUP_ID", argus.get("mre_group_id", "")) or ""
 
+        # Xyne — same @mention-triggered investigation flow as Argus, on Xyne's
+        # Slack-compatible REST API instead of Slack itself. Events arrive via
+        # a webhook (/api/xyne/events) rather than a socket connection, gated
+        # by signing_secret (preferred — real HMAC request-signature
+        # verification, matching what Xyne actually issued) or webhook_token
+        # (fallback shared-secret-in-URL) if signing_secret is unset.
+        # bot_user_id is optional — self-discovered via auth.test if unset.
+        # Unset base_url/bot_token = Xyne disabled entirely.
+        xyne = raw.get("xyne", {})
+        self.xyne_base_url: str = _env("XYNE_BASE_URL", xyne.get("base_url", "")) or ""
+        self.xyne_bot_token: str = _env("XYNE_BOT_TOKEN", xyne.get("bot_token", "")) or ""
+        self.xyne_bot_user_id: str = _env("XYNE_BOT_USER_ID", xyne.get("bot_user_id", "")) or ""
+        self.xyne_mre_group_id: str = _env("XYNE_MRE_GROUP_ID", xyne.get("mre_group_id", "")) or ""
+        self.xyne_signing_secret: str = _env("XYNE_SIGNING_SECRET", xyne.get("signing_secret", "")) or ""
+        self.xyne_webhook_token: str = _env("XYNE_WEBHOOK_TOKEN", xyne.get("webhook_token", "")) or ""
+
         # Embeddings provider (semantic RAG). Unset = keyword-only matching.
         emb = raw.get("embeddings", {})
         self.embeddings_api_base: str = _env("VK_EMBEDDINGS_API_BASE", emb.get("api_base", "")) or ""
@@ -311,6 +327,46 @@ class VishwakarmaConfig:
 
         # Toolsets config (dict of name → {enabled, config})
         self.toolsets_config: dict[str, Any] = raw.get("toolsets", {})
+
+        # Fast triage — staged Istio→Release Monitoring→DB/Redis→pod-resource
+        # narration posted to Slack (one message per stage) ahead of the full
+        # agentic RCA. Needs the `prometheus` toolset; defaults to on whenever
+        # that toolset is enabled, override with fast_triage.enabled: false.
+        # timeout_seconds is a TOTAL budget across all 4 stages, not per-stage.
+        ft = raw.get("fast_triage", {})
+        _prom_enabled = bool(self.toolsets_config.get("prometheus", {}).get("enabled", False))
+        self.fast_triage_enabled: bool = bool(ft.get("enabled", _prom_enabled)) and _prom_enabled
+        self.fast_triage_timeout_seconds: int = int(
+            _env("VK_FAST_TRIAGE_TIMEOUT", str(ft.get("timeout_seconds", 240)))
+        )
+        self.fast_triage_top_n: int = int(_env("VK_FAST_TRIAGE_TOP_N", str(ft.get("top_n", 5))))
+        self.fast_triage_namespace_exclude: str = ft.get("istio_namespace_exclude", "app-monitor")
+        # Business Impact stage — merchantOperatingCityId -> display-name map.
+        # A city has one merchant_operating_city row per onboarded merchant,
+        # so several ids legitimately map to one name; the stage sums them.
+        # Empty/unset = every city shown ranked by search volume, raw id.
+        self.fast_triage_business_impact_cities: dict[str, str] = ft.get("business_impact_cities", {}) or {}
+        self.fast_triage_service_hints: dict[str, list[dict]] = ft.get("service_hints", {}) or {}
+        self.fast_triage_redis_instances: dict[str, dict] = ft.get("redis_instances", {}) or {}
+        # How long the deep investigation will wait for the fast-triage
+        # pipeline to finish before proceeding without its findings as
+        # pre-investigation evidence — separate from (and much shorter than)
+        # fast_triage_timeout_seconds, which is triage's own total budget.
+        # Slack narration from fast_triage is unaffected either way (posts as
+        # each stage completes, on its own schedule).
+        self.fast_triage_evidence_wait_seconds: int = int(
+            _env("VK_FAST_TRIAGE_EVIDENCE_WAIT", str(ft.get("evidence_wait_seconds", 90)))
+        )
+
+        # GCP Cloud Monitoring webhook — receives Cloud Monitoring incident
+        # notifications and triggers the same investigation flow as
+        # /api/alertmanager. GCP doesn't support IP-allowlisting webhooks, so
+        # this is secured with a shared secret token instead (checked via
+        # constant-time comparison); unset = endpoint stays disabled.
+        gcm = raw.get("gcp_cloud_monitoring", {})
+        self.gcp_cm_webhook_token: str = _env(
+            "VK_GCP_CM_WEBHOOK_TOKEN", gcm.get("webhook_token", "")
+        ) or ""
 
         # Custom toolset YAML paths
         self.custom_toolset_paths: list[str] = raw.get("custom_toolset_paths", [])
@@ -339,6 +395,20 @@ class VishwakarmaConfig:
         self.dedup_window: int = int(
             _env("VK_DEDUP_WINDOW", str(raw.get("dedup_window", 300)))
         )
+
+        # Alert channel allowlist — AlertManager's catch-all 'argus' receiver
+        # forwards EVERY critical/warning alert (all vm-rule routes: system,
+        # sev2, pt, data, ...). Only alerts whose routing label value is in
+        # this allowlist trigger an investigation; the rest still reach their
+        # own Slack channels via their normal receivers. Applies only to
+        # source="alertmanager" issues — GCP Cloud Monitoring / Slack mentions
+        # are unaffected. Empty allow list = no filtering.
+        # e.g. alert_filter: {allow: [ny-system-alerts, ny-sev2-alerts], label: alert}
+        af = raw.get("alert_filter", {})
+        self.alert_filter_allow: list[str] = (
+            _split_keys(_env("VK_ALERT_FILTER_ALLOW", "")) or af.get("allow") or []
+        )
+        self.alert_filter_label: str = str(_env("VK_ALERT_FILTER_LABEL", af.get("label", "alert")))
 
         # Cost report scheduler
         cost_cfg = raw.get("cost_report", {})
