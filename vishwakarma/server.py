@@ -963,7 +963,7 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
                 None, run_fast_triage_staged, issue, tm, llm, _post_triage_stage,
                 config.fast_triage_timeout_seconds, config.fast_triage_top_n,
                 config.fast_triage_namespace_exclude, config.fast_triage_business_impact_cities,
-                config.fast_triage_service_hints,
+                config.fast_triage_service_hints, config.fast_triage_redis_instances,
             )
 
         # Only the expensive agentic-loop section below is concurrency-gated —

@@ -982,27 +982,16 @@ def _stage_logs_infra(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
 
 
 def _stage_gcp_redis(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
-    """Real panels from 'GCP Memorystore for Valkey': CPU/Memory maximum
-    utilization (memorystore.googleapis.com/instance/{cpu,memory}/
-    maximum_utilization, already a 0-1 ratio per the dashboard's own
-    percentunit formatting) and network-out throughput
-    (.../stats/total_net_output_bytes_count) — covers Redis High CPU/Memory/
-    Network Out from the one managed-instance dashboard. Also grouped by
-    node_id (a clustered/multi-shard Valkey instance has per-node series) so
-    each instance reports avg + worst-node with that node's own id, same as
-    the AlloyDB stage — falls back to just avg/worst with no node tag for a
-    standalone instance where node_id doesn't resolve (label key unconfirmed
-    live for this metric; `_label()` fails open rather than assume one)."""
     grafana = ctx.get("_grafana")
     if grafana is None:
         return "Grafana toolset not configured — stackdriver-backed check skipped.", {}
-    group_bys = ["resource.label.instance_id", "resource.label.node_id"]
-    cpu = _stackdriver_query(grafana, "memorystore.googleapis.com/instance/cpu/maximum_utilization",
-                              None, group_bys, "ALIGN_MEAN", "REDUCE_NONE", "300s", "now-5m", "now")
-    mem = _stackdriver_query(grafana, "memorystore.googleapis.com/instance/memory/maximum_utilization",
-                              None, group_bys, "ALIGN_MEAN", "REDUCE_NONE", "300s", "now-5m", "now")
+    node_group_bys = ["resource.label.instance_id", "resource.label.node_id"]
+    cpu = _stackdriver_query(grafana, "memorystore.googleapis.com/instance/node/cpu/utilization",
+                              None, node_group_bys, "ALIGN_MEAN", "REDUCE_NONE", "300s", "now-5m", "now")
+    mem = _stackdriver_query(grafana, "memorystore.googleapis.com/instance/node/memory/utilization",
+                              None, node_group_bys, "ALIGN_MEAN", "REDUCE_NONE", "300s", "now-5m", "now")
     net_out = _stackdriver_query(grafana, "memorystore.googleapis.com/instance/stats/total_net_output_bytes_count",
-                                  None, group_bys, "ALIGN_RATE", "REDUCE_SUM", "300s", "now-5m", "now")
+                                  None, ["resource.label.instance_id"], "ALIGN_RATE", "REDUCE_SUM", "300s", "now-5m", "now")
 
     def _fmt(rows, unit_fn):
         by_instance: dict[str, list[tuple[dict, float]]] = {}
@@ -1026,6 +1015,174 @@ def _stage_gcp_redis(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
         lines.append("Memory util (max): " + _fmt(mem, lambda v: f"{v * 100:.0f}%"))
     if net_out:
         lines.append("Network out: " + _fmt(net_out, lambda v: f"{v / 1e6:.2f} MB/s"))
+    findings = "\n".join(lines) if lines else ""
+    return findings, {}
+
+
+_REDIS_SCAN_ITER = 5
+_REDIS_SCAN_COUNT = 2000
+_REDIS_UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+_REDIS_NUM_RE = re.compile(r"\d{3,}")
+
+
+def _redis_cli(bash_tool, host: str, port, args: str) -> str | None:
+    from vishwakarma.core.models import ToolStatus
+    cmd = f"redis-cli -h {host} -p {port} --no-auth-warning {args}"
+    try:
+        out = bash_tool.execute("bash", {"command": cmd})
+    except Exception as e:
+        log.debug(f"redis-cli failed ({host}:{port} {args[:40]}): {e}")
+        return None
+    if out.status != ToolStatus.SUCCESS:
+        return None
+    return (out.output or "").strip()
+
+
+def _parse_info_field(info_text: str, field: str, numeric: bool = True):
+    for ln in info_text.splitlines():
+        ln = ln.strip()
+        if ln.startswith(f"{field}:"):
+            val = ln.split(":", 1)[1].strip()
+            if not numeric:
+                return val
+            try:
+                return float(val)
+            except ValueError:
+                return None
+    return None
+
+
+def _redis_bigvalue_sample(bash_tool, host: str, port, sample_size: int = 30) -> str | None:
+    out = _redis_cli(bash_tool, host, port, f"SCAN 0 COUNT {sample_size}")
+    if not out:
+        return None
+    rows = out.splitlines()
+    keys = rows[1:] if len(rows) > 1 else []
+    biggest = None
+    for k in keys[:sample_size]:
+        size_out = _redis_cli(bash_tool, host, port, f"MEMORY USAGE {k}")
+        if not size_out:
+            continue
+        try:
+            size = int(size_out)
+        except ValueError:
+            continue
+        if biggest is None or size > biggest[1]:
+            biggest = (k, size)
+    if biggest is None:
+        return None
+    return f"{biggest[0]} (~{biggest[1] / 1e6:.1f}MB, sampled {len(keys)} keys)"
+
+
+def _redis_key_pattern_histogram(bash_tool, host: str, port) -> str | None:
+    from collections import Counter
+    counter: Counter = Counter()
+    cursor = "0"
+    total_sampled = 0
+    for _ in range(_REDIS_SCAN_ITER):
+        out = _redis_cli(bash_tool, host, port, f"SCAN {cursor} COUNT {_REDIS_SCAN_COUNT}")
+        if not out:
+            break
+        rows = out.splitlines()
+        if not rows:
+            break
+        cursor = rows[0].strip()
+        keys = rows[1:]
+        total_sampled += len(keys)
+        for k in keys:
+            norm = _REDIS_NUM_RE.sub("<N>", _REDIS_UUID_RE.sub("<UUID>", k))
+            counter[norm] += 1
+        if cursor == "0" or not cursor.isdigit():
+            break
+    if not counter:
+        return None
+    top_pattern, top_count = counter.most_common(1)[0]
+    pct = (top_count / total_sampled * 100) if total_sampled else 0
+    return f'"{top_pattern}" ({top_count}/{total_sampled} sampled, {pct:.0f}%)'
+
+
+def _redis_hotspot_check(bash_tool, inst_name: str, spec: dict) -> str | None:
+    host, port, mode = spec["host"], spec["port"], spec["mode"]
+    target_host, target_port = host, port
+    shard_note = ""
+
+    if mode == "cluster":
+        nodes_out = _redis_cli(bash_tool, host, port, "CLUSTER NODES")
+        if not nodes_out:
+            return f"{inst_name}: unreachable (CLUSTER NODES failed) — PSC IP may have drifted, re-check `gcloud memorystore instances list`"
+        masters = []
+        for ln in nodes_out.splitlines():
+            parts = ln.split()
+            if len(parts) < 3 or "master" not in parts[2]:
+                continue
+            addr = parts[1].split("@")[0]
+            if ":" in addr:
+                h, p = addr.rsplit(":", 1)
+                if p.isdigit():
+                    masters.append((h, p))
+        if not masters:
+            return f"{inst_name}: CLUSTER NODES returned no master shards"
+        worst = None
+        for h, p in masters[:16]:
+            mem_out = _redis_cli(bash_tool, h, p, "INFO memory")
+            used = _parse_info_field(mem_out, "used_memory") if mem_out else None
+            if used is None:
+                continue
+            if worst is None or used > worst[2]:
+                worst = (h, p, used)
+        if worst is None:
+            return f"{inst_name}: reached {len(masters)} shard(s) but none responded to INFO memory"
+        target_host, target_port, worst_used = worst
+        shard_note = f" (hot shard {target_host}:{target_port}, {worst_used / 1e6:.0f}MB)"
+
+    info_mem = _redis_cli(bash_tool, target_host, target_port, "INFO memory")
+    if not info_mem:
+        return f"{inst_name}{shard_note}: unreachable for INFO memory"
+    used_h = _parse_info_field(info_mem, "used_memory_human", numeric=False)
+    max_h = _parse_info_field(info_mem, "maxmemory_human", numeric=False)
+    policy = _parse_info_field(info_mem, "maxmemory_policy", numeric=False)
+    dataset_pct = _parse_info_field(info_mem, "used_memory_dataset_perc", numeric=False)
+
+    line = f"{inst_name}{shard_note}: used {used_h or '?'} / max {max_h or '?'} (policy {policy or '?'}, dataset {dataset_pct or '?'})"
+
+    info_stats = _redis_cli(bash_tool, target_host, target_port, "INFO stats")
+    evicted = _parse_info_field(info_stats, "evicted_keys") if info_stats else None
+    if evicted is not None and evicted > 0:
+        line += f" — evicted_keys={int(evicted)} (past maxmemory, LRU actively discarding)"
+
+    dataset_val = None
+    if dataset_pct:
+        try:
+            dataset_val = float(dataset_pct.rstrip("%"))
+        except ValueError:
+            dataset_val = None
+
+    if dataset_val is not None and dataset_val >= 70:
+        top_key = _redis_bigvalue_sample(bash_tool, target_host, target_port)
+        if top_key:
+            line += f" — big-value candidate: {top_key}"
+    elif dataset_val is not None:
+        pattern = _redis_key_pattern_histogram(bash_tool, target_host, target_port)
+        if pattern:
+            line += f" — top key pattern: {pattern}"
+
+    return line
+
+
+def _stage_redis_hotspot(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
+    bash_tool = ctx.get("_bash")
+    if bash_tool is None:
+        return "bash toolset not configured — redis-cli hotspot check skipped.", {}
+    redis_instances = ctx.get("redis_instances") or {}
+    if not redis_instances:
+        return "", {}
+    alerted = ctx.get("gcp_resource_instance_id")
+    targets = {alerted: redis_instances[alerted]} if alerted in redis_instances else redis_instances
+    lines = []
+    for inst_name, spec in targets.items():
+        line = _redis_hotspot_check(bash_tool, inst_name, spec)
+        if line:
+            lines.append(line)
     findings = "\n".join(lines) if lines else ""
     return findings, {}
 
@@ -1116,6 +1273,7 @@ _STAGE_FNS: dict[str, Callable] = {
     "ClickHouse": _stage_clickhouse,
     "GCP LB 5xx": _stage_gcp_lb_5xx,
     "GCP Redis": _stage_gcp_redis,
+    "Redis Hotspot": _stage_redis_hotspot,
     "GCP AlloyDB": _stage_gcp_alloydb,
     "Logs & Infra": _stage_logs_infra,
 }
@@ -1130,7 +1288,7 @@ _ALERT_ROUTES: list[tuple[re.Pattern, list[str]]] = [
     (re.compile(r"(RideToSearchRatioDown|LowCityRides)", re.I), ["Istio mesh", "Release Monitoring", "Logs & Infra"]),
     (re.compile(r"^Node[A-Z]", re.I), []),
     (re.compile(r"GCP ELB 5xx Alert", re.I), ["Istio mesh", "GCP LB 5xx", "Logs & Infra"]),
-    (re.compile(r"Redis\s*High\s*(Network Out|Memory|CPU)", re.I), ["GCP Redis", "Logs & Infra"]),
+    (re.compile(r"GCPRedis|Redis\s*High\s*(Network Out|Memory|CPU)", re.I), ["GCP Redis", "Redis Hotspot", "Logs & Infra"]),
     (re.compile(r"Alloy\s?DB.*CPU", re.I), ["GCP AlloyDB", "Logs & Infra"]),
     (re.compile(r"Clickhouse disk usage", re.I), ["ClickHouse"]),
     (re.compile(r"VM Instance.*tummoc-db-v2", re.I), []),
@@ -1182,7 +1340,7 @@ def _resolve_service_hints(title: str, service_hints: dict[str, list[dict]]) -> 
 
 def _run_triage_stages(prom, grafana, bash_tool, es_tool, llm, issue, on_stage_ready: Callable[[str, str], None],
                         top_n: int, namespace_exclude: str, business_impact_cities: dict[str, str],
-                        service_hints: dict[str, list[dict]]) -> str:
+                        service_hints: dict[str, list[dict]], redis_instances: dict[str, dict]) -> str:
     labels = issue.labels or {}
     ctx = {
         "known_service": _sanitize(labels.get("service") or labels.get("job") or ""),
@@ -1196,6 +1354,8 @@ def _run_triage_stages(prom, grafana, bash_tool, es_tool, llm, issue, on_stage_r
         "merchant_operating_city_id": _sanitize(labels.get("merchantOperatingCityId") or "") or None,
         "business_impact_cities": business_impact_cities,
         "service_hints": _resolve_service_hints(issue.title, service_hints or {}),
+        "redis_instances": redis_instances or {},
+        "gcp_resource_instance_id": _sanitize(labels.get("instance_id") or ""),
     }
     # Business Impact always runs first, ahead of the alert-specific route —
     # it's independent of which category (Istio/DB-Redis/GCP-Redis/AlloyDB/
@@ -1218,6 +1378,7 @@ def run_fast_triage_staged(
     namespace_exclude: str = "app-monitor",
     business_impact_cities: dict[str, str] | None = None,
     service_hints: dict[str, list[dict]] | None = None,
+    redis_instances: dict[str, dict] | None = None,
 ) -> str:
     """
     Runs whichever stages `_route_for_alert(issue.title)` picks for this
@@ -1266,7 +1427,7 @@ def run_fast_triage_staged(
 
     pool = ThreadPoolExecutor(max_workers=1)
     future = pool.submit(_run_triage_stages, prom, grafana, bash_tool, es_tool, llm, issue, on_stage_ready, top_n,
-                          namespace_exclude, business_impact_cities or {}, service_hints or {})
+                          namespace_exclude, business_impact_cities or {}, service_hints or {}, redis_instances or {})
     try:
         return future.result(timeout=timeout_seconds)
     except FuturesTimeoutError:

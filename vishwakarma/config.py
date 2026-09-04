@@ -347,6 +347,7 @@ class VishwakarmaConfig:
         # Empty/unset = every city shown ranked by search volume, raw id.
         self.fast_triage_business_impact_cities: dict[str, str] = ft.get("business_impact_cities", {}) or {}
         self.fast_triage_service_hints: dict[str, list[dict]] = ft.get("service_hints", {}) or {}
+        self.fast_triage_redis_instances: dict[str, dict] = ft.get("redis_instances", {}) or {}
         # How long the deep investigation will wait for the fast-triage
         # pipeline to finish before proceeding without its findings as
         # pre-investigation evidence — separate from (and much shorter than)
