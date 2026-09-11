@@ -132,6 +132,17 @@ CREATE TABLE IF NOT EXISTS alert_runbook_map (
     PRIMARY KEY (alert_pattern, runbook_id)
 );
 
+CREATE TABLE IF NOT EXISTS runbook_proposals (
+    id           TEXT PRIMARY KEY,
+    runbook_id   TEXT NOT NULL,
+    incident_id  TEXT NOT NULL,
+    proposed_md  TEXT NOT NULL,
+    reason       TEXT,
+    status       TEXT DEFAULT 'open',
+    created_at   REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_proposals_open ON runbook_proposals(status);
+
 CREATE TABLE IF NOT EXISTS code_index_state (
     repo        TEXT NOT NULL,
     path        TEXT NOT NULL,

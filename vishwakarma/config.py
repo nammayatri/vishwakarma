@@ -421,6 +421,15 @@ class VishwakarmaConfig:
             "region": cost_cfg.get("region", "ap-south-1"),
         }
 
+        handoff_cfg = raw.get("handoff", {})
+        self.handoff = {
+            "enabled": _env("VK_HANDOFF_ENABLED",
+                            str(handoff_cfg.get("enabled", False))).lower() in ("true", "1", "yes"),
+            "weekday": str(handoff_cfg.get("weekday", "1")),
+            "hour": str(handoff_cfg.get("hour", "04")),
+            "channel": _env("VK_HANDOFF_CHANNEL", handoff_cfg.get("channel", "")),
+        }
+
     # ── Factory methods ────────────────────────────────────────────────────────
 
     def make_llm(self) -> VishwakarmaLLM:

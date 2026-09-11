@@ -274,6 +274,23 @@ def create_console_router(config, state: dict) -> APIRouter:
                 results["runbooks"].append(rid)
             except Exception as e:
                 log.warning(f"Feedback runbook update failed for {rid}: {e}")
+        if not body.correct and body.runbook_ids:
+            import threading
+
+            def _draft_amendments():
+                try:
+                    from vishwakarma.core.amendment_proposals import propose_amendments
+                    from vishwakarma.storage.queries import get_incident
+                    llm = config.make_llm()
+                    propose_amendments(
+                        incident_id, body.runbook_ids, corrected=False,
+                        fetch_incident=get_incident, get_runbook=rb.get_runbook,
+                        summarize=lambda p: llm.summarize(p),
+                        save_proposal=rb.save_proposal)
+                except Exception as e:
+                    log.warning(f"Amendment proposal hook failed: {e}")
+
+            threading.Thread(target=_draft_amendments, daemon=True).start()
         return results
 
     # ── Runbook studio ────────────────────────────────────────────────────────
@@ -331,6 +348,37 @@ def create_console_router(config, state: dict) -> APIRouter:
         return [{"id": m["id"], "title": m["title"], "cloud_type": m["cloud_type"],
                  "hit_count": m["hit_count"], "miss_count": m["miss_count"]}
                 for m in matched]
+
+    @router.get("/runbook-proposals")
+    async def proposals_list(role: str = reader):
+        from vishwakarma.storage import runbooks as rb
+        return rb.list_proposals()
+
+    @router.post("/runbook-proposals/{pid}/approve")
+    async def proposal_approve(pid: str, role: str = admin):
+        from vishwakarma.storage import runbooks as rb
+        from vishwakarma.storage.audit import audit
+        audit(role, "proposal_approve", pid, {})
+        rows = [p for p in rb.list_proposals() if p["id"] == pid]
+        if not rows:
+            raise HTTPException(404, "proposal not found")
+        p = rows[0]
+        cur = rb.get_runbook(p["runbook_id"])
+        if not cur:
+            raise HTTPException(404, "runbook no longer exists")
+        rb.save_runbook(p["runbook_id"], cur["title"], p["proposed_md"],
+                        cloud_type=cur.get("cloud_type", "any"),
+                        keywords=cur.get("keywords"), services=cur.get("services"))
+        rb.delete_proposal(pid)
+        return {"applied": True}
+
+    @router.post("/runbook-proposals/{pid}/reject")
+    async def proposal_reject(pid: str, role: str = admin):
+        from vishwakarma.storage import runbooks as rb
+        from vishwakarma.storage.audit import audit
+        audit(role, "proposal_reject", pid, {})
+        rb.delete_proposal(pid)
+        return {"rejected": True}
 
     # ── Fixes / PRs (Phase-3 gate surface; PR fields land with the GitHub App) ─
 

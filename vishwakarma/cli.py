@@ -613,10 +613,14 @@ def eval_cmd(
     table.add_row("precision", str(summary["precision"]))
     table.add_row("calibration (HIGH correct)", str(summary["calibration_high"]))
     table.add_row("calibration (MEDIUM correct)", str(summary["calibration_medium"]))
+    grades = report.grade_counts()
+    for g in ("✅", "⚠️", "❌", "🚫"):
+        table.add_row(f"grade {g}", str(grades[g]))
+    gate_pass = report.gate()
+    table.add_row("gate", "[green]PASS[/green]" if gate_pass else "[red]FAIL[/red]")
     console.print(table)
     for c in report.cases:
-        mark = "[green]✓[/green]" if c.correct else "[red]✗[/red]"
-        console.print(f"  {mark} [{c.confidence or '?'}] {c.title}"
+        console.print(f"  {c.grade or '?'} [{c.confidence or '?'}] {c.title}"
                       + (f" — missing: {c.missing_terms}" if c.missing_terms else ""))
 
     if out:
@@ -624,6 +628,85 @@ def eval_cmd(
             "summary": summary,
             "cases": [vars(c) for c in report.cases]}, indent=2))
         console.print(f"[green]Report written to {out}[/green]")
+
+
+def _post_handoff(cfg, text: str) -> None:
+    channel = cfg.handoff.get("channel") or cfg.cost_report.get("channel")
+    if not (channel and cfg.slack_bot_token):
+        console.print(text)
+        return
+    from slack_sdk import WebClient
+    WebClient(token=cfg.slack_bot_token).chat_postMessage(channel=channel, text=text)
+
+
+def _handoff_fetch(cfg) -> list[dict]:
+    from vishwakarma.storage.db import _get_conn, init_db
+    init_db(db_path=cfg.db_path, dsn=cfg.pg_dsn or None)
+    rows = _get_conn().execute(
+        "SELECT id,title,status,analysis,created_at,labels FROM incidents "
+        "ORDER BY created_at DESC LIMIT 200").fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.command("handoff")
+def handoff_cmd(
+    config: Optional[str] = typer.Option(None, "--config", "-c"),
+    post: bool = typer.Option(False, "--post", help="Post to Slack (handoff.channel); default prints to stdout"),
+):
+    """Generate the weekly on-call handoff summary now (what happened / means / do)."""
+    from vishwakarma.scheduler.handoff import collect_week, run_once
+    import time as _time
+    cfg = _load_config(config)
+    rows = _handoff_fetch(cfg)
+    week = collect_week(rows, _time.time())
+    llm = cfg.make_llm()
+    post_fn = (lambda text: _post_handoff(cfg, text)) if post else console.print
+    if not run_once(week, llm.summarize, post_fn):
+        console.print("No incidents in the last 7 days — nothing to hand off")
+
+
+def _mine_fetch(cfg, since_days: int, limit: int) -> list[dict]:
+    import time
+    from vishwakarma.storage.db import _get_conn, init_db
+    init_db(db_path=cfg.db_path, dsn=cfg.pg_dsn or None)
+    since = time.time() - since_days * 86400
+    from vishwakarma.core.runbook_mine import CONFIRMED_SQL
+    rows = _get_conn().execute(CONFIRMED_SQL, (since, limit)).fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.command("mine")
+def mine_cmd(
+    since_days: int = typer.Option(90, "--since-days"),
+    limit: int = typer.Option(500, "--limit"),
+    min_cluster: int = typer.Option(2, "--min-cluster"),
+    apply: bool = typer.Option(False, "--apply", help="Write runbooks (default: dry run)"),
+    config: Optional[str] = typer.Option(None, "--config", "-c"),
+):
+    """Mine ✅-confirmed incidents into runbooks (dry-run preview; --apply writes them)."""
+    from vishwakarma.core.runbook_mine import mine, build_draft_prompt
+    cfg = _load_config(config)
+    items = _mine_fetch(cfg, since_days, limit)
+    console.print(f"{len(items)} confirmed RCAs in window")
+    if not items:
+        return
+    from vishwakarma.core.embeddings import get_client
+    embed_fn = get_client().embed
+    llm = cfg.make_llm()
+
+    def draft_fn(cluster):
+        return llm.complete(messages=[{"role": "user", "content": build_draft_prompt(cluster)}]).content
+
+    def save_fn(**kw):
+        if apply:
+            from vishwakarma.storage import runbooks as rb
+            rb.save_runbook(kw["runbook_id"], kw["title"], kw["content_md"])
+        console.print(f"[{'green' if apply else 'yellow'}]{'SAVED' if apply else 'DRY'}[/] {kw['title']}")
+
+    mine(items, embed_fn=embed_fn, draft_fn=draft_fn, save_fn=save_fn,
+         min_cluster=min_cluster)
+    if not apply:
+        console.print("Dry run — re-run with --apply to write them")
 
 
 # ── vk serve ──────────────────────────────────────────────────────────────────
@@ -657,6 +740,9 @@ def serve(
     # Start daily cost report scheduler
     from vishwakarma.scheduler.cost_report import start_cost_reporter
     start_cost_reporter(cfg)
+
+    from vishwakarma.scheduler.handoff import start_handoff_scheduler
+    start_handoff_scheduler(cfg, post_fn=lambda text: _post_handoff(cfg, text))
 
     # Start FastAPI server
     from vishwakarma.server import create_app, _state

@@ -379,7 +379,7 @@ def create_app(config=None) -> FastAPI:
             from vishwakarma.storage.queries import resolve_incidents_by_labels
             for a in (payload.get("alerts") or []):
                 if a.get("status") == "resolved":
-                    n = resolve_incidents_by_labels(a.get("labels") or {})
+                    n = resolve_incidents_by_labels(a.get("labels") or {}, source="alertmanager")
                     if n:
                         log.info(f"Auto-resolved {n} incident(s) — alert cleared: "
                                  f"{(a.get('labels') or {}).get('alertname')}")
@@ -432,7 +432,7 @@ def create_app(config=None) -> FastAPI:
             incident = payload.get("incident") or {}
             if incident.get("state") == "closed":
                 labels = {"alertname": incident.get("policy_name", "")}
-                n = resolve_incidents_by_labels(labels)
+                n = resolve_incidents_by_labels(labels, source="gcp_cloud_monitoring")
                 if n:
                     log.info(f"Auto-resolved {n} incident(s) — GCP incident closed: "
                              f"{incident.get('policy_name')}")

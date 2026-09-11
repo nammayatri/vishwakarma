@@ -241,6 +241,33 @@ def seed_from_files(agents_json_path: str | Path | None = None) -> int:
     return n
 
 
+def save_proposal(runbook_id: str, incident_id: str, proposed_md: str,
+                  reason: str = "") -> str:
+    import uuid
+    pid = uuid.uuid4().hex[:12]
+    conn = _get_conn()
+    with _lock:
+        conn.execute(
+            "INSERT INTO runbook_proposals (id, runbook_id, incident_id, proposed_md,"
+            " reason, status, created_at) VALUES (?,?,?,?,?, 'open', ?)",
+            (pid, runbook_id, incident_id, proposed_md, reason, time.time()))
+        conn.commit()
+    return pid
+
+
+def list_proposals(status: str = "open") -> list[dict]:
+    rows = _get_conn().execute(
+        "SELECT * FROM runbook_proposals WHERE status=? ORDER BY created_at DESC",
+        (status,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def delete_proposal(pid: str) -> None:
+    with _lock:
+        _get_conn().execute("DELETE FROM runbook_proposals WHERE id=?", (pid,))
+        _get_conn().commit()
+
+
 # ── Internal ──────────────────────────────────────────────────────────────────
 
 def _row_to_dict(row) -> dict:

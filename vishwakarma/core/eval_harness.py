@@ -33,6 +33,7 @@ class CaseResult:
     confidence: str
     matched_terms: list[str]
     missing_terms: list[str]
+    grade: str = ""
 
 
 @dataclass
@@ -67,6 +68,17 @@ class EvalReport:
             "confidence_counts": self.confidence_counts(),
         }
 
+    def grade_counts(self) -> dict:
+        out = {"✅": 0, "⚠️": 0, "❌": 0, "🚫": 0}
+        for c in self.cases:
+            out[c.grade if c.grade in out else "❌"] += 1
+        return out
+
+    def gate(self, min_pass: float = 0.5) -> bool:
+        g = self.grade_counts()
+        return (g["🚫"] == 0 and self.total > 0
+                and (g["✅"] + g["⚠️"]) / self.total >= min_pass)
+
 
 def extract_confidence(rca_text: str) -> str:
     m = _CONF_RE.search(rca_text or "")
@@ -90,10 +102,24 @@ def score_case(case: dict, rca_text: str) -> CaseResult:
         missing = [t for t in terms if t not in text]
         correct = bool(terms) and (len(matched) / len(terms)) >= 0.5
 
+    harmful = [t.lower() for t in case.get("harmful_terms", [])]
+    hit_harmful = [t for t in harmful if t in text]
+    total_terms = len(matched) + len(missing)
+    if hit_harmful:
+        grade, correct = "🚫", False
+    elif total_terms == 0:
+        grade = "❌"
+    elif not missing:
+        grade = "✅"
+    elif len(matched) * 2 >= total_terms:
+        grade = "⚠️"
+    else:
+        grade = "❌"
+
     return CaseResult(
         title=case.get("title", "?"), correct=correct,
         confidence=extract_confidence(rca_text),
-        matched_terms=matched, missing_terms=missing)
+        matched_terms=matched, missing_terms=missing, grade=grade)
 
 
 def run_eval(golden: list[dict], investigate_fn) -> EvalReport:
