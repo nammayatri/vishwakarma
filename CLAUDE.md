@@ -54,6 +54,8 @@ Config is loaded from: `VK_CONFIG` env var → `~/.vishwakarma/config.yaml` → 
 
 ```
 AlertManager webhook POST /api/alertmanager
+    → channel filter: alert_filter.allow gates the vm-rule routing label (default `alert`,
+      e.g. ny-system-alerts/ny-sev2-alerts trigger — ny-pt-alerts doesn't; empty = off)
     → dedup by fingerprint (alertname+namespace+service)
     → 4 parallel pre-enrichment tasks:
         1. kubectl get pods/events/replicasets (prefetch_ctx)

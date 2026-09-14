@@ -929,13 +929,33 @@ def start_bot(config: "VishwakarmaConfig") -> None:
 
             # Penalize the runbooks that led to the wrong RCA (auto-demote on
             # repeated misses).
+            matched_runbook_ids = []
             try:
                 from vishwakarma.storage.runbooks import mark_runbook_miss
-                inc_meta = _json.loads(incident.get("meta", "{}")) if incident and incident.get("meta") else {}
-                for rid in inc_meta.get("matched_runbook_ids", []):
+                inc_meta = (incident.get("meta") or {}) if incident else {}
+                if isinstance(inc_meta, str):
+                    inc_meta = _json.loads(inc_meta) if inc_meta else {}
+                matched_runbook_ids = inc_meta.get("matched_runbook_ids", [])
+                for rid in matched_runbook_ids:
                     mark_runbook_miss(rid)
             except Exception as e:
                 log.debug(f"[FEEDBACK] Runbook miss update failed (non-fatal): {e}")
+
+            try:
+                from vishwakarma.core.amendment_proposals import propose_amendments
+                from vishwakarma.storage import runbooks as rb
+                wrong_rca = (incident.get("analysis") or "")[:4000] if incident else ""
+                bot_llm = config.make_llm()
+                propose_amendments(
+                    incident_id, matched_runbook_ids, corrected=False,
+                    fetch_incident=lambda i: {
+                        "analysis": f"WRONG RCA:\n{wrong_rca}\n\n"
+                                    f"CORRECT ROOT CAUSE (per human):\n{real_cause}"},
+                    get_runbook=rb.get_runbook,
+                    summarize=lambda p: bot_llm.summarize(p),
+                    save_proposal=rb.save_proposal)
+            except Exception as e:
+                log.debug(f"[FEEDBACK] Amendment proposal failed (non-fatal): {e}")
 
             # Update the original feedback message
             if channel_id and msg_ts:

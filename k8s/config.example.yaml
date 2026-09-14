@@ -28,6 +28,29 @@ server:
 storage:
   db_path: /data/vishwakarma.db     # SQLite — incident history (on PVC)
 
+# ── Alert Channel Filter ──────────────────────────────────────────────────────
+# AlertManager's catch-all 'argus' route forwards EVERY critical/warning alert
+# to /api/alertmanager (all vm-rule channels: system, sev2, pt, data, ...).
+# Only investigate alerts whose routing label is in this allowlist — the rest
+# still page their own Slack channels via their normal receivers, but no RCA
+# runs for them. Applies only to AlertManager-sourced alerts; GCP Cloud
+# Monitoring / Slack mentions are unaffected. Empty allow = no filtering.
+alert_filter:
+  allow: [ny-system-alerts, ny-sev2-alerts]   # vm rule `alert` label values
+  # label: alert                              # routing label name (default: alert)
+
+# ── Fast Triage ───────────────────────────────────────────────────────────────
+# fast_triage:
+#   business_impact_cities:      # merchantOperatingCityId -> display name
+#     # A city has one merchant_operating_city row per onboarded merchant, so
+#     # several ids legitimately map to the same name — list them all, the
+#     # stage sums rides/searches across them before computing the ratio.
+#     <city-uuid-1>: Bangalore
+#     <city-uuid-2>: Bangalore
+#     <city-uuid-3>: Chennai
+#     <city-uuid-4>: Kolkata
+#     # Unset/empty = every city shown ranked by search volume, raw id.
+
 # ── Site Knowledge Base ────────────────────────────────────────────────────────
 # Injected into every investigation. Put cluster-specific facts here:
 # instance IDs, namespaces, metric names, proven commands, IAM gaps.
