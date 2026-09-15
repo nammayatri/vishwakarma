@@ -713,7 +713,8 @@ _INFRA_SIGNATURES: list[tuple[re.Pattern, str]] = [
     (re.compile(r"(oomkilled|out of memory|cannot allocate memory)", re.I),
      "OOM — pod killed / allocation failed for exceeding memory limit"),
     (re.compile(r"(no healthy upstream|upstream connect error|connection reset by peer|ucupstream)", re.I),
-     "No healthy upstream — destination pod(s) not ready / crashlooping"),
+     "No healthy upstream — Envoy couldn't reach a ready backend (not necessarily a crash — "
+     "check the pod-restart line above; a rollout/scale-down or a slow readiness probe can also cause this)"),
     (re.compile(r"(context deadline exceeded|i/o timeout|dial tcp[^\n]{0,40}timeout|request timeout)", re.I),
      "Request timeout calling a downstream dependency"),
     (re.compile(r"connection refused", re.I),
@@ -803,13 +804,19 @@ def _pod_health_lines(prom, targets: list[tuple[str, str | None]], top_n: int) -
     namespace = next((ns for _s, ns in targets if ns), None)
     ns_clause = f', namespace="{_sanitize(namespace)}"' if namespace else ""
 
+    # `and on(pod) kube_pod_info` drops pods already deleted (routine scale-down/
+    # rollout replacement) — their restart counters still have samples inside
+    # a 15m window otherwise, misreported as the currently-running pod's state.
+    ns_only = f'namespace="{_sanitize(namespace)}"' if namespace else ""
+    live_pods = f'kube_pod_info{{{ns_only}}}'
+
     terminated = _query(prom, (
-        f'kube_pod_container_status_terminated_reason{{reason=~"Error|OOMKilled|ContainerStatusUnknown", '
-        f'pod=~"({svc_match}).*"{ns_clause}}} == 1'
+        f'(kube_pod_container_status_terminated_reason{{reason=~"Error|OOMKilled|ContainerStatusUnknown", '
+        f'pod=~"({svc_match}).*"{ns_clause}}} == 1) and on(pod) ({live_pods})'
     ))
     restarts = _topk_rows(_query(prom, (
         f'topk({top_n}, sum by (pod) (increase(kube_pod_container_status_restarts_total{{'
-        f'pod=~"({svc_match}).*"{ns_clause}}}[15m])))'
+        f'pod=~"({svc_match}).*"{ns_clause}}}[15m]))) and on(pod) ({live_pods})'
     )), top_n)
 
     reason_by_pod: dict[str, str] = {}
