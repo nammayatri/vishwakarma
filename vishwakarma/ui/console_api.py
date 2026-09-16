@@ -259,9 +259,9 @@ def create_console_router(config, state: dict) -> APIRouter:
         results = {"evidence": False, "runbooks": []}
         try:
             if body.correct:
-                evidence.mark_evidence_correct(incident_id)
+                evidence.mark_evidence_correct(incident_id, alert_name=body.alert_name)
             else:
-                evidence.mark_evidence_wrong(incident_id)
+                evidence.mark_evidence_wrong(incident_id, alert_name=body.alert_name)
             results["evidence"] = True
         except Exception as e:
             log.warning(f"Feedback evidence update failed: {e}")

@@ -776,7 +776,7 @@ def start_bot(config: "VishwakarmaConfig") -> None:
             # Update evidence baselines
             try:
                 from vishwakarma.storage.evidence import mark_evidence_correct
-                mark_evidence_correct(incident_id)
+                mark_evidence_correct(incident_id, alert_name=alert_name)
                 log.info(f"[FEEDBACK] Evidence marked correct, baselines updated for {alert_name}")
             except Exception as e:
                 log.debug(f"[FEEDBACK] Evidence update failed (non-fatal): {e}")
@@ -784,7 +784,9 @@ def start_bot(config: "VishwakarmaConfig") -> None:
             # Credit the runbooks used (hit + self-populate alert→runbook map)
             try:
                 from vishwakarma.storage.runbooks import mark_runbook_hit
-                meta = json.loads(incident.get("meta", "{}")) if incident.get("meta") else {}
+                meta = incident.get("meta") or {}
+                if isinstance(meta, str):
+                    meta = json.loads(meta) if meta else {}
                 for rid in meta.get("matched_runbook_ids", []):
                     mark_runbook_hit(rid, alert_name=alert_name)
             except Exception as e:
@@ -796,7 +798,9 @@ def start_bot(config: "VishwakarmaConfig") -> None:
                 from vishwakarma.storage.tool_effectiveness import (
                     record_effective, tools_to_toolsets)
                 from vishwakarma.storage.runbooks import normalize_alert_key
-                tos = json.loads(incident.get("tool_outputs", "[]")) if incident.get("tool_outputs") else []
+                tos = incident.get("tool_outputs") or []
+                if isinstance(tos, str):
+                    tos = json.loads(tos) if tos else []
                 used_tools = {o.get("tool_name") for o in tos if o.get("tool_name")}
                 toolsets = config.make_toolset_manager().active_toolsets()
                 used_toolsets = tools_to_toolsets(used_tools, toolsets)
@@ -809,7 +813,9 @@ def start_bot(config: "VishwakarmaConfig") -> None:
             try:
                 from vishwakarma.storage.patterns import extract_pattern_from_rca, save_pattern
                 import uuid
-                tool_outputs = json.loads(incident.get("tool_outputs", "[]")) if incident.get("tool_outputs") else []
+                tool_outputs = incident.get("tool_outputs") or []
+                if isinstance(tool_outputs, str):
+                    tool_outputs = json.loads(tool_outputs) if tool_outputs else []
                 pattern_data = extract_pattern_from_rca(llm, alert_name, analysis, tool_outputs)
                 if pattern_data:
                     save_pattern(

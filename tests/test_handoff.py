@@ -1,5 +1,32 @@
 """Weekly handoff — pure builder + injectable run_once."""
+import sys
+import tempfile
+import time
+
+import pytest
+
 from vishwakarma.scheduler.handoff import build_handoff, collect_week, run_once
+
+
+def _reset():
+    for mod in list(sys.modules):
+        if mod.startswith("vishwakarma.storage"):
+            del sys.modules[mod]
+
+
+class _FakeCfg:
+    def __init__(self, db_path):
+        self.db_path = db_path
+        self.pg_dsn = ""
+
+
+@pytest.fixture()
+def db():
+    _reset()
+    from vishwakarma.storage import db as dbmod
+    path = tempfile.mktemp(suffix=".db")
+    dbmod.init_db(db_path=path)
+    return path
 
 
 ROWS = [
@@ -26,3 +53,17 @@ def test_run_once_posts_via_injection():
     n = run_once(ROWS, summarize=lambda p: "SUMMARY", post_fn=posted.append)
     assert n is True and posted == ["SUMMARY"]
     assert run_once([], summarize=lambda p: "x", post_fn=posted.append) is False
+
+
+def test_handoff_fetch_pulls_real_incidents_end_to_end(db):
+    from vishwakarma.storage.queries import save_incident
+    import vishwakarma.cli as cli_mod
+
+    save_incident("inc-1", "AllocatorJobPickupDelayHigh", question="q",
+                  analysis="deploy diff caused it", source="alertmanager")
+    rows = cli_mod._handoff_fetch(_FakeCfg(db))
+    assert [r["id"] for r in rows] == ["inc-1"]
+
+    week = collect_week(rows, time.time())
+    md = build_handoff(week)
+    assert "AllocatorJobPickupDelayHigh" in md
