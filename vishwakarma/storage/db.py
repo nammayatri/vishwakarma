@@ -143,6 +143,12 @@ CREATE TABLE IF NOT EXISTS runbook_proposals (
 );
 CREATE INDEX IF NOT EXISTS idx_proposals_open ON runbook_proposals(status);
 
+CREATE TABLE IF NOT EXISTS infra_gpt_conversations (
+    thread_key      TEXT PRIMARY KEY,     -- "{channel}:{thread_ts}"
+    conversation_id INTEGER NOT NULL,
+    updated_at      REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS code_index_state (
     repo        TEXT NOT NULL,
     path        TEXT NOT NULL,

@@ -437,7 +437,7 @@ class VishwakarmaConfig:
             "url": _env("NY_INFRA_GPT_URL",
                         infra_gpt_cfg.get("url", "http://nyinfragpt.atlas.svc.cluster.local")),
             "token": _env("NY_INFRA_GPT_TOKEN", infra_gpt_cfg.get("token", "")) or "",
-            "timeout": float(infra_gpt_cfg.get("timeout", 20)),
+            "timeout": float(_env("NY_INFRA_GPT_TIMEOUT", str(infra_gpt_cfg.get("timeout", 180)))),
         }
 
     # ── Factory methods ────────────────────────────────────────────────────────

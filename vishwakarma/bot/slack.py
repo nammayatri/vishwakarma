@@ -426,10 +426,12 @@ def start_bot(config: "VishwakarmaConfig") -> None:
 
             def run_chat():
                 try:
+                    if _run_infra_gpt_chat(config, channel, thread_ts, question, thread_text, say):
+                        return
                     if is_thread_reply and thread_text:
                         reply = _contextual_thread_reply(config, question, thread_text)
                     else:
-                        reply = _ask_infra_gpt(config, question) or _simple_chat(config, question)
+                        reply = _simple_chat(config, question)
                     from vishwakarma.utils.slack_format import md_to_slack
                     say(text=md_to_slack(reply), thread_ts=thread_ts)
                 except Exception as e:
@@ -1161,25 +1163,90 @@ def _contextual_thread_reply(config, question: str, thread_context: str) -> str:
     return content or fallback
 
 
-def _ask_infra_gpt(config, question: str) -> str | None:
-    """Proxy to the existing read-only infra Q&A service; None means unconfigured
-    or failed, so the caller falls back to the no-tools chat reply."""
+def _run_infra_gpt_chat(config, channel: str, thread_ts: str, question: str,
+                        thread_text: str, say) -> bool:
+    """Streams the question through ny-infra-gpt with per-thread conversation
+    continuity, posting live status updates as tool calls happen. Returns
+    False (caller falls back to plain chat) when unconfigured or the stream
+    produced no usable answer; True once it has posted a real one."""
+    from vishwakarma.core.ny_infra_gpt import stream_ask, build_question
+    from vishwakarma.storage import infra_gpt as infra_gpt_store
+
     cfg = config.ny_infra_gpt
     if not (cfg.get("enabled") and cfg.get("token")):
-        return None
+        return False
+
+    existing_conv_id = infra_gpt_store.get_conversation_id(channel, thread_ts)
+    full_question = question if existing_conv_id else build_question(question, thread_text)
+
+    from slack_sdk import WebClient
+    client_sdk = WebClient(token=config.slack_bot_token)
+    status_ts = None
+    status_lines: list[str] = []
+    answer = None
+    conv_id = None
+    saw_any_event = False
+
+    def render_status():
+        if status_ts is None:
+            return
+        text = "\n".join(status_lines[-10:])
+        try:
+            client_sdk.chat_update(
+                channel=channel, ts=status_ts, text=text,
+                blocks=[{"type": "context", "elements": [{"type": "mrkdwn", "text": text}]}],
+            )
+        except Exception:
+            pass
+
     try:
-        import requests
-        resp = requests.post(
-            f"{cfg['url'].rstrip('/')}/ask",
-            json={"question": question},
-            headers={"Authorization": f"Bearer {cfg['token']}"},
-            timeout=cfg.get("timeout", 20),
+        status_resp = client_sdk.chat_postMessage(
+            channel=channel, thread_ts=thread_ts, text="🔎 Asking infra-gpt...",
+            blocks=[{"type": "context", "elements": [{"type": "mrkdwn", "text": "🔎 _Asking infra-gpt..._"}]}],
         )
-        resp.raise_for_status()
-        return resp.json().get("answer") or None
+        status_ts = status_resp["ts"]
+
+        for event in stream_ask(config, full_question, conversation_id=existing_conv_id):
+            saw_any_event = True
+            etype = event.get("type", "")
+            if etype == "notice":
+                status_lines.append(f"💭 {event.get('text', '')}")
+                render_status()
+            elif etype == "stage":
+                status_lines.append(f"⚙ {event.get('stage', '')} — {event.get('detail', '')}")
+                render_status()
+            elif etype == "call_start":
+                params = _short_oracle_params(event.get("params", {}))
+                status_lines.append(f"⚙ `{event.get('entry_name', '')}({params})`")
+                render_status()
+            elif etype == "call":
+                name = event.get("entry_name", "")
+                marker = "✓" if event.get("ok") else "✗"
+                for i in range(len(status_lines) - 1, -1, -1):
+                    if f"`{name}(" in status_lines[i] and "✓" not in status_lines[i] and "✗" not in status_lines[i]:
+                        status_lines[i] += f"  {marker}"
+                        break
+                render_status()
+            elif etype == "answer":
+                answer = event.get("answer", "")
+                conv_id = event.get("conversation_id")
     except Exception as e:
-        log.debug(f"[NY-INFRA-GPT] ask failed (non-fatal, falling back to chat): {e}")
-        return None
+        log.debug(f"[NY-INFRA-GPT] stream failed (non-fatal, falling back to chat): {e}")
+
+    if not saw_any_event or not answer:
+        if status_ts:
+            status_lines.append("⚠️ infra-gpt unavailable, falling back...")
+            render_status()
+        return False
+
+    if conv_id is not None:
+        infra_gpt_store.save_conversation_id(channel, thread_ts, conv_id)
+    status_lines.append("✅ answered")
+    render_status()
+
+    from vishwakarma.utils.slack_format import md_to_slack
+    say(text=md_to_slack(answer), thread_ts=thread_ts)
+    return True
 
 
 def _simple_chat(config, question: str) -> str:
