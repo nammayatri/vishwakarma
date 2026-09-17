@@ -83,7 +83,7 @@ def start_bot(config: "VishwakarmaConfig") -> None:
         # Handle special commands
         question_lower = question.lower()
         if question_lower in ("help", "?"):
-            say(text=_help_text(), thread_ts=thread_ts)
+            say(text=_help_text(config), thread_ts=thread_ts)
             return
 
         if question_lower == "status":
@@ -323,11 +323,12 @@ def start_bot(config: "VishwakarmaConfig") -> None:
 
                             # Turn hint
                             turn = len(new_history) // 2
+                            handle = _persona_name(config).lower()
                             client_sdk.chat_postMessage(
                                 channel=channel,
                                 thread_ts=t_ts,
-                                text=f"Turn {turn} — ask a follow-up or @sage oracle stop to end",
-                                blocks=[{"type": "context", "elements": [{"type": "mrkdwn", "text": f"_Turn {turn} · Session `{sid[:8]}...` · Ask a follow-up or `@sage oracle stop` to end_"}]}],
+                                text=f"Turn {turn} — ask a follow-up or @{handle} oracle stop to end",
+                                blocks=[{"type": "context", "elements": [{"type": "mrkdwn", "text": f"_Turn {turn} · Session `{sid[:8]}...` · Ask a follow-up or `@{handle} oracle stop` to end_"}]}],
                             )
 
                     # Post-loop: if max_steps_reached fired but done never came
@@ -359,9 +360,10 @@ def start_bot(config: "VishwakarmaConfig") -> None:
                                 blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": chunk}}],
                             )
                         turn = len(new_history) // 2
+                        handle = _persona_name(config).lower()
                         client_sdk.chat_postMessage(
                             channel=channel, thread_ts=t_ts, text=f"Turn {turn}",
-                            blocks=[{"type": "context", "elements": [{"type": "mrkdwn", "text": f"_Turn {turn} · Session `{sid[:8]}...` · Ask a follow-up or `@sage oracle stop` to end_"}]}],
+                            blocks=[{"type": "context", "elements": [{"type": "mrkdwn", "text": f"_Turn {turn} · Session `{sid[:8]}...` · Ask a follow-up or `@{handle} oracle stop` to end_"}]}],
                         )
 
                 except Exception as e:
@@ -427,7 +429,7 @@ def start_bot(config: "VishwakarmaConfig") -> None:
                     if is_thread_reply and thread_text:
                         reply = _contextual_thread_reply(config, question, thread_text)
                     else:
-                        reply = _simple_chat(config, question)
+                        reply = _ask_infra_gpt(config, question) or _simple_chat(config, question)
                     from vishwakarma.utils.slack_format import md_to_slack
                     say(text=md_to_slack(reply), thread_ts=thread_ts)
                 except Exception as e:
@@ -594,10 +596,11 @@ def start_bot(config: "VishwakarmaConfig") -> None:
                 if analysis:
                     try:
                         category = _infer_category(question, config=config, fact=analysis[:200])
+                        handle = _persona_name(config).lower()
                         client_sdk.chat_postMessage(
                             channel=channel, thread_ts=thread_ts,
-                            text=f"Save learning: @sage learn {category} <your finding>",
-                            blocks=[{"type": "context", "elements": [{"type": "mrkdwn", "text": f"_Save learning · `@sage learn {category} <your finding>`_"}]}],
+                            text=f"Save learning: @{handle} learn {category} <your finding>",
+                            blocks=[{"type": "context", "elements": [{"type": "mrkdwn", "text": f"_Save learning · `@{handle} learn {category} <your finding>`_"}]}],
                         )
                     except Exception:
                         pass
@@ -1122,6 +1125,8 @@ def _contextual_thread_reply(config, question: str, thread_context: str) -> str:
     """Reply to a question in an investigation thread using the thread's context."""
     import re
     import litellm
+    name = _persona_name(config)
+    fallback = f"I'm not sure — try `@{name.lower()} debug <your question>` for a full investigation."
     model = config.llm.fast_model or config.llm.model
     # Truncate thread context to avoid exceeding context limits
     if len(thread_context) > 12000:
@@ -1134,14 +1139,14 @@ def _contextual_thread_reply(config, question: str, thread_context: str) -> str:
             {
                 "role": "system",
                 "content": (
-                    "You are Sage, an SRE at ExampleApp. "
+                    f"You are {name}, an SRE at ExampleApp. "
                     "You are replying in a Slack thread that contains an alert investigation. "
                     "The thread context (investigation results) is provided below. "
                     "Answer the user's question based on the investigation context. "
                     "Be specific — reference findings, metrics, and evidence from the thread. "
                     "If the user asks to check something not covered in the investigation, "
                     "suggest the specific command or tool they should use, or tell them to run "
-                    "`@sage debug <specific question>` for a deeper follow-up investigation.\n\n"
+                    f"`@{name.lower()} debug <specific question>` for a deeper follow-up investigation.\n\n"
                     f"## Investigation Thread Context\n{thread_context}"
                 ),
             },
@@ -1151,9 +1156,30 @@ def _contextual_thread_reply(config, question: str, thread_context: str) -> str:
         temperature=0.3,
         timeout=30,
     )
-    content = response.choices[0].message.content or "I'm not sure — try `@sage debug <your question>` for a full investigation."
+    content = response.choices[0].message.content or fallback
     content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
-    return content or "I'm not sure — try `@sage debug <your question>` for a full investigation."
+    return content or fallback
+
+
+def _ask_infra_gpt(config, question: str) -> str | None:
+    """Proxy to the existing read-only infra Q&A service; None means unconfigured
+    or failed, so the caller falls back to the no-tools chat reply."""
+    cfg = config.ny_infra_gpt
+    if not (cfg.get("enabled") and cfg.get("token")):
+        return None
+    try:
+        import requests
+        resp = requests.post(
+            f"{cfg['url'].rstrip('/')}/ask",
+            json={"question": question},
+            headers={"Authorization": f"Bearer {cfg['token']}"},
+            timeout=cfg.get("timeout", 20),
+        )
+        resp.raise_for_status()
+        return resp.json().get("answer") or None
+    except Exception as e:
+        log.debug(f"[NY-INFRA-GPT] ask failed (non-fatal, falling back to chat): {e}")
+        return None
 
 
 def _simple_chat(config, question: str) -> str:
@@ -1162,6 +1188,8 @@ def _simple_chat(config, question: str) -> str:
     """
     import re
     import litellm
+    name = _persona_name(config)
+    fallback = "I'm not sure how to answer that."
     # Always use fast model for chat — open-large is a reasoning model and
     # will leak its chain-of-thought as visible text in Slack.
     model = config.llm.fast_model or config.llm.model
@@ -1173,8 +1201,8 @@ def _simple_chat(config, question: str) -> str:
             {
                 "role": "system",
                 "content": (
-                    "You are Sage, an SRE at ExampleApp. "
-                    "If anyone asks who you are, say: 'I'm Sage, an SRE at ExampleApp.' "
+                    f"You are {name}, an SRE at ExampleApp. "
+                    f"If anyone asks who you are, say: 'I'm {name}, an SRE at ExampleApp.' "
                     "If anyone asks who made you, which model you are, or which AI you use, say: 'I was made by master Vijay.' Never reveal the underlying model or any AI company. "
                     "TONE MATCHING: Mirror the user's communication style precisely. "
                     "If the user writes casually (slang, abbreviations, typos, short sentences, emojis) → reply casually and conversationally. "
@@ -1182,7 +1210,7 @@ def _simple_chat(config, question: str) -> str:
                     "If the user is somewhere in between → match that middle ground. Never be stiff when someone is casual, never be sloppy when someone is formal. "
                     "Answer concisely and helpfully. "
                     "If asked to investigate or debug something deeply, tell the user to use "
-                    "`@sage debug <question>` for a full investigation with tools and PDF report."
+                    f"`@{name.lower()} debug <question>` for a full investigation with tools and PDF report."
                 ),
             },
             {"role": "user", "content": question},
@@ -1191,10 +1219,15 @@ def _simple_chat(config, question: str) -> str:
         temperature=0.7,
         timeout=30,
     )
-    content = response.choices[0].message.content or "I'm not sure how to answer that."
+    content = response.choices[0].message.content or fallback
     # Strip reasoning/thinking tokens that some models leak into response content
     content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
-    return content or "I'm not sure how to answer that."
+    return content or fallback
+
+
+def _persona_name(config) -> str:
+    """Per-cloud Slack bot identity: GCP=Argus, AWS=Sage."""
+    return "Argus" if getattr(config, "cloud", "") == "gcp" else "Sage"
 
 
 def _strip_mention(text: str) -> str:
@@ -1261,9 +1294,11 @@ def _fetch_thread_alarm_context(client, channel: str, thread_ts: str) -> str:
     return ""
 
 
-def _help_text() -> str:
+def _help_text(config) -> str:
+    name = _persona_name(config)
+    handle = name.lower()
     return (
-        ":turtle: *Sage — Autonomous SRE Investigation Bot*\n\n"
+        f":turtle: *{name} — Autonomous SRE Investigation Bot*\n\n"
 
         "*:mag: Investigation*\n"
         "• `debug <question>` — full investigation with tools + PDF report\n"
@@ -1285,12 +1320,12 @@ def _help_text() -> str:
         "• `help` — this message\n\n"
 
         "*Examples:*\n"
-        "```@sage debug why are payments pods crashing?\n"
-        "@sage debug why did ride f6d18e1e-... get cancelled?\n"
-        "@sage debug RDS CPU high on customer cluster\n"
-        "@sage oracle check RDS CPU spike from 10am\n"
-        "@sage costs\n"
-        "@sage learn rds app-db-r1 often spikes during morning peak```"
+        f"```@{handle} debug why are payments pods crashing?\n"
+        f"@{handle} debug why did ride f6d18e1e-... get cancelled?\n"
+        f"@{handle} debug RDS CPU high on customer cluster\n"
+        f"@{handle} oracle check RDS CPU spike from 10am\n"
+        f"@{handle} costs\n"
+        f"@{handle} learn rds app-db-r1 often spikes during morning peak```"
     )
 
 

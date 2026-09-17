@@ -430,6 +430,16 @@ class VishwakarmaConfig:
             "channel": _env("VK_HANDOFF_CHANNEL", handoff_cfg.get("channel", "")),
         }
 
+        infra_gpt_cfg = raw.get("ny_infra_gpt", {})
+        self.ny_infra_gpt = {
+            "enabled": _env("NY_INFRA_GPT_ENABLED",
+                            str(infra_gpt_cfg.get("enabled", False))).lower() in ("true", "1", "yes"),
+            "url": _env("NY_INFRA_GPT_URL",
+                        infra_gpt_cfg.get("url", "http://nyinfragpt.atlas.svc.cluster.local")),
+            "token": _env("NY_INFRA_GPT_TOKEN", infra_gpt_cfg.get("token", "")) or "",
+            "timeout": float(infra_gpt_cfg.get("timeout", 20)),
+        }
+
     # ── Factory methods ────────────────────────────────────────────────────────
 
     def make_llm(self) -> VishwakarmaLLM:
