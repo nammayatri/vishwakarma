@@ -724,22 +724,20 @@ _INFRA_SIGNATURES: list[tuple[re.Pattern, str]] = [
 ]
 
 
-def _find_infra_match(lines: list[str]) -> tuple[str, str, "re.Pattern"] | None:
-    """Scans from the most recent line backwards; the first line matching a
-    known signature wins — label, line and pattern all come from that SAME
-    line, so what's reported as evidence is always what actually justified
-    the label (not just "the last line", which could be unrelated noise)."""
+def _find_infra_or_route_match(
+    lines: list[str], route_terms: list[str],
+) -> tuple[str, str | None, str, "re.Pattern | None"] | None:
+    """Recency decides, not category: a single backward pass checks BOTH
+    infra signatures and route terms per line, so a stale infra blip several
+    minutes old can't suppress a genuinely current, more relevant API
+    failure that happens to sit on a more recent line. Returns
+    (kind, label, line, pattern) — label/pattern are None for a route match."""
     for ln in reversed(lines):
         for pattern, label in _INFRA_SIGNATURES:
             if pattern.search(ln):
-                return label, ln, pattern
-    return None
-
-
-def _find_route_match(lines: list[str], route_terms: list[str]) -> str | None:
-    for ln in reversed(lines):
-        if any(re.search(rt, ln, re.I) for rt in route_terms):
-            return ln
+                return "infra", label, ln, pattern
+        if route_terms and any(re.search(rt, ln, re.I) for rt in route_terms):
+            return "route", None, ln, None
     return None
 
 
@@ -971,16 +969,14 @@ def _stage_logs_infra(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
             continue
         matched = text.splitlines()
 
-        infra_hit = _find_infra_match(matched)
-        if infra_hit:
-            label, ln, pattern = infra_hit
-            lines.append(f"{svc}: {label} — e.g. \"{_snippet(ln, pattern)}\"")
+        hit = _find_infra_or_route_match(matched, route_terms)
+        if hit:
+            kind, label, ln, pattern = hit
+            if kind == "infra":
+                lines.append(f"{svc}: {label} — e.g. \"{_snippet(ln, pattern)}\"")
+            else:
+                lines.append(f"{svc}: API failure — e.g. \"{_snippet(ln)}\"")
             continue
-        if route_terms:
-            route_ln = _find_route_match(matched, route_terms)
-            if route_ln:
-                lines.append(f"{svc}: API failure — e.g. \"{_snippet(route_ln)}\"")
-                continue
         # Matched the retrieval grep (so there WAS something error-shaped)
         # but nothing classified — deliberately not reported; a raw
         # unclassified dump is exactly the noise this stage should avoid.
@@ -1294,7 +1290,7 @@ _ALERT_ROUTES: list[tuple[re.Pattern, list[str]]] = [
                 r"CustomerDrainerNotProcessing|DriverDrainerNotProcessing)", re.I), ["Drainer"]),
     (re.compile(r"(RideToSearchRatioDown|LowCityRides)", re.I), ["Istio mesh", "Release Monitoring", "Logs & Infra"]),
     (re.compile(r"^Node[A-Z]", re.I), []),
-    (re.compile(r"GCP ELB 5xx Alert", re.I), ["Istio mesh", "GCP LB 5xx", "Logs & Infra"]),
+    (re.compile(r"GCP ELB 5xx Alert", re.I), ["Istio mesh", "Release Monitoring", "GCP LB 5xx", "Logs & Infra"]),
     (re.compile(r"GCPRedis|Redis\s*High\s*(Network Out|Memory|CPU)", re.I), ["GCP Redis", "Redis Hotspot", "Logs & Infra"]),
     (re.compile(r"Alloy\s?DB.*CPU", re.I), ["GCP AlloyDB", "Logs & Infra"]),
     (re.compile(r"Clickhouse disk usage", re.I), ["ClickHouse"]),

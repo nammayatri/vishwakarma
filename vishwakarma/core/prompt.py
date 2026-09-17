@@ -128,14 +128,13 @@ Every claim must link to the tool output it came from. A claim you cannot link, 
 ## Code Fix
 <If the root cause is in application code (a bug — bad query/missing ON CONFLICT,
 unhandled case, wrong constraint, regression from a deploy, etc.):
-You MUST attempt the actual fix, not just describe it. After locating the code
-with code_search/code_semantic_search/stacktrace_to_source on the repo:
-  1. `code_session_start(repo=backend, mode=edit)`
-  2. `code_session_send` — instruct the coding agent to make the precise change.
-  3. `propose_fix(...)` — generate a DRAFT PR (or a scored propose-only diff).
-Then put the PR link / diff here. "Recommending a fix in prose is NOT enough —
-open the code_session and call propose_fix." If it is NOT a code bug (infra/
-config/data), write "N/A — not a code fix" and say what to change instead.>
+Locate the exact code with code_search/code_semantic_search/stacktrace_to_source
+on the repo, and state precisely here: the file, the function, and the change
+needed. Do NOT open a code_session or call propose_fix as part of a routine
+investigation — a draft PR is only opened when a human explicitly asks for one
+(e.g. "propose a fix for this" in a follow-up), never automatically. If it is
+NOT a code bug (infra/config/data), write "N/A — not a code fix" and say what
+to change instead.>
 
 ## Prevention
 <what change prevents recurrence>
