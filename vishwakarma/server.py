@@ -493,13 +493,11 @@ def create_app(config=None) -> FastAPI:
         except Exception:
             raise HTTPException(400, "Invalid JSON")
 
-        if isinstance(payload, dict) and payload.get("eventType") == "APP_MENTIONED":
-            # TEMP DIAGNOSTIC (remove once parse_xyne_mention_event's field
-            # mapping is confirmed against enough real traffic): full body
-            # logged only for this event type — internal engineer mention
-            # text, not customer PII like the other eventTypes hitting this
-            # endpoint carry.
+        event_type = payload.get("eventType") if isinstance(payload, dict) else None
+        if event_type == "APP_MENTIONED":
             log.warning(f"Xyne APP_MENTIONED raw payload: {payload!r}")
+        elif event_type != "ADDITIONAL_FORM_FIELD_UPDATED":
+            log.warning(f"Xyne unhandled eventType={event_type!r} payload={str(payload)[:3000]}")
 
         from vishwakarma.bot.xyne import parse_xyne_mention_event
         event = parse_xyne_mention_event(payload) if isinstance(payload, dict) else {}
@@ -508,6 +506,8 @@ def create_app(config=None) -> FastAPI:
         # run off the event loop so a slow classification can't block it.
         loop = asyncio.get_event_loop()
         action = await loop.run_in_executor(None, xyne_bot.handle_message, event)
+        if event_type == "APP_MENTIONED":
+            log.info(f"Xyne mention handled: action={action} channel={event.get('channel')} user={event.get('user')} text={(event.get('text') or '')[:80]!r}")
         return {"status": action}
 
     # ── /api/model ────────────────────────────────────────────────────────────
@@ -878,6 +878,10 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
             try:
                 dest = _make_destination(config, issue.labels)
                 slack_client = dest._get_client()
+                if (config.xyne_mirror_alerts and not report_channel
+                        and not issue.labels.get("platform")):
+                    from vishwakarma.plugins.relays.xyne.plugin import build_alert_mirror
+                    slack_client = build_alert_mirror(config, slack_client)
                 if report_channel:
                     slack_channel_id = report_channel        # already a channel id from the event
                 else:
@@ -1502,6 +1506,13 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
                 channel=slack_channel_id or None,   # report channel for Argus issues
             )
             slack_ts = resp.get("ts")
+            if hasattr(slack_client, "post_investigation"):
+                try:
+                    slack_client.post_investigation(
+                        ack_ts, title=issue.title, analysis=analysis, source=issue.source,
+                        severity=issue.severity, incident_id=incident_id, pdf_path=pdf_path)
+                except Exception as e:
+                    log.warning(f"Xyne RCA mirror failed (non-fatal): {e}")
             # If a draft PR was opened during the fix step, surface it
             # prominently in the thread (the RCA PDF is already attached above).
             # The streamed path leaves result.tool_outputs empty, so also look in
@@ -1514,7 +1525,7 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
                     pr_url = _m.group(0)
             if pr_url and (slack_ts or ack_ts):
                 try:
-                    dest._get_client().chat_postMessage(
+                    slack_client.chat_postMessage(
                         channel=resp.get("channel") or slack_channel_id,
                         thread_ts=slack_ts or ack_ts,
                         text=f":memo: I opened a *draft PR* with the fix: {pr_url}",
@@ -1603,6 +1614,15 @@ async def _synthesize_and_post_cross_cloud(config, issue, base_incident_id: str)
                 channel=channel,
             )
             slack_ts = resp.get("ts")
+            if (config.xyne_mirror_alerts and not channel
+                    and not issue.labels.get("platform")):
+                from vishwakarma.plugins.relays.xyne.plugin import build_alert_mirror
+                mirror = build_alert_mirror(config, dest._get_client())
+                if hasattr(mirror, "post_investigation"):
+                    mirror.post_investigation(
+                        None, title=f"{issue.title} (cross-cloud)", analysis=unified,
+                        source=issue.source, severity=issue.severity,
+                        pdf_path=pdf_path, incident_id=base_incident_id)
         except Exception as e:
             log.warning(f"Cross-cloud RCA post failed (dest={issue.labels.get('platform') or 'slack'}): {e}")
 

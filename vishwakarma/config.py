@@ -308,6 +308,8 @@ class VishwakarmaConfig:
         self.xyne_mre_group_id: str = _env("XYNE_MRE_GROUP_ID", xyne.get("mre_group_id", "")) or ""
         self.xyne_signing_secret: str = _env("XYNE_SIGNING_SECRET", xyne.get("signing_secret", "")) or ""
         self.xyne_webhook_token: str = _env("XYNE_WEBHOOK_TOKEN", xyne.get("webhook_token", "")) or ""
+        self.xyne_alert_channel: str = _env("XYNE_ALERT_CHANNEL", xyne.get("alert_channel", "")) or ""
+        self.xyne_mirror_alerts: bool = (_env("XYNE_MIRROR_ALERTS", str(xyne.get("mirror_alerts", True))) or "true").lower() != "false"
 
         # Embeddings provider (semantic RAG). Unset = keyword-only matching.
         emb = raw.get("embeddings", {})

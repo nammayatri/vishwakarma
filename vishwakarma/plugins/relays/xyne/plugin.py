@@ -28,12 +28,35 @@ real API (2026-08-11):
     whole conversation still threads together correctly from that point on.
 """
 import logging
+import re
 
 import requests
 
 from vishwakarma.plugins.relays.slack.plugin import SlackDestination
 
 log = logging.getLogger(__name__)
+
+
+_EMOJI = {
+    "rotating_light": "🚨", "page_facing_up": "📄", "thread": "🧵",
+    "hourglass_flowing_sand": "⏳", "hourglass": "⌛", "mag": "🔍",
+    "white_check_mark": "✅", "memo": "📝", "warning": "⚠️", "wave": "👋",
+    "brain": "🧠", "gear": "⚙️", "chart_with_upwards_trend": "📈",
+    "x": "❌", "red_circle": "🔴", "large_green_circle": "🟢",
+    "large_yellow_circle": "🟡", "bar_chart": "📊", "rocket": "🚀",
+    "mega": "📣", "bulb": "💡", "bug": "🐛", "fire": "🔥",
+}
+
+
+def _emojify(value):
+    if isinstance(value, str):
+        return re.sub(r":([a-z0-9_+-]+):", lambda m: _EMOJI.get(m.group(1), m.group(0)), value)
+    if isinstance(value, list):
+        return [_emojify(v) for v in value]
+    if isinstance(value, dict):
+        return {k: (v if k in ("action_id", "block_id", "type", "value") else _emojify(v))
+                for k, v in value.items()}
+    return value
 
 
 class XyneApiError(Exception):
@@ -58,6 +81,8 @@ class XyneWebClient:
             self._session.headers.update({"Authorization": f"Bearer {token}"})
 
     def _post(self, method: str, body: dict) -> dict:
+        if method in ("chat.postMessage", "chat.update"):
+            body = _emojify(body)
         r = self._session.post(f"{self._base_url}/{method}", json=body, timeout=15)
         r.raise_for_status()  # transport-level failures still raise
         data = r.json() if r.content else {}
@@ -101,6 +126,26 @@ class XyneWebClient:
         data = self._post("chat.update", body)
         return {"ok": True, "ts": data.get("ts", ts), "channel": data.get("channel") or channel}
 
+    def files_upload_v2(self, channel, content: bytes, filename: str, title: str = "",
+                         thread_ts: str | None = None, initial_comment: str = "", **_ignored) -> dict:
+        slot = self._post("files.getUploadURLExternal", {"filename": filename, "length": len(content)})
+        up = self._session.post(slot["upload_url"], data=content, timeout=60,
+                                headers={"Content-Type": "application/pdf" if filename.lower().endswith(".pdf") else "application/octet-stream"})
+        up.raise_for_status()
+        body: dict = {"files": [{"id": slot["file_id"], "title": title or filename}],
+                      "channel_id": channel}
+        if thread_ts:
+            body["thread_ts"] = thread_ts
+        if initial_comment:
+            body["initial_comment"] = _emojify(initial_comment)
+        try:
+            return self._post("files.completeUploadExternal", body)
+        except XyneApiError as e:
+            if thread_ts and str(e) == "thread_not_found":
+                body.pop("thread_ts", None)
+                return self._post("files.completeUploadExternal", body)
+            raise
+
     def auth_test(self) -> dict:
         """Confirmed live — returns {"ok", "user_id", "bot_id", "user", "team", ...},
         same shape as Slack's auth.test. Used to self-discover our bot's own
@@ -132,9 +177,9 @@ class XyneDestination(SlackDestination):
     """
     Reuses SlackDestination's entire post_investigation flow (thread-vs-new-message
     decision, text chunking, feedback buttons) — only the transport differs:
-    XyneWebClient instead of the real Slack SDK, and PDF upload is skipped
-    (no known Xyne equivalent to files_upload_v2) — always falls back to
-    posting the RCA as chunked text.
+    XyneWebClient instead of the real Slack SDK. PDFs go through Xyne's
+    files.getUploadURLExternal/completeUploadExternal flow, falling back to
+    chunked text if the upload fails.
 
     Config:
       base_url: https://spaces.xyne.juspay.net
@@ -159,5 +204,93 @@ class XyneDestination(SlackDestination):
         # no known channel-list-lookup equivalent to resolve names against.
         return channel
 
-    def _upload_pdf(self, client, channel, thread_ts, pdf_path, title, initial_comment) -> bool:
-        return False
+
+
+_channel_cache: dict[str, str] = {}
+
+
+def resolve_xyne_channel(client: XyneWebClient, channel: str) -> str:
+    if not channel:
+        return ""
+    name = channel.lstrip("#")
+    if name in _channel_cache:
+        return _channel_cache[name]
+    try:
+        data = client._post("conversations.list", {"limit": 1000})
+    except Exception as e:
+        log.warning(f"Xyne channel lookup failed for '{channel}': {e}")
+        return channel if not channel.startswith("#") else ""
+    for c in data.get("channels", []):
+        if c.get("name") == name:
+            _channel_cache[name] = c["id"]
+            return c["id"]
+        if c.get("id") == channel:
+            return channel
+    log.warning(f"Xyne channel '{channel}' not found")
+    return ""
+
+
+class MirroredClient:
+    def __init__(self, primary, xyne_client: XyneWebClient, xyne_channel: str):
+        self._primary = primary
+        self._xyne = xyne_client
+        self._xyne_channel = xyne_channel
+        self._ts: dict[str, str] = {}
+
+    def __getattr__(self, name):
+        return getattr(self._primary, name)
+
+    def xyne_ts(self, primary_ts):
+        return self._ts.get(primary_ts) if primary_ts else None
+
+    def chat_postMessage(self, **kwargs):
+        resp = self._primary.chat_postMessage(**kwargs)
+        try:
+            thread = kwargs.get("thread_ts")
+            xr = self._xyne.chat_postMessage(
+                channel=self._xyne_channel,
+                text=kwargs.get("text", ""),
+                thread_ts=self._ts.get(thread) if thread else None,
+                blocks=kwargs.get("blocks"),
+                attachments=kwargs.get("attachments"),
+            )
+            if xr.get("ts"):
+                self._ts[resp["ts"]] = xr["ts"]
+        except Exception as e:
+            log.warning(f"Xyne mirror post failed (non-fatal): {e}")
+        return resp
+
+    def chat_update(self, **kwargs):
+        resp = self._primary.chat_update(**kwargs)
+        try:
+            xts = self._ts.get(kwargs.get("ts"))
+            if xts:
+                self._xyne.chat_update(
+                    channel=self._xyne_channel, ts=xts,
+                    text=kwargs.get("text", ""), blocks=kwargs.get("blocks"),
+                )
+        except Exception as e:
+            log.warning(f"Xyne mirror update failed (non-fatal): {e}")
+        return resp
+
+    def post_investigation(self, primary_thread_ts, **kwargs):
+        dest = XyneDestination({"base_url": self._xyne._base_url, "token": ""})
+        dest._client = self._xyne
+        return dest.post_investigation(
+            channel=self._xyne_channel,
+            thread_ts=self.xyne_ts(primary_thread_ts),
+            **kwargs,
+        )
+
+
+def build_alert_mirror(config, primary_client):
+    if not (config.xyne_base_url and config.xyne_bot_token):
+        return primary_client
+    import os
+    xc = XyneWebClient(config.xyne_base_url, config.xyne_bot_token)
+    channel = resolve_xyne_channel(
+        xc, config.xyne_alert_channel or os.environ.get("SLACK_CHANNEL", ""))
+    if not channel:
+        log.warning("Xyne alert mirror disabled — no Xyne channel resolved")
+        return primary_client
+    return MirroredClient(primary_client, xc, channel)
