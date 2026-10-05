@@ -234,6 +234,15 @@ def _stage_business_impact(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
 
 # ── Stage 1 — Istio mesh ────────────────────────────────────────────────────
 
+def _istio_scope(ctx: dict) -> str:
+    common = 'destination_service_name!="istio-telemetry", reporter="destination"'
+    known_service = ctx.get("known_service", "")
+    if known_service:
+        return f'{common}, destination_service_name="{known_service}"'
+    namespace_exclude = _sanitize(ctx.get("namespace_exclude", ""))
+    return f'{common}, destination_workload_namespace!="{namespace_exclude}"'
+
+
 def _stage_istio(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
     """Real panels: '5xx - Service Wise' + '4xx - Service Wise' (service
     ranking) and '5xx - Pod Wise'. response_code="0" (Istio's code for
@@ -333,6 +342,65 @@ def _stage_istio(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
         elevated_services = elevated_services[:top_n]
 
     return findings, {"services": services, "elevated_services": elevated_services}
+
+
+# ── Stage 1b — 0DC pod remediation (suggest only; a human approves) ──────────
+
+def _stage_zero_dc_remediation(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
+    settings = ctx.get("_remediation")
+    if settings is None or not settings.enabled:
+        return "", {}
+
+    scope = _istio_scope(ctx)
+    pod_label = _sanitize(settings.pod_label) or "pod"
+    q_dc = (
+        f'sum(increase(istio_requests_total{{{scope}, response_code="0", response_flags="DC"}}[5m])) '
+        f'by (destination_service_name, destination_workload_namespace, {pod_label})'
+    )
+    q_all = (
+        f'sum(increase(istio_requests_total{{{scope}}}[5m])) '
+        f'by (destination_service_name, {pod_label})'
+    )
+    queries = [q_dc, q_all]
+
+    offenders: dict[str, dict] = {}
+    for labels, val in _query(prom, q_dc):
+        svc, pod = labels.get("destination_service_name"), labels.get(pod_label)
+        if not (svc and pod) or val < settings.min_requests:
+            continue
+        entry = offenders.setdefault(svc, {"namespace": labels.get("destination_workload_namespace", ""), "pods": {}})
+        entry["pods"][pod] = entry["pods"].get(pod, 0.0) + val
+
+    if not offenders:
+        return "", {}
+
+    if len(offenders) > 1:
+        names = ", ".join(sorted(offenders))
+        return (f"0DC from {len(offenders)} services ({names}) — not isolated to one service, "
+                f"no pod action suggested"), {}
+
+    svc, entry = next(iter(offenders.items()))
+    bad = entry["pods"]
+    total_pods = len({l.get(pod_label) for l, v in _query(prom, q_all)
+                      if l.get("destination_service_name") == svc and l.get(pod_label)} | set(bad))
+    summary = ", ".join(f"{p} ({int(v)}x/5m)" for p, v in sorted(bad.items(), key=lambda kv: -kv[1]))
+    head = f"{svc} — 0DC on {len(bad)}/{total_pods} pods"
+
+    if len(bad) > settings.max_pods:
+        return f"{head}: {summary} — too many pods to suggest a restart, investigate", {}
+    if len(bad) >= total_pods:
+        return f"{head}: {summary} — every pod is affected, deleting won't help, no action suggested", {}
+
+    proposed = []
+    for pod, val in bad.items():
+        action = ctx["_propose"](
+            namespace=entry["namespace"], service=svc, pod=pod, queries_ran=queries,
+            evidence=f"`{svc}` — 0DC on {len(bad)} of {total_pods} pods; `{pod}` had {int(val)} 0DC in 5m.",
+        )
+        if action:
+            proposed.append(action)
+    suffix = f" — restart suggested for {len(proposed)} pod(s), awaiting approval" if proposed else ""
+    return f"{head}: {summary}{suffix}", {}
 
 
 # ── Stage 2 — Release Monitoring ────────────────────────────────────────────
@@ -1268,6 +1336,7 @@ def _format_stage_findings(stage_name: str, findings: str) -> str:
 _STAGE_FNS: dict[str, Callable] = {
     "Business Impact": _stage_business_impact,
     "Istio mesh": _stage_istio,
+    "0DC Remediation": _stage_zero_dc_remediation,
     "Release Monitoring": _stage_release_monitoring,
     "DB/Redis": _stage_db_redis,
     "Pod CPU/Mem": _stage_pod_resources,
@@ -1284,6 +1353,8 @@ _STAGE_FNS: dict[str, Callable] = {
 _DEFAULT_ROUTE: list[str] = ["Istio mesh", "Release Monitoring", "DB/Redis", "Pod CPU/Mem", "Logs & Infra"]
 
 _ALERT_ROUTES: list[tuple[re.Pattern, list[str]]] = [
+    (re.compile(r"0\s?DC|ZeroDC", re.I),
+     ["Istio mesh", "0DC Remediation", "Release Monitoring", "DB/Redis", "Pod CPU/Mem", "Logs & Infra"]),
     (re.compile(r"DriverAllocatorLooksDead", re.I), ["Scheduler"]),
     (re.compile(r"(NoDriverDrainerRunning|NoRiderDrainerRunning|NoDriverDrainerPodRunning|"
                 r"NoCustomerDrainerPodRunning|DriverDrainerLagIncreasing|CustomerDrainerLagIncreasing|"
@@ -1343,7 +1414,8 @@ def _resolve_service_hints(title: str, service_hints: dict[str, list[dict]]) -> 
 
 def _run_triage_stages(prom, grafana, bash_tool, es_tool, llm, issue, on_stage_ready: Callable[[str, str], None],
                         top_n: int, namespace_exclude: str, business_impact_cities: dict[str, str],
-                        service_hints: dict[str, list[dict]], redis_instances: dict[str, dict]) -> str:
+                        service_hints: dict[str, list[dict]], redis_instances: dict[str, dict],
+                        remediation=None, proposal_context: dict | None = None) -> str:
     labels = issue.labels or {}
     ctx = {
         "known_service": _sanitize(labels.get("service") or labels.get("job") or ""),
@@ -1359,7 +1431,21 @@ def _run_triage_stages(prom, grafana, bash_tool, es_tool, llm, issue, on_stage_r
         "service_hints": _resolve_service_hints(issue.title, service_hints or {}),
         "redis_instances": redis_instances or {},
         "gcp_resource_instance_id": _sanitize(labels.get("instance_id") or ""),
+        "_remediation": remediation,
     }
+
+    def _propose(**kw):
+        from vishwakarma.core.remediation import propose
+        try:
+            action = propose(remediation, alert_title=issue.title, **(proposal_context or {}), **kw)
+            if action and remediation.on_proposal:
+                remediation.on_proposal(action)
+            return action
+        except Exception as e:
+            log.warning(f"Remediation proposal failed (non-fatal): {e}")
+            return None
+
+    ctx["_propose"] = _propose
     # Business Impact always runs first, ahead of the alert-specific route —
     # it's independent of which category (Istio/DB-Redis/GCP-Redis/AlloyDB/
     # default) matched, so it isn't gated by `_route_for_alert` like the rest.
@@ -1382,6 +1468,8 @@ def run_fast_triage_staged(
     business_impact_cities: dict[str, str] | None = None,
     service_hints: dict[str, list[dict]] | None = None,
     redis_instances: dict[str, dict] | None = None,
+    remediation=None,
+    proposal_context: dict | None = None,
 ) -> str:
     """
     Runs whichever stages `_route_for_alert(issue.title)` picks for this
@@ -1430,7 +1518,8 @@ def run_fast_triage_staged(
 
     pool = ThreadPoolExecutor(max_workers=1)
     future = pool.submit(_run_triage_stages, prom, grafana, bash_tool, es_tool, llm, issue, on_stage_ready, top_n,
-                          namespace_exclude, business_impact_cities or {}, service_hints or {}, redis_instances or {})
+                          namespace_exclude, business_impact_cities or {}, service_hints or {}, redis_instances or {},
+                          remediation, proposal_context)
     try:
         return future.result(timeout=timeout_seconds)
     except FuturesTimeoutError:

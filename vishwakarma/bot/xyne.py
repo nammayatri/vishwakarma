@@ -99,6 +99,7 @@ def parse_xyne_mention_event(payload: dict) -> dict:
         "ts": inner.get("messageId", ""),
         "thread_ts": inner.get("conversationId", ""),
         "user": inner.get("userId", ""),
+        "sender_name": inner.get("senderName", ""),
     }
 
 

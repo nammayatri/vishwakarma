@@ -201,6 +201,35 @@ CREATE TABLE IF NOT EXISTS audit_log (
     detail      TEXT                     -- JSON
 );
 
+CREATE TABLE IF NOT EXISTS remediation_actions (
+    id            TEXT PRIMARY KEY,
+    incident_id   TEXT,
+    alert_title   TEXT,
+    platform      TEXT,
+    channel       TEXT,
+    thread_ts     TEXT,
+    message_ts    TEXT,
+    mirror_channel    TEXT,
+    mirror_thread_ts  TEXT,
+    mirror_message_ts TEXT,
+    namespace     TEXT NOT NULL,
+    service       TEXT,
+    pod           TEXT NOT NULL,
+    command       TEXT NOT NULL,
+    queries_ran   TEXT,
+    evidence      TEXT,
+    is_approved   INTEGER,
+    status        TEXT NOT NULL,
+    approved_by   TEXT,
+    approved_via  TEXT,
+    approved_at   REAL,
+    executed_at   REAL,
+    output        TEXT,
+    created_at    REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_remediation_status ON remediation_actions(status);
+CREATE INDEX IF NOT EXISTS idx_remediation_thread ON remediation_actions(channel, thread_ts);
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts);
 CREATE INDEX IF NOT EXISTS idx_embeddings_kind ON embeddings_json(kind);
 CREATE INDEX IF NOT EXISTS idx_runbooks_status ON runbooks(status);

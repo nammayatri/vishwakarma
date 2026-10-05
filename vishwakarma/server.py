@@ -502,6 +502,24 @@ def create_app(config=None) -> FastAPI:
         from vishwakarma.bot.xyne import parse_xyne_mention_event
         event = parse_xyne_mention_event(payload) if isinstance(payload, dict) else {}
 
+        if event_type == "APP_MENTIONED" and event.get("text"):
+            from vishwakarma.core import remediation as rem
+            import re as _re
+            reply = _re.sub(r"<@[^>]+>", " ", event["text"]).strip()
+            if rem.is_yes(reply) or rem.is_no(reply):
+                pending = rem.find_pending_for_xyne(event.get("channel", ""), config.remediation_ttl_seconds)
+                if pending:
+                    approver = event.get("sender_name") or event.get("user") or "unknown"
+                    result = await asyncio.get_event_loop().run_in_executor(
+                        None, lambda: rem.decide(
+                            rem.settings_from_config(config), pending["id"], approved=rem.is_yes(reply),
+                            approver=approver, approver_ids=[event.get("user", "")], via="xyne"))
+                    if result["status"] in rem.FINAL_STATUSES:
+                        rem.mirror_outcome_to_xyne(config, result["action"], result["text"])
+                        rem.update_primary_slack(config, result["action"], result["text"])
+                    log.info(f"[REMEDIATE] {pending['id']} -> {result['status']} by {approver} via xyne reply")
+                    return {"status": result["status"]}
+
         # handle_message can call classify() (an LLM call) synchronously —
         # run off the event loop so a slow classification can't block it.
         loop = asyncio.get_event_loop()
@@ -509,6 +527,51 @@ def create_app(config=None) -> FastAPI:
         if event_type == "APP_MENTIONED":
             log.info(f"Xyne mention handled: action={action} channel={event.get('channel')} user={event.get('user')} text={(event.get('text') or '')[:80]!r}")
         return {"status": action}
+
+    @app.post("/api/xyne/interactions")
+    async def xyne_interactions(request: Request, auth_token: str | None = None):
+        import hmac
+
+        raw_body = await request.body()
+        sig_ok = False
+        if config.xyne_signing_secret:
+            from vishwakarma.plugins.relays.xyne.plugin import verify_xyne_signature
+            sig_ok = verify_xyne_signature(
+                config.xyne_signing_secret, raw_body, request.headers.get("x-xyne-signature", ""))
+        elif config.xyne_webhook_token:
+            sig_ok = hmac.compare_digest(auth_token or "", config.xyne_webhook_token)
+        hdrs = {k: v for k, v in request.headers.items()
+                if k.lower() not in ("authorization", "cookie", "x-xyne-signature")}
+        log.warning(f"Xyne interaction sig_ok={sig_ok} ctype={request.headers.get('content-type')} "
+                    f"headers={hdrs} body={raw_body[:3000]!r}")
+        if not sig_ok:
+            return {"status": "received"}
+
+        from urllib.parse import parse_qs
+        try:
+            body_text = raw_body.decode("utf-8", "replace")
+            if body_text.startswith("payload="):
+                body_text = parse_qs(body_text)["payload"][0]
+            payload = json.loads(body_text)
+        except Exception:
+            return {"status": "received"}
+        if not isinstance(payload, dict):
+            return {"status": "received"}
+
+        from vishwakarma.core import remediation as rem
+        click = rem.extract_click(payload)
+        if not click or click[0] not in (rem.APPROVE_ACTION_ID, rem.REJECT_ACTION_ID):
+            return {"status": "received"}
+        action_id_name, value, uid, uname = click
+        result = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: rem.decide(
+                rem.settings_from_config(config), value, approved=action_id_name == rem.APPROVE_ACTION_ID,
+                approver=uname or uid or "unknown", approver_ids=[uid, uname], via="xyne"))
+        if result["status"] in rem.FINAL_STATUSES:
+            rem.mirror_outcome_to_xyne(config, result["action"], result["text"])
+            rem.update_primary_slack(config, result["action"], result["text"])
+        log.info(f"[REMEDIATE] {value} -> {result['status']} by {uname or uid} via xyne click")
+        return {"status": result["status"]}
 
     # ── /api/model ────────────────────────────────────────────────────────────
 
@@ -963,11 +1026,43 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
             # window (config.fast_triage_evidence_wait_seconds), so they can
             # seed the deep investigation without the investigation start
             # itself being able to hang on a slow/stuck triage run.
+            from vishwakarma.core.remediation import (
+                proposal_blocks, proposal_text, settings_from_config)
+            from vishwakarma.storage.remediation import set_message_refs
+
+            remediation = settings_from_config(config)
+
+            def _on_proposal(action: dict) -> None:
+                if not (slack_client and slack_channel_id and ack_ts):
+                    return
+                try:
+                    resp = slack_client.chat_postMessage(
+                        channel=slack_channel_id, thread_ts=ack_ts,
+                        text=proposal_text(action), blocks=proposal_blocks(action),
+                    )
+                    xyne_ts = getattr(slack_client, "xyne_ts", None)
+                    set_message_refs(
+                        action["id"], message_ts=resp["ts"],
+                        mirror_channel=getattr(slack_client, "_xyne_channel", "") if xyne_ts else "",
+                        mirror_thread_ts=(xyne_ts(ack_ts) or "") if xyne_ts else "",
+                        mirror_message_ts=(xyne_ts(resp["ts"]) or "") if xyne_ts else "",
+                    )
+                except Exception as e:
+                    log.warning(f"Remediation proposal post failed (non-fatal): {e}")
+
+            remediation.on_proposal = _on_proposal
+            proposal_context = {
+                "incident_id": incident_id,
+                "platform": issue.labels.get("platform") or "slack",
+                "channel": slack_channel_id or "",
+                "thread_ts": ack_ts or "",
+            }
             triage_future = loop.run_in_executor(
                 None, run_fast_triage_staged, issue, tm, llm, _post_triage_stage,
                 config.fast_triage_timeout_seconds, config.fast_triage_top_n,
                 config.fast_triage_namespace_exclude, config.fast_triage_business_impact_cities,
                 config.fast_triage_service_hints, config.fast_triage_redis_instances,
+                remediation, proposal_context,
             )
 
         # Only the expensive agentic-loop section below is concurrency-gated —

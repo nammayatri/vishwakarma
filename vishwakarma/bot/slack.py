@@ -982,6 +982,48 @@ def start_bot(config: "VishwakarmaConfig") -> None:
         except Exception as e:
             log.error(f"[FEEDBACK] vk_rca_wrong_submit failed: {e}", exc_info=True)
 
+    # ── Remediation approvals (0DC pod restart) ───────────────────────────────
+
+    def _handle_remediation(body, client, approved: bool) -> None:
+        from vishwakarma.core import remediation as rem
+
+        action_id = body["actions"][0]["value"]
+        user_id = body.get("user", {}).get("id", "unknown")
+        name, ids = user_id, [user_id]
+        try:
+            info = client.users_info(user=user_id)["user"]
+            name = info.get("real_name") or info.get("name") or user_id
+            ids += [info.get("name", ""), (info.get("profile") or {}).get("email", "")]
+        except Exception as e:
+            log.debug(f"[REMEDIATE] users_info failed: {e}")
+
+        result = rem.decide(rem.settings_from_config(config), action_id, approved=approved,
+                            approver=name, approver_ids=ids, via="slack")
+        channel_id = body["channel"]["id"]
+        if result["status"] not in rem.FINAL_STATUSES:
+            try:
+                client.chat_postEphemeral(channel=channel_id, user=user_id, text=result["text"])
+            except Exception:
+                pass
+            return
+        try:
+            client.chat_update(channel=channel_id, ts=body["message"]["ts"],
+                               text=result["text"], blocks=rem.outcome_blocks(result["text"]))
+        except Exception as e:
+            log.warning(f"[REMEDIATE] message update failed: {e}")
+        rem.mirror_outcome_to_xyne(config, result["action"], result["text"])
+        log.info(f"[REMEDIATE] {action_id} -> {result['status']} by {name} via slack")
+
+    @app.action("vk_remediate_approve")
+    def handle_remediate_approve(ack, body, client):
+        ack()
+        _handle_remediation(body, client, True)
+
+    @app.action("vk_remediate_reject")
+    def handle_remediate_reject(ack, body, client):
+        ack()
+        _handle_remediation(body, client, False)
+
     # ── Start ─────────────────────────────────────────────────────────────────
 
     def _start():

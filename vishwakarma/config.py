@@ -360,6 +360,16 @@ class VishwakarmaConfig:
             _env("VK_FAST_TRIAGE_EVIDENCE_WAIT", str(ft.get("evidence_wait_seconds", 90)))
         )
 
+        rem = raw.get("remediation", {})
+        self.remediation_enabled: bool = str(_env("VK_REMEDIATION_ENABLED", str(rem.get("enabled", True)))).lower() == "true"
+        self.remediation_allowed_namespaces: list[str] = list(rem.get("allowed_namespaces", ["atlas"]) or ["atlas"])
+        self.remediation_max_pods: int = int(rem.get("max_pods", 3))
+        self.remediation_min_requests: float = float(rem.get("min_requests", 5))
+        self.remediation_ttl_seconds: int = int(rem.get("ttl_seconds", 900))
+        self.remediation_approvers: list[str] = [str(a) for a in (rem.get("approvers") or [])]
+        self.remediation_pod_label: str = str(rem.get("pod_label", "pod"))
+        self.remediation_kubectl_bin: str = str(rem.get("kubectl_bin", "kubectl"))
+
         # GCP Cloud Monitoring webhook — receives Cloud Monitoring incident
         # notifications and triggers the same investigation flow as
         # /api/alertmanager. GCP doesn't support IP-allowlisting webhooks, so
