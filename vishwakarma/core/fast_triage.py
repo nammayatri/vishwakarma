@@ -363,28 +363,54 @@ def _stage_zero_dc_remediation(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
     )
     queries = [q_dc, q_all]
 
-    offenders: dict[str, dict] = {}
+    all_pods: dict[str, set[str]] = {}
+    for labels, _v in _query(prom, q_all):
+        svc, pod = labels.get("destination_service_name"), labels.get(pod_label)
+        if svc and pod:
+            all_pods.setdefault(svc, set()).add(pod)
+
+    dc: dict[str, dict[str, float]] = {}
+    namespaces: dict[str, str] = {}
     for labels, val in _query(prom, q_dc):
         svc, pod = labels.get("destination_service_name"), labels.get(pod_label)
-        if not (svc and pod) or val < settings.min_requests:
+        if not (svc and pod):
             continue
-        entry = offenders.setdefault(svc, {"namespace": labels.get("destination_workload_namespace", ""), "pods": {}})
-        entry["pods"][pod] = entry["pods"].get(pod, 0.0) + val
+        dc.setdefault(svc, {})[pod] = dc.get(svc, {}).get(pod, 0.0) + val
+        namespaces[svc] = labels.get("destination_workload_namespace", "")
+        all_pods.setdefault(svc, set()).add(pod)
+
+    offenders: dict[str, dict[str, float]] = {}
+    spread: list[str] = []
+    for svc, pods in dc.items():
+        per_pod = {p: pods.get(p, 0.0) for p in all_pods[svc]}
+        bad: dict[str, float] = {}
+        for pod, val in pods.items():
+            others = sorted(v for p, v in per_pod.items() if p != pod)
+            median_others = others[len(others) // 2] if others else 0.0
+            if val >= max(settings.min_requests, settings.outlier_factor * median_others):
+                bad[pod] = val
+        if bad:
+            offenders[svc] = bad
+        else:
+            typical = sorted(per_pod.values())[len(per_pod) // 2]
+            if typical >= settings.min_requests:
+                spread.append(svc)
 
     if not offenders:
+        if spread:
+            return (f"0DC is spread evenly across the pods of {', '.join(sorted(spread))} "
+                    f"(no single outlier pod) — no pod action suggested"), {}
         return "", {}
 
     if len(offenders) > 1:
         names = ", ".join(sorted(offenders))
-        return (f"0DC from {len(offenders)} services ({names}) — not isolated to one service, "
+        return (f"0DC outlier pods in {len(offenders)} services ({names}) — not isolated to one service, "
                 f"no pod action suggested"), {}
 
-    svc, entry = next(iter(offenders.items()))
-    bad = entry["pods"]
-    total_pods = len({l.get(pod_label) for l, v in _query(prom, q_all)
-                      if l.get("destination_service_name") == svc and l.get(pod_label)} | set(bad))
+    svc, bad = next(iter(offenders.items()))
+    total_pods = len(all_pods[svc])
     summary = ", ".join(f"{p} ({int(v)}x/5m)" for p, v in sorted(bad.items(), key=lambda kv: -kv[1]))
-    head = f"{svc} — 0DC on {len(bad)}/{total_pods} pods"
+    head = f"{svc} — 0DC concentrated on {len(bad)}/{total_pods} pods"
 
     if len(bad) > settings.max_pods:
         return f"{head}: {summary} — too many pods to suggest a restart, investigate", {}
@@ -394,8 +420,9 @@ def _stage_zero_dc_remediation(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
     proposed = []
     for pod, val in bad.items():
         action = ctx["_propose"](
-            namespace=entry["namespace"], service=svc, pod=pod, queries_ran=queries,
-            evidence=f"`{svc}` — 0DC on {len(bad)} of {total_pods} pods; `{pod}` had {int(val)} 0DC in 5m.",
+            namespace=namespaces[svc], service=svc, pod=pod, queries_ran=queries,
+            evidence=f"`{svc}` — 0DC concentrated on {len(bad)} of {total_pods} pods; "
+                     f"`{pod}` had {int(val)} 0DC in 5m (other pods ~background noise).",
         )
         if action:
             proposed.append(action)

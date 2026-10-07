@@ -362,13 +362,15 @@ class VishwakarmaConfig:
 
         rem = raw.get("remediation", {})
         self.remediation_enabled: bool = str(_env("VK_REMEDIATION_ENABLED", str(rem.get("enabled", True)))).lower() == "true"
-        self.remediation_allowed_namespaces: list[str] = list(rem.get("allowed_namespaces", ["atlas"]) or ["atlas"])
-        self.remediation_max_pods: int = int(rem.get("max_pods", 3))
-        self.remediation_min_requests: float = float(rem.get("min_requests", 5))
-        self.remediation_ttl_seconds: int = int(rem.get("ttl_seconds", 900))
-        self.remediation_approvers: list[str] = [str(a) for a in (rem.get("approvers") or [])]
-        self.remediation_pod_label: str = str(rem.get("pod_label", "pod"))
-        self.remediation_kubectl_bin: str = str(rem.get("kubectl_bin", "kubectl"))
+        self.remediation_allowed_namespaces: list[str] = _csv(
+            _env("VK_REMEDIATION_ALLOWED_NAMESPACES", None), rem.get("allowed_namespaces") or ["atlas"])
+        self.remediation_max_pods: int = int(_env("VK_REMEDIATION_MAX_PODS", rem.get("max_pods", 3)))
+        self.remediation_min_requests: float = float(_env("VK_REMEDIATION_MIN_REQUESTS", rem.get("min_requests", 50)))
+        self.remediation_outlier_factor: float = float(_env("VK_REMEDIATION_OUTLIER_FACTOR", rem.get("outlier_factor", 10)))
+        self.remediation_ttl_seconds: int = int(_env("VK_REMEDIATION_TTL_SECONDS", rem.get("ttl_seconds", 900)))
+        self.remediation_approvers: list[str] = _csv(_env("VK_REMEDIATION_APPROVERS", None), rem.get("approvers") or [])
+        self.remediation_pod_label: str = str(_env("VK_REMEDIATION_POD_LABEL", rem.get("pod_label", "pod")))
+        self.remediation_kubectl_bin: str = str(_env("VK_REMEDIATION_KUBECTL_BIN", rem.get("kubectl_bin", "kubectl")))
 
         # GCP Cloud Monitoring webhook — receives Cloud Monitoring incident
         # notifications and triggers the same investigation flow as
@@ -570,6 +572,12 @@ def _env(key: str, fallback: Any = None) -> Any:
     """Return env var if set, else fallback."""
     val = os.environ.get(key)
     return val if val is not None else fallback
+
+
+def _csv(env_val: str | None, fallback: list) -> list[str]:
+    if env_val is None:
+        return [str(x) for x in fallback]
+    return [x.strip() for x in env_val.split(",") if x.strip()]
 
 
 def _split_keys(val: str) -> list[str]:

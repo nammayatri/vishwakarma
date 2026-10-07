@@ -154,31 +154,86 @@ def _run_stage(prom, settings=None):
 
 def test_stage_one_bad_pod_of_four_proposes_delete():
     allp = [(_m("beckn-offer", f"beckn-offer-p{i}"), 100) for i in range(4)]
-    text, proposed = _run_stage(FakeProm([(_m("beckn-offer", "beckn-offer-p0"), 40)], allp))
+    text, proposed = _run_stage(FakeProm([(_m("beckn-offer", "beckn-offer-p0"), 400)], allp))
     assert len(proposed) == 1 and proposed[0]["pod"] == "beckn-offer-p0" and proposed[0]["namespace"] == "atlas"
     assert "1/4 pods" in text and len(proposed[0]["queries_ran"]) == 2
 
 
-def test_stage_two_services_no_proposal():
-    dc = [(_m("a", "a-1"), 40), (_m("b", "b-1"), 40)]
-    text, proposed = _run_stage(FakeProm(dc, dc))
+def test_stage_real_incident_ambient_noise_elsewhere_still_proposes_the_one_outlier():
+    offer = [f"beckn-driver-offer-bpp-production-c9e91bv1-566d45f4db-p{i}" for i in range(24)]
+    lts = [f"beckn-location-tracking-service-production-3a96c8-p{i}" for i in range(8)]
+    allp = [(_m("beckn-driver-offer-bpp-production", p), 3000) for p in offer] + \
+           [(_m("beckn-location-tracking-service-production", p), 3000) for p in lts]
+    dc = [(_m("beckn-driver-offer-bpp-production", offer[0]), 2371)] + \
+         [(_m("beckn-driver-offer-bpp-production", p), 8) for p in offer[1:]] + \
+         [(_m("beckn-location-tracking-service-production", p), 8) for p in lts]
+    text, proposed = _run_stage(FakeProm(dc, allp))
+    assert len(proposed) == 1
+    assert proposed[0]["pod"] == offer[0] and proposed[0]["service"] == "beckn-driver-offer-bpp-production"
+    assert "1/24 pods" in text and "not isolated" not in text
+
+
+def test_stage_ambient_noise_only_is_silent():
+    pods = [f"a-{i}" for i in range(10)]
+    allp = [(_m("a", p), 100) for p in pods]
+    assert _run_stage(FakeProm([(_m("a", p), 8) for p in pods], allp)) == ("", [])
+
+
+def test_stage_two_services_with_outliers_no_proposal():
+    allp = [(_m(s, f"{s}-{i}"), 100) for s in ("a", "b") for i in range(4)]
+    dc = [(_m("a", "a-0"), 600), (_m("b", "b-0"), 600)]
+    text, proposed = _run_stage(FakeProm(dc, allp))
     assert proposed == [] and "not isolated" in text
 
 
+def test_stage_fleet_wide_spread_is_not_an_outlier():
+    pods = [f"a-{i}" for i in range(6)]
+    allp = [(_m("a", p), 1000) for p in pods]
+    text, proposed = _run_stage(FakeProm([(_m("a", p), 500) for p in pods], allp))
+    assert proposed == [] and "spread evenly" in text
+
+
 def test_stage_all_pods_bad_no_proposal():
-    pods = [(_m("a", f"a-{i}"), 40) for i in range(2)]
-    text, proposed = _run_stage(FakeProm(pods, pods))
+    allp = [(_m("a", "a-0"), 100)]
+    text, proposed = _run_stage(FakeProm([(_m("a", "a-0"), 400)], allp))
     assert proposed == [] and "every pod" in text
 
 
 def test_stage_too_many_bad_pods_no_proposal():
-    allp = [(_m("a", f"a-{i}"), 100) for i in range(8)]
-    dc = [(_m("a", f"a-{i}"), 40) for i in range(4)]
+    allp = [(_m("a", f"a-{i}"), 100) for i in range(12)]
+    dc = [(_m("a", f"a-{i}"), 400) for i in range(4)]
     text, proposed = _run_stage(FakeProm(dc, allp), _settings(max_pods=3))
     assert proposed == [] and "too many" in text
 
 
-def test_stage_below_threshold_and_disabled_are_silent():
+def test_stage_below_floor_and_disabled_are_silent():
     allp = [(_m("a", f"a-{i}"), 100) for i in range(4)]
-    assert _run_stage(FakeProm([(_m("a", "a-0"), 2)], allp)) == ("", [])
-    assert _run_stage(FakeProm([(_m("a", "a-0"), 40)], allp), rem.RemediationSettings(enabled=False)) == ("", [])
+    assert _run_stage(FakeProm([(_m("a", "a-0"), 20)], allp)) == ("", [])
+    assert _run_stage(FakeProm([(_m("a", "a-0"), 400)], allp), rem.RemediationSettings(enabled=False)) == ("", [])
+
+
+def test_config_defaults_yaml_and_env_override(monkeypatch):
+    pytest.importorskip("litellm")
+    from vishwakarma.config import VishwakarmaConfig
+    for k in list(__import__("os").environ):
+        if k.startswith("VK_REMEDIATION_"):
+            monkeypatch.delenv(k)
+    c = VishwakarmaConfig({})
+    assert (c.remediation_enabled, c.remediation_min_requests, c.remediation_outlier_factor) == (True, 50.0, 10.0)
+    assert c.remediation_allowed_namespaces == ["atlas"] and c.remediation_max_pods == 3
+
+    c = VishwakarmaConfig({"remediation": {"min_requests": 80, "outlier_factor": 5, "allowed_namespaces": ["atlas", "x"]}})
+    assert (c.remediation_min_requests, c.remediation_outlier_factor) == (80.0, 5.0)
+    assert c.remediation_allowed_namespaces == ["atlas", "x"]
+
+    monkeypatch.setenv("VK_REMEDIATION_MIN_REQUESTS", "120")
+    monkeypatch.setenv("VK_REMEDIATION_OUTLIER_FACTOR", "20")
+    monkeypatch.setenv("VK_REMEDIATION_ALLOWED_NAMESPACES", "atlas, prod2")
+    monkeypatch.setenv("VK_REMEDIATION_APPROVERS", "U1,a@b.in")
+    monkeypatch.setenv("VK_REMEDIATION_ENABLED", "false")
+    c = VishwakarmaConfig({"remediation": {"min_requests": 80}})
+    assert (c.remediation_min_requests, c.remediation_outlier_factor) == (120.0, 20.0)
+    assert c.remediation_allowed_namespaces == ["atlas", "prod2"] and c.remediation_approvers == ["U1", "a@b.in"]
+    assert c.remediation_enabled is False
+    s = rem.settings_from_config(c)
+    assert s.min_requests == 120.0 and s.outlier_factor == 20.0 and s.enabled is False

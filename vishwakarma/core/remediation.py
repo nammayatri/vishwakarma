@@ -23,7 +23,8 @@ class RemediationSettings:
     enabled: bool = True
     allowed_namespaces: list[str] = field(default_factory=lambda: ["atlas"])
     max_pods: int = 3
-    min_requests: float = 5.0
+    min_requests: float = 50.0
+    outlier_factor: float = 10.0
     ttl_seconds: int = 900
     approvers: list[str] = field(default_factory=list)
     pod_label: str = "pod"
@@ -37,6 +38,7 @@ def settings_from_config(config) -> RemediationSettings:
         allowed_namespaces=config.remediation_allowed_namespaces,
         max_pods=config.remediation_max_pods,
         min_requests=config.remediation_min_requests,
+        outlier_factor=config.remediation_outlier_factor,
         ttl_seconds=config.remediation_ttl_seconds,
         approvers=config.remediation_approvers,
         pod_label=config.remediation_pod_label,
