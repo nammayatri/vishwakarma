@@ -405,6 +405,156 @@ def test_drainer_unauthorized_touches_nothing():
     assert out["status"] == "unauthorized" and r.calls == [] and r.kv == {"DRIVER_DRAINER_STOP": "true"}
 
 
+def _xyne_plugin():
+    from vishwakarma.plugins.relays.xyne import plugin
+    return plugin
+
+
+def test_proposal_blocks_become_a_flow_card_with_submit_buttons():
+    a = _propose()
+    flow = _xyne_plugin().blocks_to_flow(rem.proposal_blocks(a, "notice here"))
+    assert flow["version"] == "2.0" and "state" in flow and flow["screenId"] == "argus-remediation"
+    kinds = [c["type"] for c in flow["components"]]
+    assert kinds == ["text", "text", "row"]
+    buttons = flow["components"][-1]["children"]
+    assert [b["props"]["action"]["actionId"] for b in buttons] == [
+        f"{rem.APPROVE_ACTION_ID}:{a['id']}", f"{rem.REJECT_ACTION_ID}:{a['id']}"]
+    assert all(b["props"]["action"]["type"] == "submit" for b in buttons)
+    assert [b["props"]["variant"] for b in buttons] == ["primary", "destructive"]
+    assert "notice here" in flow["components"][1]["props"]["content"]
+
+
+def test_only_remediation_buttons_become_flows():
+    p = _xyne_plugin()
+    assert p.blocks_to_flow(None) is None and p.blocks_to_flow([]) is None
+    assert p.blocks_to_flow(rem.outcome_blocks("done")) is None
+    rca = [{"type": "actions", "elements": [{"type": "button", "action_id": "vk_rca_correct", "value": "x",
+                                              "text": {"type": "plain_text", "text": "ok"}}]}]
+    assert p.blocks_to_flow(rca) is None
+
+
+def test_xyne_client_sends_flow_not_blocks_and_keeps_action_ids_intact():
+    p = _xyne_plugin()
+    sent = []
+
+    class Sess:
+        headers = {}
+
+        def post(self, url, json=None, timeout=None):
+            sent.append((url, json))
+
+            class R:
+                content = b"1"
+                def raise_for_status(self): pass
+                def json(self_inner): return {"ok": True, "ts": "T1", "channel": "C"}
+            return R()
+
+    c = p.XyneWebClient("https://x/api/apps/slack", "tok")
+    c._session = Sess()
+    a = _propose()
+    c.chat_postMessage(channel="C", thread_ts="R", text=":wrench: hi", blocks=rem.proposal_blocks(a))
+    url, body = sent[-1]
+    assert url.endswith("/chat.postMessage") and "blocks" not in body and body["thread_ts"] == "R"
+    assert body["flow"]["components"][-1]["children"][0]["props"]["action"]["actionId"] == f"{rem.APPROVE_ACTION_ID}:{a['id']}"
+    assert body["text"].startswith("🔧")
+    c.chat_update(channel="C", ts="T1", text="done", flow=p.text_flow("*Executed* by A"))
+    assert sent[-1][1]["flow"]["components"][0]["props"]["content"] == "**Executed** by A"
+    c.chat_postMessage(channel="C", text="plain", blocks=rem.outcome_blocks("x"))
+    assert "flow" not in sent[-1][1] and "blocks" in sent[-1][1]
+
+
+def test_xyne_get_user_returns_name_and_email():
+    p = _xyne_plugin()
+
+    class Sess:
+        headers = {}
+
+        def post(self, url, json=None, timeout=None):
+            class R:
+                content = b"1"
+                def raise_for_status(self): pass
+                def json(self_inner):
+                    if json["user"] == "u1":
+                        return {"ok": True, "user": {"real_name": "Alice A", "profile": {"email": "alice@x.in"}}}
+                    return {"ok": False, "error": "user_not_found"}
+            return R()
+
+    c = p.XyneWebClient("https://x/api/apps/slack", "tok")
+    c._session = Sess()
+    assert c.get_user("u1") == ("Alice A", "alice@x.in")
+    assert c.get_user("nope") == ("", "") and c.get_user("") == ("", "")
+
+
+def _cfg(**kw):
+    import types
+    base = dict(remediation_enabled=True, remediation_allowed_namespaces=["atlas"], remediation_max_pods=3,
+                remediation_min_requests=50.0, remediation_outlier_factor=10.0, remediation_ttl_seconds=900,
+                remediation_approver_emails=[ALICE], remediation_pod_label="pod", remediation_kubectl_bin="kubectl",
+                remediation_redis_cli_bin="redis-cli", remediation_drainer_redis_host="redis.internal",
+                remediation_drainer_redis_port=6379, remediation_drainer_redis_cluster=True,
+                xyne_base_url="", xyne_bot_token="", slack_bot_token="")
+    base.update(kw)
+    return types.SimpleNamespace(**base)
+
+
+def _click(verb, rid, user="u-alice"):
+    return {"actionId": f"{verb}:{rid}", "type": "submit", "values": {},
+            "context": {"messageId": "m", "conversationId": "c", "userId": user}}
+
+
+def _lookup(uid):
+    return {"u-alice": ("Alice A", ALICE), "u-mallory": ("Mallory", "m@x.in"), "u-ghost": ("Ghost", "")}.get(uid, ("", ""))
+
+
+def test_flow_click_by_authorized_user_runs_the_pod_delete_and_acks():
+    a, r = _propose(), Runner()
+    resp = rem.handle_flow_action(_cfg(), _click(rem.APPROVE_ACTION_ID, a["id"]), _lookup, runner=r)
+    assert resp["type"] == "ack" and "Executed" in resp["message"]
+    assert r.calls[-1] == ["kubectl", "delete", "pod", "beckn-offer-abc12-xyz", "-n", "atlas"]
+    row = store.get_action(a["id"])
+    assert row["approved_via"] == "xyne" and row["approved_by"] == f"Alice A <{ALICE}>" and row["is_approved"] == 1
+
+
+def test_flow_click_by_unlisted_user_is_an_error_and_runs_nothing():
+    a, r = _propose(), Runner()
+    resp = rem.handle_flow_action(_cfg(), _click(rem.APPROVE_ACTION_ID, a["id"], "u-mallory"), _lookup, runner=r)
+    assert resp["type"] == "error" and "don't have access" in resp["message"] and "m@x.in" in resp["message"]
+    assert r.calls == [] and store.get_action(a["id"])["status"] == "pending"
+    ghost = rem.handle_flow_action(_cfg(), _click(rem.APPROVE_ACTION_ID, a["id"], "u-ghost"), _lookup, runner=r)
+    unknown = rem.handle_flow_action(_cfg(), _click(rem.APPROVE_ACTION_ID, a["id"], "u-nobody"), _lookup, runner=r)
+    assert ghost["type"] == unknown["type"] == "error" and r.calls == []
+
+
+def test_flow_click_reject_by_authorized_user_acks_without_running():
+    a, r = _propose(), Runner()
+    resp = rem.handle_flow_action(_cfg(), _click(rem.REJECT_ACTION_ID, a["id"]), _lookup, runner=r)
+    assert resp["type"] == "ack" and "Rejected" in resp["message"] and r.calls == []
+    assert store.get_action(a["id"])["is_approved"] == 0
+
+
+def test_flow_click_drainer_resume_and_unknown_actions():
+    d, rs = _drainer(), RedisSim()
+    resp = rem.handle_flow_action(_cfg(), _click(rem.APPROVE_ACTION_ID, d["id"]), _lookup, runner=rs)
+    assert resp["type"] == "ack" and rs.kv == {"DRIVER_FORCE_DRAIN": "true"}
+    assert rem.handle_flow_action(_cfg(), {"actionId": "something_else:1", "context": {}}, _lookup) is None
+    assert rem.handle_flow_action(_cfg(), {"actionId": rem.APPROVE_ACTION_ID, "context": {}}, _lookup) is None
+    again = rem.handle_flow_action(_cfg(), _click(rem.APPROVE_ACTION_ID, d["id"]), _lookup, runner=rs)
+    assert again["type"] == "error" or "Already handled" in again["message"] or again["type"] == "ack"
+    assert sum(1 for c in rs.calls if "SET" in c) == 1
+
+
+def test_flow_click_with_remediation_disabled_does_nothing():
+    a, r = _propose(), Runner()
+    resp = rem.handle_flow_action(_cfg(remediation_enabled=False), _click(rem.APPROVE_ACTION_ID, a["id"]), _lookup, runner=r)
+    assert resp["type"] == "error" and r.calls == []
+
+
+def test_xyne_target_prefers_mirror_then_xyne_origin():
+    assert rem._xyne_target({"mirror_channel": "mc", "mirror_message_ts": "mt", "platform": "slack"}) == ("mc", "mt")
+    assert rem._xyne_target({"platform": "xyne", "channel": "c", "message_ts": "t"}) == ("c", "t")
+    assert rem._xyne_target({"platform": "slack", "channel": "c", "message_ts": "t"}) is None and rem._xyne_target(None) is None
+
+
 def test_drainer_routes_and_side_detection():
     from vishwakarma.core.fast_triage import _drainer_sides_from_title
     assert "Drainer Remediation" in _route_for_alert("[CRITICAL] NoRiderDrainerRunning in GCP")

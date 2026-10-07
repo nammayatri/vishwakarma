@@ -45,7 +45,12 @@ _EMOJI = {
     "x": "❌", "red_circle": "🔴", "large_green_circle": "🟢",
     "large_yellow_circle": "🟡", "bar_chart": "📊", "rocket": "🚀",
     "mega": "📣", "bulb": "💡", "bug": "🐛", "fire": "🔥",
+    "wrench": "🔧", "test_tube": "🧪", "no_entry": "⛔", "no_entry_sign": "🚫",
+    "information_source": "ℹ️", "lock": "🔒", "pushpin": "📌", "eyes": "👀",
 }
+
+
+_NO_EMOJIFY_KEYS = ("action_id", "block_id", "type", "value", "actionId", "id", "screenId", "version", "variant")
 
 
 def _emojify(value):
@@ -54,9 +59,56 @@ def _emojify(value):
     if isinstance(value, list):
         return [_emojify(v) for v in value]
     if isinstance(value, dict):
-        return {k: (v if k in ("action_id", "block_id", "type", "value") else _emojify(v))
-                for k, v in value.items()}
+        return {k: (v if k in _NO_EMOJIFY_KEYS else _emojify(v)) for k, v in value.items()}
     return value
+
+
+_FLOW_STATE = {"values": {}, "touched": {}, "errors": {}, "submitting": False, "submitted": False,
+               "history": [], "loadingComponentIds": []}
+_FLOW_ACTION_PREFIX = "vk_remediate_"
+
+
+def _flow_md(text: str) -> str:
+    return re.sub(r"(?<![\w*])\*([^*\n]+)\*(?![\w*])", r"**\1**", text or "")
+
+
+def text_flow(text: str, screen_id: str = "argus-outcome") -> dict:
+    return {"version": "2.0", "screenId": screen_id,
+            "components": [{"id": "t0", "type": "text", "props": {"content": _flow_md(text)}}],
+            "state": {**_FLOW_STATE}}
+
+
+def blocks_to_flow(blocks: list | None) -> dict | None:
+    """Slack-style blocks carrying our remediation Approve/Reject buttons become a Xyne Flow UI v2 card
+    whose buttons submit `<action_id>:<remediation id>` to the app webhook. Any other blocks are left
+    for the Slack-compat layer."""
+    def is_ours(b):
+        return b.get("type") == "actions" and any(
+            str(e.get("action_id", "")).startswith(_FLOW_ACTION_PREFIX) for e in b.get("elements", []))
+
+    if not blocks or not any(is_ours(b) for b in blocks):
+        return None
+    components = []
+    for i, b in enumerate(blocks):
+        kind = b.get("type")
+        if kind == "section":
+            components.append({"id": f"t{i}", "type": "text",
+                               "props": {"content": _flow_md((b.get("text") or {}).get("text", ""))}})
+        elif kind == "context":
+            text = " ".join((e.get("text") or "") for e in b.get("elements", []))
+            components.append({"id": f"t{i}", "type": "text", "props": {"content": _flow_md(text)}})
+        elif is_ours(b):
+            children = []
+            for j, e in enumerate(b["elements"]):
+                destructive = e.get("style") == "danger"
+                children.append({
+                    "id": f"btn{i}_{j}", "type": "button",
+                    "props": {"label": (e.get("text") or {}).get("text", "OK"),
+                              "variant": "destructive" if destructive else "primary",
+                              "action": {"type": "submit", "actionId": f"{e['action_id']}:{e.get('value', '')}"}}})
+            components.append({"id": f"row{i}", "type": "row", "style": {"gap": "8px"}, "children": children})
+    return {"version": "2.0", "screenId": "argus-remediation", "components": components,
+            "state": {**_FLOW_STATE}}
 
 
 class XyneApiError(Exception):
@@ -94,11 +146,14 @@ class XyneWebClient:
 
     def chat_postMessage(self, channel, text: str = "", thread_ts: str | None = None,
                           blocks: list | None = None, attachments: list | None = None,
-                          **_ignored) -> dict:
+                          flow: dict | None = None, **_ignored) -> dict:
         body: dict = {"channel": channel, "text": text}
         if thread_ts:
             body["thread_ts"] = thread_ts
-        if blocks:
+        flow = flow or blocks_to_flow(blocks)
+        if flow:
+            body["flow"] = flow
+        elif blocks:
             body["blocks"] = blocks
         if attachments:
             body["attachments"] = attachments
@@ -119,12 +174,26 @@ class XyneWebClient:
         return {"ok": True, "ts": data.get("ts", ""), "channel": data.get("channel") or channel}
 
     def chat_update(self, channel, ts, text: str = "", blocks: list | None = None,
-                     **_ignored) -> dict:
+                     flow: dict | None = None, **_ignored) -> dict:
         body: dict = {"channel": channel, "ts": ts, "text": text}
-        if blocks:
+        flow = flow or blocks_to_flow(blocks)
+        if flow:
+            body["flow"] = flow
+        elif blocks:
             body["blocks"] = blocks
         data = self._post("chat.update", body)
         return {"ok": True, "ts": data.get("ts", ts), "channel": data.get("channel") or channel}
+
+    def get_user(self, user_id: str) -> tuple[str, str]:
+        if not user_id:
+            return "", ""
+        try:
+            u = self._post("users.info", {"user": user_id}).get("user") or {}
+        except Exception as e:
+            log.warning(f"Xyne users.info failed for {user_id!r}: {e}")
+            return "", ""
+        profile = u.get("profile") or {}
+        return (u.get("real_name") or u.get("name") or profile.get("display_name") or ""), (profile.get("email") or "")
 
     def files_upload_v2(self, channel, content: bytes, filename: str, title: str = "",
                          thread_ts: str | None = None, initial_comment: str = "", **_ignored) -> dict:

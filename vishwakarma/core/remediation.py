@@ -192,7 +192,7 @@ def result_text(action: dict, status: str, approver: str, output: str = "") -> s
     return f":information_source: Already handled ({status}): {cmd}"
 
 
-def _run(argv: list[str], timeout: int = 45) -> tuple[int, str]:
+def _run(argv: list[str], timeout: int = 12) -> tuple[int, str]:
     try:
         r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, shell=False)
         return r.returncode, ((r.stdout or "") + (r.stderr or "")).strip()
@@ -201,7 +201,7 @@ def _run(argv: list[str], timeout: int = 45) -> tuple[int, str]:
 
 
 def _run_read(argv: list[str]) -> tuple[int, str]:
-    return _run(argv, timeout=15)
+    return _run(argv, timeout=10)
 
 
 def _authorized(settings: RemediationSettings, email: str) -> bool:
@@ -321,17 +321,24 @@ def outcome_blocks(text: str) -> list[dict]:
     return [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]
 
 
+def _xyne_target(action: dict | None) -> tuple[str, str] | None:
+    if not action:
+        return None
+    if action.get("mirror_channel") and action.get("mirror_message_ts"):
+        return action["mirror_channel"], action["mirror_message_ts"]
+    if action.get("platform") == "xyne" and action.get("channel") and action.get("message_ts"):
+        return action["channel"], action["message_ts"]
+    return None
+
+
 def mirror_outcome_to_xyne(config, action: dict | None, text: str) -> None:
-    if not (action and action.get("mirror_channel") and action.get("mirror_message_ts")):
-        return
-    if not (config.xyne_base_url and config.xyne_bot_token):
+    target = _xyne_target(action)
+    if not target or not (config.xyne_base_url and config.xyne_bot_token):
         return
     try:
-        from vishwakarma.plugins.relays.xyne.plugin import XyneWebClient
+        from vishwakarma.plugins.relays.xyne.plugin import XyneWebClient, text_flow
         XyneWebClient(config.xyne_base_url, config.xyne_bot_token).chat_update(
-            channel=action["mirror_channel"], ts=action["mirror_message_ts"],
-            text=text, blocks=outcome_blocks(text),
-        )
+            channel=target[0], ts=target[1], text=text, flow=text_flow(text))
     except Exception as e:
         log.warning(f"Xyne remediation outcome update failed (non-fatal): {e}")
 
@@ -353,14 +360,13 @@ def update_primary_slack(config, action: dict | None, text: str) -> None:
 
 
 def mirror_notice_to_xyne(config, action: dict | None, notice: str) -> None:
-    if not (action and action.get("mirror_channel") and action.get("mirror_message_ts")):
-        return
-    if not (config.xyne_base_url and config.xyne_bot_token):
+    target = _xyne_target(action)
+    if not target or not (config.xyne_base_url and config.xyne_bot_token):
         return
     try:
         from vishwakarma.plugins.relays.xyne.plugin import XyneWebClient
         XyneWebClient(config.xyne_base_url, config.xyne_bot_token).chat_update(
-            channel=action["mirror_channel"], ts=action["mirror_message_ts"],
+            channel=target[0], ts=target[1],
             text=f"{proposal_text(action)}\n{notice}", blocks=proposal_blocks(action, notice),
         )
     except Exception as e:
@@ -383,6 +389,37 @@ def update_primary_slack_notice(config, action: dict | None, notice: str) -> Non
 
 def find_pending_for_xyne(channel: str, ttl_seconds: int) -> dict | None:
     return store.latest_pending(channel, ttl_seconds) or store.only_pending(ttl_seconds)
+
+
+def _plain(text: str) -> str:
+    from vishwakarma.plugins.relays.xyne.plugin import _emojify
+    return _emojify(text).replace("`", "").replace("*", "")
+
+
+def flow_response(result: dict) -> dict:
+    status, text = result["status"], _plain(result["text"])
+    if status in ("executed", "rejected"):
+        return {"type": "ack", "message": text}
+    return {"type": "error", "message": text, "error": text}
+
+
+def handle_flow_action(config, payload: dict, user_lookup, runner=_run) -> dict | None:
+    verb, _, remediation_id = str(payload.get("actionId") or "").partition(":")
+    if verb not in (APPROVE_ACTION_ID, REJECT_ACTION_ID) or not remediation_id:
+        return None
+    user_id = str((payload.get("context") or {}).get("userId") or "")
+    name, email = user_lookup(user_id)
+    result = decide(settings_from_config(config), remediation_id, approved=verb == APPROVE_ACTION_ID,
+                    approver=name or user_id or "unknown", approver_email=email, via="xyne", runner=runner)
+    action = result["action"]
+    if result["status"] == "unauthorized":
+        mirror_notice_to_xyne(config, action, result["text"])
+        update_primary_slack_notice(config, action, result["text"])
+    elif result["status"] in FINAL_STATUSES:
+        mirror_outcome_to_xyne(config, action, result["text"])
+        update_primary_slack(config, action, result["text"])
+    log.info(f"[REMEDIATE] {remediation_id} -> {result['status']} by {name or user_id} <{email or 'no email'}> via xyne click")
+    return flow_response(result)
 
 
 def extract_click(payload: dict) -> tuple[str, str, str, str, str] | None:

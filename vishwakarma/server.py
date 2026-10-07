@@ -499,6 +499,23 @@ def create_app(config=None) -> FastAPI:
         elif event_type != "ADDITIONAL_FORM_FIELD_UPDATED":
             log.warning(f"Xyne unhandled eventType={event_type!r} payload={str(payload)[:3000]}")
 
+        if request.headers.get("x-xyne-event") == "flow_action" or (isinstance(payload, dict) and "actionId" in payload):
+            from vishwakarma.core import remediation as rem
+            from vishwakarma.plugins.relays.xyne.plugin import XyneWebClient
+            log.info(f"Xyne flow_action actionId={payload.get('actionId')!r} "
+                     f"user={(payload.get('context') or {}).get('userId')!r}")
+            xc = XyneWebClient(config.xyne_base_url, config.xyne_bot_token)
+            fut = asyncio.get_event_loop().run_in_executor(
+                None, lambda: rem.handle_flow_action(config, payload, xc.get_user))
+            try:
+                response = await asyncio.wait_for(asyncio.shield(fut), 24)
+            except asyncio.TimeoutError:
+                return {"type": "ack", "message": "Still running — the card will update when it finishes."}
+            if response is None:
+                log.warning(f"Xyne flow_action not recognised: {str(payload)[:500]}")
+                return {"type": "ack", "message": "No action taken."}
+            return response
+
         from vishwakarma.bot.xyne import parse_xyne_mention_event
         event = parse_xyne_mention_event(payload) if isinstance(payload, dict) else {}
 
@@ -510,10 +527,17 @@ def create_app(config=None) -> FastAPI:
                 pending = rem.find_pending_for_xyne(event.get("channel", ""), config.remediation_ttl_seconds)
                 if pending:
                     approver = event.get("sender_name") or event.get("user") or "unknown"
-                    result = await asyncio.get_event_loop().run_in_executor(
-                        None, lambda: rem.decide(
+                    def _decide_reply():
+                        email = event.get("sender_email", "")
+                        if not email:
+                            from vishwakarma.plugins.relays.xyne.plugin import XyneWebClient
+                            email = XyneWebClient(config.xyne_base_url, config.xyne_bot_token).get_user(
+                                event.get("user", ""))[1]
+                        return rem.decide(
                             rem.settings_from_config(config), pending["id"], approved=rem.is_yes(reply),
-                            approver=approver, approver_email=event.get("sender_email", ""), via="xyne"))
+                            approver=approver, approver_email=email, via="xyne")
+
+                    result = await asyncio.get_event_loop().run_in_executor(None, _decide_reply)
                     if result["status"] == "unauthorized":
                         rem.mirror_notice_to_xyne(config, result["action"], result["text"])
                         rem.update_primary_slack_notice(config, result["action"], result["text"])
