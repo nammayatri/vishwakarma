@@ -445,22 +445,69 @@ def test_xyne_client_sends_flow_not_blocks_and_keeps_action_ids_intact():
 
             class R:
                 content = b"1"
+                status_code = 201 if "/chat/" in url else 200
                 def raise_for_status(self): pass
-                def json(self_inner): return {"ok": True, "ts": "T1", "channel": "C"}
+                def json(self_inner):
+                    if "/chat/" in url:
+                        return {"eventType": "MESSAGE_POSTED", "messageId": "MID-1"}
+                    return {"ok": True, "ts": "T1", "channel": "C"}
             return R()
 
     c = p.XyneWebClient("https://x/api/apps/slack", "tok")
     c._session = Sess()
     a = _propose()
-    c.chat_postMessage(channel="C", thread_ts="R", text=":wrench: hi", blocks=rem.proposal_blocks(a))
-    url, body = sent[-1]
-    assert url.endswith("/chat.postMessage") and "blocks" not in body and body["thread_ts"] == "R"
-    assert body["flow"]["components"][-1]["children"][0]["props"]["action"]["actionId"] == f"{rem.APPROVE_ACTION_ID}:{a['id']}"
-    assert body["text"].startswith("🔧")
-    c.chat_update(channel="C", ts="T1", text="done", flow=p.text_flow("*Executed* by A"))
-    assert sent[-1][1]["flow"]["components"][0]["props"]["content"] == "**Executed** by A"
+    out = c.chat_postMessage(channel="C", thread_ts="R", text=":wrench: *hi* `x`", blocks=rem.proposal_blocks(a))
+    thread_url, thread_body = sent[0]
+    assert thread_url.endswith("/api/apps/slack/chat.postMessage") and thread_body["thread_ts"] == "R"
+    assert "flow" not in thread_body and "blocks" not in thread_body
+    assert thread_body["text"].startswith("🔧 hi x") and "card posted just below" in thread_body["text"]
+    card_url, card = sent[1]
+    assert card_url == "https://x/api/apps/chat/postMessage" and card["channelId"] == "C" and "thread_ts" not in card
+    assert card["flow"]["components"][-1]["children"][0]["props"]["action"]["actionId"] == f"{rem.APPROVE_ACTION_ID}:{a['id']}"
+    assert out["ts"] == "flow:MID-1"
+
+    c.chat_update(channel="C", ts="flow:MID-1", text="done", flow=p.text_flow("*Executed* by A"))
+    upd_url, upd = sent[-1]
+    assert upd_url == "https://x/api/apps/chat/updateMessage"
+    assert upd["messageId"] == "MID-1" and upd["channelId"] == "C"
+    assert upd["flowJSON"]["components"][0]["props"]["content"] == "*Executed* by A"
+    c.chat_update(channel="C", ts="flow:MID-1", text="x", blocks=rem.proposal_blocks(a, "denied"))
+    assert sent[-1][1]["flowJSON"]["components"][-1]["type"] == "row"
+
+    c.chat_update(channel="C", ts="T9", text="plain update")
+    assert sent[-1][0].endswith("/api/apps/slack/chat.update") and "flowJSON" not in sent[-1][1]
     c.chat_postMessage(channel="C", text="plain", blocks=rem.outcome_blocks("x"))
-    assert "flow" not in sent[-1][1] and "blocks" in sent[-1][1]
+    assert sent[-1][0].endswith("/api/apps/slack/chat.postMessage") and "blocks" in sent[-1][1] and "flow" not in sent[-1][1]
+
+
+def test_flow_text_keeps_slack_bold_and_turns_code_fences_into_inline_code():
+    p = _xyne_plugin()
+    out = p._flow_md("*Executed* by A: ```redis-cli SET X true\nredis-cli DEL Y``` done")
+    assert out == "*Executed* by A: `redis-cli SET X true`\n`redis-cli DEL Y` done"
+    assert "```" not in p.blocks_to_flow(rem.proposal_blocks(_drainer()))["components"][0]["props"]["content"]
+
+
+def test_flow_card_without_thread_posts_only_the_card():
+    p = _xyne_plugin()
+    sent = []
+
+    class Sess:
+        headers = {}
+
+        def post(self, url, json=None, timeout=None):
+            sent.append(url)
+
+            class R:
+                content = b"1"
+                status_code = 201
+                def raise_for_status(self): pass
+                def json(self_inner): return {"messageId": "M2"}
+            return R()
+
+    c = p.XyneWebClient("https://x/api/apps/slack", "tok")
+    c._session = Sess()
+    out = c.chat_postMessage(channel="C", text="t", blocks=rem.proposal_blocks(_propose()))
+    assert sent == ["https://x/api/apps/chat/postMessage"] and out["ts"] == "flow:M2"
 
 
 def test_xyne_get_user_returns_name_and_email():

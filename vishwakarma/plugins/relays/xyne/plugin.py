@@ -66,10 +66,18 @@ def _emojify(value):
 _FLOW_STATE = {"values": {}, "touched": {}, "errors": {}, "submitting": False, "submitted": False,
                "history": [], "loadingComponentIds": []}
 _FLOW_ACTION_PREFIX = "vk_remediate_"
+FLOW_TS_PREFIX = "flow:"
+
+
+def _xyne_text(text: str) -> str:
+    return _emojify(text or "").replace("```", "").replace("`", "").replace("*", "")
 
 
 def _flow_md(text: str) -> str:
-    return re.sub(r"(?<![\w*])\*([^*\n]+)\*(?![\w*])", r"**\1**", text or "")
+    def fence(m):
+        return "\n".join(f"`{ln}`" for ln in m.group(1).strip().splitlines() if ln.strip())
+
+    return re.sub(r"```(.*?)```", fence, text or "", flags=re.S)
 
 
 def text_flow(text: str, screen_id: str = "argus-outcome") -> dict:
@@ -107,8 +115,8 @@ def blocks_to_flow(blocks: list | None) -> dict | None:
                               "variant": "destructive" if destructive else "primary",
                               "action": {"type": "submit", "actionId": f"{e['action_id']}:{e.get('value', '')}"}}})
             components.append({"id": f"row{i}", "type": "row", "style": {"gap": "8px"}, "children": children})
-    return {"version": "2.0", "screenId": "argus-remediation", "components": components,
-            "state": {**_FLOW_STATE}}
+    return {"version": "2.0", "screenId": "argus-remediation", "title": "Argus — approval needed",
+            "components": components, "state": {**_FLOW_STATE}}
 
 
 class XyneApiError(Exception):
@@ -144,16 +152,32 @@ class XyneWebClient:
             raise XyneApiError(data.get("error", "unknown_error"))
         return data
 
+    def _native_base(self) -> str:
+        return self._base_url[: -len("/slack")] if self._base_url.endswith("/slack") else self._base_url
+
+    def _native_post(self, path: str, body: dict) -> dict:
+        r = self._session.post(f"{self._native_base()}/{path}", json=_emojify(body), timeout=15)
+        if r.status_code >= 300:
+            raise XyneApiError(f"{path} {r.status_code}: {r.text[:200]}")
+        return r.json() if r.content else {}
+
+    def _post_flow_card(self, channel, text: str, flow: dict, thread_ts: str | None) -> dict:
+        if thread_ts:
+            self.chat_postMessage(channel=channel, thread_ts=thread_ts,
+                                  text=f"{_xyne_text(text)}\n\n⬇️ Approve or reject with the card posted just below in the channel.")
+        data = self._native_post("chat/postMessage", {"channelId": channel, "text": _xyne_text(text)[:300], "flow": flow})
+        return {"ok": True, "ts": f"{FLOW_TS_PREFIX}{data.get('messageId', '')}", "channel": channel}
+
     def chat_postMessage(self, channel, text: str = "", thread_ts: str | None = None,
                           blocks: list | None = None, attachments: list | None = None,
                           flow: dict | None = None, **_ignored) -> dict:
+        flow = flow or blocks_to_flow(blocks)
+        if flow:
+            return self._post_flow_card(channel, text, flow, thread_ts)
         body: dict = {"channel": channel, "text": text}
         if thread_ts:
             body["thread_ts"] = thread_ts
-        flow = flow or blocks_to_flow(blocks)
-        if flow:
-            body["flow"] = flow
-        elif blocks:
+        if blocks:
             body["blocks"] = blocks
         if attachments:
             body["attachments"] = attachments
@@ -175,11 +199,14 @@ class XyneWebClient:
 
     def chat_update(self, channel, ts, text: str = "", blocks: list | None = None,
                      flow: dict | None = None, **_ignored) -> dict:
+        if str(ts).startswith(FLOW_TS_PREFIX):
+            card = flow or blocks_to_flow(blocks) or text_flow(text)
+            self._native_post("chat/updateMessage", {
+                "channelId": channel, "messageId": str(ts)[len(FLOW_TS_PREFIX):],
+                "text": _xyne_text(text)[:300], "flowJSON": card})
+            return {"ok": True, "ts": ts, "channel": channel}
         body: dict = {"channel": channel, "ts": ts, "text": text}
-        flow = flow or blocks_to_flow(blocks)
-        if flow:
-            body["flow"] = flow
-        elif blocks:
+        if blocks:
             body["blocks"] = blocks
         data = self._post("chat.update", body)
         return {"ok": True, "ts": data.get("ts", ts), "channel": data.get("channel") or channel}
