@@ -715,30 +715,35 @@ def _stage_drainer_remediation(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
     if settings is None or not settings.enabled:
         return "", {}
 
+    from vishwakarma.core.remediation import DRAINER_KEYS, read_drainer_stop_key
+
     title = ctx.get("alert_title", "")
     sides = _drainer_sides_from_title(title) or list(_DRAINER_STOP_QUERIES)
-    stop_alert = bool(re.search(r"DrainerRunning|NotProcessing", title or "", re.I))
+    read_key = ctx.get("_redis_reader") or read_drainer_stop_key
     lines = []
     for side in sides:
         promql = _DRAINER_STOP_QUERIES[side]
         rows = _query(prom, promql)
-        stopped = bool(rows and rows[0][1] > 0)
-        if not stopped:
-            if stop_alert:
-                lines.append(f"{side} drainer stop status is 0 — stop key not set, no resume needed")
-            continue
-        if not settings.drainer_redis_host:
-            lines.append(f"{side} drainer is stopped, but remediation.drainer_redis.host is not configured — "
-                         f"no resume suggested")
-            continue
-        from vishwakarma.core.remediation import DRAINER_KEYS
+        metric = f"stop_status={int(rows[0][1])}" if rows else "stop_status=n/a"
         stop_key, force_key = DRAINER_KEYS[side]
+
+        state, detail = read_key(settings, side)
+        if state == "error":
+            lines.append(f"{side} drainer: could not read `{stop_key}` from Redis ({detail}) — "
+                         f"no resume suggested [{metric}]")
+            continue
+        if state == "absent":
+            found = f"found with value `{detail}`, not `true`" if detail else "not found in Redis"
+            lines.append(f"{side} drainer: `{stop_key}` {found} — the stop key is not what's pausing it, "
+                         f"nothing to resume [{metric}]")
+            continue
+
         action = ctx["_propose_drainer"](
-            side=side, queries_ran=[promql],
-            evidence=f"`{promql}` = 1 — the {side} drainer paused itself (`{stop_key}` is set in Redis). "
+            side=side, queries_ran=[promql, f"redis GET {stop_key}"],
+            evidence=f"`{stop_key}` is set to `true` in Redis — the {side} drainer paused itself ({metric}). "
                      f"Resuming sets `{force_key}`=true and deletes `{stop_key}`.",
         )
-        lines.append(f"{side} drainer is STOPPED ({stop_key} set)"
+        lines.append(f"{side} drainer is STOPPED (`{stop_key}`=true in Redis, {metric})"
                      + (" — resume suggested, awaiting approval" if action else " — resume not suggested"))
     return "\n".join(lines), {}
 

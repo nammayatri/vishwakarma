@@ -364,6 +364,41 @@ def test_drainer_failure_midway_is_reported_not_hidden():
     assert out["status"] == "failed" and "DEL DRIVER_DRAINER_STOP failed" in store.get_action(a["id"])["output"]
 
 
+def test_drainer_moved_redirect_is_a_failure_not_a_noop():
+    a = _drainer()
+    calls = []
+
+    def moved(argv):
+        calls.append(argv)
+        return 0, "MOVED 13362 10.60.96.3:11120"
+
+    out = rem.decide(_settings(), a["id"], approved=True, approver="Alice", approver_email=ALICE, via="slack", runner=moved)
+    row = store.get_action(a["id"])
+    assert out["status"] == "failed" and "no-op" not in row["output"]
+    assert "VK_REMEDIATION_DRAINER_REDIS_CLUSTER=true" in row["output"] and len(calls) == 1
+
+
+def test_drainer_redis_error_replies_and_redirect_noise():
+    a, r = _drainer(), RedisSim()
+    real = r.__call__
+
+    def noisy(argv):
+        code, out = real(argv)
+        return code, f"-> Redirected to slot [13362] located at 10.60.96.3:11120\n{out}" if out else (code, out)[1]
+
+    out = rem.decide(_settings(), a["id"], approved=True, approver="Alice", approver_email=ALICE, via="slack", runner=noisy)
+    assert out["status"] == "executed" and r.kv == {"DRIVER_FORCE_DRAIN": "true"}
+
+    b = _drainer("rider")
+
+    def set_refused(argv):
+        verb = argv[argv.index("--no-auth-warning") + 1]
+        return (0, "true") if verb == "GET" else (0, "READONLY You can't write against a read only replica.")
+
+    out = rem.decide(_settings(), b["id"], approved=True, approver="Alice", approver_email=ALICE, via="slack", runner=set_refused)
+    assert out["status"] == "failed" and "READONLY" in store.get_action(b["id"])["output"]
+
+
 def test_drainer_unauthorized_touches_nothing():
     a, r = _drainer(), RedisSim()
     out = rem.decide(_settings(), a["id"], approved=True, approver="Mallory", approver_email="m@x.in", via="slack", runner=r)
@@ -389,13 +424,52 @@ class StopProm:
         return {"data": {"result": [] if v is None else [{"metric": {}, "value": [0, str(v)]}]}}
 
 
-def _drain_stage(prom, title, settings=None):
+def _drain_stage(prom, title, settings=None, redis=("set", "true")):
     from vishwakarma.core.fast_triage import _stage_drainer_remediation
     proposed = []
     ctx = {"_remediation": settings or _settings(), "alert_title": title,
            "_propose_drainer": lambda **kw: proposed.append(kw) or kw}
+    if redis is not None:
+        ctx["_redis_reader"] = lambda s, side: redis
     text, _ = _stage_drainer_remediation(prom, ctx, 5)
     return text, proposed
+
+
+def test_read_drainer_stop_key_states_and_cluster_flag():
+    r = RedisSim(stop="true")
+    assert rem.read_drainer_stop_key(_settings(drainer_redis_cluster=True), "driver", runner=r) == ("set", "true")
+    assert r.calls[0][:6] == ["redis-cli", "-h", "redis.internal", "-p", "6379", "-c"]
+    assert rem.read_drainer_stop_key(_settings(), "driver", runner=RedisSim(stop=None)) == ("absent", "")
+    assert rem.read_drainer_stop_key(_settings(), "driver", runner=RedisSim(stop="false")) == ("absent", "false")
+    state, detail = rem.read_drainer_stop_key(_settings(), "driver", runner=lambda argv: (0, "MOVED 1 10.0.0.1:1"))
+    assert state == "error" and "CLUSTER=true" in detail
+    assert rem.read_drainer_stop_key(_settings(drainer_redis_host=""), "driver")[0] == "error"
+    r2 = RedisSim(stop="true")
+    rem.read_drainer_stop_key(_settings(), "rider", runner=r2)
+    assert r2.calls[0][-1] == "RIDER_DRAINER_STOP" and r2.calls[0][-2] == "GET"
+
+
+def test_stage_redis_is_the_source_of_truth_key_absent_means_message_only_no_buttons():
+    text, proposed = _drain_stage(StopProm(1, 0), "NoDriverDrainerRunning", redis=("absent", ""))
+    assert proposed == []
+    assert "`DRIVER_DRAINER_STOP` not found in Redis" in text and "nothing to resume" in text
+    assert "stop_status=1" in text
+
+
+def test_stage_key_present_with_non_true_value_is_not_a_stop():
+    text, proposed = _drain_stage(StopProm(0, 0), "NoRiderDrainerRunning", redis=("absent", "false"))
+    assert proposed == [] and "found with value `false`, not `true`" in text
+
+
+def test_stage_redis_unreadable_is_reported_and_nothing_proposed():
+    text, proposed = _drain_stage(StopProm(1, 0), "NoDriverDrainerRunning", redis=("error", "MOVED 1 x:1"))
+    assert proposed == [] and "could not read `DRIVER_DRAINER_STOP` from Redis" in text
+
+
+def test_stage_key_set_proposes_even_when_metric_lags():
+    text, proposed = _drain_stage(StopProm(0, 0), "NoDriverDrainerRunning", redis=("set", "true"))
+    assert [p["side"] for p in proposed] == ["driver"] and "`DRIVER_DRAINER_STOP`=true in Redis" in text
+    assert proposed[0]["queries_ran"] == ["max(driver_drainer_stop_status)", "redis GET DRIVER_DRAINER_STOP"]
 
 
 def test_stage_driver_alert_only_resumes_the_driver_drainer_even_if_rider_also_stopped():
@@ -409,15 +483,9 @@ def test_stage_rider_alert_resumes_rider_with_the_rider_keys():
     assert "RIDER_DRAINER_STOP" in proposed[0]["evidence"] and "`FORCE_DRAIN`" in proposed[0]["evidence"]
 
 
-def test_stage_not_stopped_explains_and_proposes_nothing():
-    text, proposed = _drain_stage(StopProm(0, 0), "NoDriverDrainerRunning")
-    assert proposed == [] and "no resume needed" in text
-    assert _drain_stage(StopProm(0, 0), "NoDriverDrainerPodRunning") == ("", [])
-
-
 def test_stage_unknown_side_checks_both_and_missing_redis_config_is_explained():
     text, proposed = _drain_stage(StopProm(1, 1), "SomeDrainerAlert")
     assert sorted(p["side"] for p in proposed) == ["driver", "rider"]
-    text, proposed = _drain_stage(StopProm(1, 0), "NoDriverDrainerRunning", _settings(drainer_redis_host=""))
+    text, proposed = _drain_stage(StopProm(1, 0), "NoDriverDrainerRunning", _settings(drainer_redis_host=""), redis=None)
     assert proposed == [] and "drainer_redis.host is not configured" in text
     assert _drain_stage(StopProm(1, 0), "NoDriverDrainerRunning", rem.RemediationSettings(enabled=False)) == ("", [])

@@ -23,6 +23,7 @@ DRAINER_KEYS = {
     "rider": ("RIDER_DRAINER_STOP", "FORCE_DRAIN"),
 }
 DRAINER_NAMESPACE = "drainer-redis"
+_REDIS_ERRORS = ("MOVED", "ASK", "ERR", "(ERROR)", "CLUSTERDOWN", "NOAUTH", "WRONGPASS", "LOADING", "READONLY")
 
 
 @dataclass
@@ -191,12 +192,16 @@ def result_text(action: dict, status: str, approver: str, output: str = "") -> s
     return f":information_source: Already handled ({status}): {cmd}"
 
 
-def _run(argv: list[str]) -> tuple[int, str]:
+def _run(argv: list[str], timeout: int = 45) -> tuple[int, str]:
     try:
-        r = subprocess.run(argv, capture_output=True, text=True, timeout=45, shell=False)
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, shell=False)
         return r.returncode, ((r.stdout or "") + (r.stderr or "")).strip()
     except Exception as e:
         return 1, str(e)
+
+
+def _run_read(argv: list[str]) -> tuple[int, str]:
+    return _run(argv, timeout=15)
 
 
 def _authorized(settings: RemediationSettings, email: str) -> bool:
@@ -209,6 +214,27 @@ def _redis_argv(settings: RemediationSettings, *args: str) -> list[str]:
     if settings.drainer_redis_cluster:
         argv.append("-c")
     return argv + ["--no-auth-warning", *args]
+
+
+def _redis_call(settings: RemediationSettings, runner, *args: str) -> tuple[bool, str]:
+    code, out = runner(_redis_argv(settings, *args))
+    lines = [ln.strip() for ln in out.splitlines() if ln.strip() and not ln.startswith("-> ")]
+    value = lines[-1] if lines else ""
+    if code != 0 or value.upper().startswith(_REDIS_ERRORS):
+        hint = " — Redis is a cluster: set VK_REMEDIATION_DRAINER_REDIS_CLUSTER=true" \
+            if value.upper().startswith(("MOVED", "ASK")) else ""
+        return False, f"{value or out}{hint}"
+    return True, value
+
+
+def read_drainer_stop_key(settings: RemediationSettings, side: str, runner=_run_read) -> tuple[str, str]:
+    stop_key = DRAINER_KEYS[side][0]
+    if not settings.drainer_redis_host:
+        return "error", "remediation.drainer_redis.host is not configured"
+    ok, val = _redis_call(settings, runner, "GET", stop_key)
+    if not ok:
+        return "error", val
+    return ("set", val) if val.lower() == "true" else ("absent", val)
 
 
 def _execute_pod_delete(settings: RemediationSettings, action: dict, runner) -> tuple[bool, str]:
@@ -230,22 +256,27 @@ def _execute_drainer_resume(settings: RemediationSettings, action: dict, runner)
     if not settings.drainer_redis_host:
         return False, "drainer redis host is not configured"
     stop_key, force_key = DRAINER_KEYS[side]
-    code, out = runner(_redis_argv(settings, "GET", stop_key))
-    if code != 0:
-        return False, f"could not read {stop_key}: {out}"
-    if out.strip().lower() != "true":
+
+    def redis(*args: str) -> tuple[bool, str]:
+        return _redis_call(settings, runner, *args)
+
+    ok, stop_val = redis("GET", stop_key)
+    if not ok:
+        return False, f"could not read {stop_key}: {stop_val}"
+    if stop_val.lower() != "true":
         return True, f"no-op: {stop_key} is not set (drainer already resumed), nothing changed"
-    code, out = runner(_redis_argv(settings, "SET", force_key, "true"))
-    if code != 0:
-        return False, f"SET {force_key} true failed: {out}"
-    code, out = runner(_redis_argv(settings, "DEL", stop_key))
-    if code != 0:
-        return False, f"{force_key} was set but DEL {stop_key} failed: {out}"
-    _, stop_now = runner(_redis_argv(settings, "GET", stop_key))
-    _, force_now = runner(_redis_argv(settings, "GET", force_key))
-    ok = stop_now.strip() == "" and force_now.strip().lower() == "true"
-    return ok, f"{stop_key} deleted, {force_key}={force_now.strip() or '?'} (verified)" if ok else \
-        f"verify mismatch: {stop_key}={stop_now.strip() or '(nil)'}, {force_key}={force_now.strip() or '(nil)'}"
+    ok, res = redis("SET", force_key, "true")
+    if not ok or res != "OK":
+        return False, f"SET {force_key} true failed: {res}"
+    ok, res = redis("DEL", stop_key)
+    if not ok or not res.isdigit():
+        return False, f"{force_key} was set but DEL {stop_key} failed: {res}"
+    ok_stop, stop_now = redis("GET", stop_key)
+    ok_force, force_now = redis("GET", force_key)
+    verified = ok_stop and ok_force and stop_now == "" and force_now.lower() == "true"
+    if verified:
+        return True, f"{stop_key} deleted, {force_key}=true (verified)"
+    return False, f"verify mismatch: {stop_key}={stop_now or '(nil)'}, {force_key}={force_now or '(nil)'}"
 
 
 def decide(settings: RemediationSettings, action_id: str, *, approved: bool, approver: str,
