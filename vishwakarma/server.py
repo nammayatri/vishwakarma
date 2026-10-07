@@ -513,8 +513,11 @@ def create_app(config=None) -> FastAPI:
                     result = await asyncio.get_event_loop().run_in_executor(
                         None, lambda: rem.decide(
                             rem.settings_from_config(config), pending["id"], approved=rem.is_yes(reply),
-                            approver=approver, approver_ids=[event.get("user", "")], via="xyne"))
-                    if result["status"] in rem.FINAL_STATUSES:
+                            approver=approver, approver_email=event.get("sender_email", ""), via="xyne"))
+                    if result["status"] == "unauthorized":
+                        rem.mirror_notice_to_xyne(config, result["action"], result["text"])
+                        rem.update_primary_slack_notice(config, result["action"], result["text"])
+                    elif result["status"] in rem.FINAL_STATUSES:
                         rem.mirror_outcome_to_xyne(config, result["action"], result["text"])
                         rem.update_primary_slack(config, result["action"], result["text"])
                     log.info(f"[REMEDIATE] {pending['id']} -> {result['status']} by {approver} via xyne reply")
@@ -562,12 +565,15 @@ def create_app(config=None) -> FastAPI:
         click = rem.extract_click(payload)
         if not click or click[0] not in (rem.APPROVE_ACTION_ID, rem.REJECT_ACTION_ID):
             return {"status": "received"}
-        action_id_name, value, uid, uname = click
+        action_id_name, value, uid, uname, email = click
         result = await asyncio.get_event_loop().run_in_executor(
             None, lambda: rem.decide(
                 rem.settings_from_config(config), value, approved=action_id_name == rem.APPROVE_ACTION_ID,
-                approver=uname or uid or "unknown", approver_ids=[uid, uname], via="xyne"))
-        if result["status"] in rem.FINAL_STATUSES:
+                approver=uname or uid or "unknown", approver_email=email, via="xyne"))
+        if result["status"] == "unauthorized":
+            rem.mirror_notice_to_xyne(config, result["action"], result["text"])
+            rem.update_primary_slack_notice(config, result["action"], result["text"])
+        elif result["status"] in rem.FINAL_STATUSES:
             rem.mirror_outcome_to_xyne(config, result["action"], result["text"])
             rem.update_primary_slack(config, result["action"], result["text"])
         log.info(f"[REMEDIATE] {value} -> {result['status']} by {uname or uid} via xyne click")

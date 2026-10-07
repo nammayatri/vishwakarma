@@ -16,7 +16,12 @@ def _db():
     yield
 
 
+ALICE, BOB = "alice@x.in", "bob@x.in"
+
+
 def _settings(**kw):
+    kw.setdefault("approver_emails", [ALICE, BOB])
+    kw.setdefault("drainer_redis_host", "redis.internal")
     return rem.RemediationSettings(enabled=True, **kw)
 
 
@@ -60,48 +65,76 @@ def test_propose_gates():
 
 def test_approve_executes_exact_command_once():
     a, r = _propose(), Runner()
-    out = rem.decide(_settings(), a["id"], approved=True, approver="Alice", via="slack", runner=r)
+    out = rem.decide(_settings(), a["id"], approved=True, approver="Alice", approver_email=ALICE, via="slack", runner=r)
     assert out["status"] == "executed"
     assert r.calls[-1] == ["kubectl", "delete", "pod", "beckn-offer-abc12-xyz", "-n", "atlas"]
     row = store.get_action(a["id"])
-    assert row["is_approved"] == 1 and row["approved_by"] == "Alice" and row["approved_via"] == "slack"
-    again = rem.decide(_settings(), a["id"], approved=True, approver="Bob", via="slack", runner=r)
+    assert row["is_approved"] == 1 and row["approved_via"] == "slack"
+    assert row["approved_by"] == f"Alice <{ALICE}>"
+    again = rem.decide(_settings(), a["id"], approved=True, approver="Bob", approver_email=BOB, via="slack", runner=r)
     assert again["status"] == "executed"
     assert sum(1 for c in r.calls if c[1] == "delete") == 1
 
 
 def test_reject_never_runs():
     a, r = _propose(), Runner()
-    out = rem.decide(_settings(), a["id"], approved=False, approver="Alice", via="xyne", runner=r)
+    out = rem.decide(_settings(), a["id"], approved=False, approver="Alice", approver_email=ALICE, via="xyne", runner=r)
     assert out["status"] == "rejected" and r.calls == []
     assert store.get_action(a["id"])["is_approved"] == 0
 
 
 def test_expired_never_runs():
     a, r = _propose(), Runner()
-    out = rem.decide(_settings(ttl_seconds=-1), a["id"], approved=True, approver="Alice", via="slack", runner=r)
+    out = rem.decide(_settings(ttl_seconds=-1), a["id"], approved=True, approver="Alice", approver_email=ALICE,
+                     via="slack", runner=r)
     assert out["status"] == "expired" and r.calls == []
 
 
 def test_unauthorized_never_runs_and_stays_pending():
     a, r = _propose(), Runner()
-    s = _settings(approvers=["alice@x.in"])
-    out = rem.decide(s, a["id"], approved=True, approver="Mallory", approver_ids=["U9"], via="slack", runner=r)
+    s = _settings(approver_emails=[ALICE])
+    out = rem.decide(s, a["id"], approved=True, approver="Mallory", approver_email="mallory@x.in", via="slack", runner=r)
     assert out["status"] == "unauthorized" and r.calls == []
+    assert "don't have access" in out["text"] and "mallory@x.in" in out["text"]
     assert store.get_action(a["id"])["status"] == "pending"
-    ok = rem.decide(s, a["id"], approved=True, approver="Alice", approver_ids=["alice@x.in"], via="slack", runner=r)
+    ok = rem.decide(s, a["id"], approved=True, approver="Alice", approver_email=ALICE.upper(), via="slack", runner=r)
     assert ok["status"] == "executed"
+
+
+def test_no_email_or_empty_allowlist_means_no_access():
+    a, r = _propose(), Runner()
+    for settings, email in [(_settings(), ""), (_settings(approver_emails=[]), ALICE), (_settings(approver_emails=[""]), "")]:
+        out = rem.decide(settings, a["id"], approved=True, approver="X", approver_email=email, via="slack", runner=r)
+        assert out["status"] == "unauthorized"
+    assert r.calls == [] and store.get_action(a["id"])["status"] == "pending"
+
+
+def test_unauthorized_reject_is_also_refused():
+    a, r = _propose(), Runner()
+    out = rem.decide(_settings(), a["id"], approved=False, approver="Mallory", approver_email="m@x.in", via="slack", runner=r)
+    assert out["status"] == "unauthorized" and store.get_action(a["id"])["status"] == "pending"
+
+
+def test_denied_notice_keeps_buttons():
+    a = _propose()
+    blocks = rem.proposal_blocks(a, rem.denied_notice("Mallory", "m@x.in"))
+    kinds = [b["type"] for b in blocks]
+    assert kinds == ["section", "context", "actions"]
+    ids = [e["action_id"] for e in blocks[-1]["elements"]]
+    assert ids == [rem.APPROVE_ACTION_ID, rem.REJECT_ACTION_ID]
+    assert "don't have access" in blocks[1]["elements"][0]["text"]
 
 
 def test_pod_already_gone_does_not_delete():
     a, r = _propose(), Runner(get_ok=False)
-    out = rem.decide(_settings(), a["id"], approved=True, approver="Alice", via="slack", runner=r)
+    out = rem.decide(_settings(), a["id"], approved=True, approver="Alice", approver_email=ALICE, via="slack", runner=r)
     assert out["status"] == "failed" and all(c[1] == "get" for c in r.calls)
 
 
 def test_disabled_blocks_decision():
     a, r = _propose(), Runner()
-    out = rem.decide(rem.RemediationSettings(enabled=False), a["id"], approved=True, approver="A", via="slack", runner=r)
+    out = rem.decide(rem.RemediationSettings(enabled=False, approver_emails=[ALICE]), a["id"], approved=True,
+                     approver="A", approver_email=ALICE, via="slack", runner=r)
     assert out["status"] == "disabled" and r.calls == []
 
 
@@ -118,9 +151,12 @@ def test_xyne_pending_lookup_requires_unambiguous():
 
 
 def test_extract_click_slack_shaped():
-    p = {"actions": [{"action_id": rem.APPROVE_ACTION_ID, "value": "abc"}], "user": {"id": "U1", "name": "al"}}
-    assert rem.extract_click(p) == (rem.APPROVE_ACTION_ID, "abc", "U1", "al")
-    assert rem.extract_click({"payload": p}) == (rem.APPROVE_ACTION_ID, "abc", "U1", "al")
+    p = {"actions": [{"action_id": rem.APPROVE_ACTION_ID, "value": "abc"}],
+         "user": {"id": "U1", "name": "al", "profile": {"email": "al@x.in"}}}
+    assert rem.extract_click(p) == (rem.APPROVE_ACTION_ID, "abc", "U1", "al", "al@x.in")
+    assert rem.extract_click({"payload": p}) == (rem.APPROVE_ACTION_ID, "abc", "U1", "al", "al@x.in")
+    no_email = {"actions": [{"action_id": "x", "value": "v"}], "user": {"id": "U1"}}
+    assert rem.extract_click(no_email)[4] == ""
     assert rem.extract_click({"foo": 1}) is None
 
 
@@ -229,11 +265,159 @@ def test_config_defaults_yaml_and_env_override(monkeypatch):
     monkeypatch.setenv("VK_REMEDIATION_MIN_REQUESTS", "120")
     monkeypatch.setenv("VK_REMEDIATION_OUTLIER_FACTOR", "20")
     monkeypatch.setenv("VK_REMEDIATION_ALLOWED_NAMESPACES", "atlas, prod2")
-    monkeypatch.setenv("VK_REMEDIATION_APPROVERS", "U1,a@b.in")
+    monkeypatch.setenv("VK_REMEDIATION_APPROVER_EMAILS", "a@b.in, C@D.in")
+    monkeypatch.setenv("VK_REMEDIATION_DRAINER_REDIS_HOST", "10.1.2.3")
+    monkeypatch.setenv("VK_REMEDIATION_DRAINER_REDIS_PORT", "6380")
+    monkeypatch.setenv("VK_REMEDIATION_DRAINER_REDIS_CLUSTER", "true")
     monkeypatch.setenv("VK_REMEDIATION_ENABLED", "false")
     c = VishwakarmaConfig({"remediation": {"min_requests": 80}})
     assert (c.remediation_min_requests, c.remediation_outlier_factor) == (120.0, 20.0)
-    assert c.remediation_allowed_namespaces == ["atlas", "prod2"] and c.remediation_approvers == ["U1", "a@b.in"]
+    assert c.remediation_allowed_namespaces == ["atlas", "prod2"]
+    assert c.remediation_approver_emails == ["a@b.in", "C@D.in"]
     assert c.remediation_enabled is False
     s = rem.settings_from_config(c)
     assert s.min_requests == 120.0 and s.outlier_factor == 20.0 and s.enabled is False
+    assert (s.drainer_redis_host, s.drainer_redis_port, s.drainer_redis_cluster) == ("10.1.2.3", 6380, True)
+    assert s.approver_emails == ["a@b.in", "C@D.in"]
+
+    for k in list(__import__("os").environ):
+        if k.startswith("VK_REMEDIATION_"):
+            monkeypatch.delenv(k)
+    c = VishwakarmaConfig({})
+    assert c.remediation_approver_emails == [] and c.remediation_drainer_redis_host == ""
+
+
+def _drainer(side="driver", settings=None, **kw):
+    args = dict(incident_id="inc2", alert_title="NoDriverDrainerRunning", platform="slack", channel="C1",
+                thread_ts="1.1", side=side, evidence="stopped", queries_ran=["max(driver_drainer_stop_status)"])
+    args.update(kw)
+    return rem.propose_drainer(settings or _settings(), **args)
+
+
+class RedisSim:
+    def __init__(self, stop="true", force=None, fail_on=None):
+        self.kv = {}
+        if stop is not None:
+            self.kv["DRIVER_DRAINER_STOP"] = stop
+        if force is not None:
+            self.kv["DRIVER_FORCE_DRAIN"] = force
+        self.calls, self.fail_on = [], fail_on
+
+    def __call__(self, argv):
+        self.calls.append(argv)
+        cmd, *rest = argv[argv.index("--no-auth-warning") + 1:]
+        if self.fail_on == cmd:
+            return 1, "ERR boom"
+        if cmd == "GET":
+            return 0, self.kv.get(rest[0], "")
+        if cmd == "SET":
+            self.kv[rest[0]] = rest[1]
+            return 0, "OK"
+        if cmd == "DEL":
+            return 0, str(int(self.kv.pop(rest[0], None) is not None))
+        return 1, "unknown"
+
+
+def test_drainer_commands_use_the_real_backend_keys():
+    assert rem.build_drainer_command("driver") == "redis-cli SET DRIVER_FORCE_DRAIN true\nredis-cli DEL DRIVER_DRAINER_STOP"
+    assert rem.build_drainer_command("rider") == "redis-cli SET FORCE_DRAIN true\nredis-cli DEL RIDER_DRAINER_STOP"
+    assert rem.parse_drainer_command(rem.build_drainer_command("rider")) == "rider"
+    for bad in ["redis-cli FLUSHALL", "redis-cli DEL SOMETHING_ELSE", "redis-cli SET DRIVER_FORCE_DRAIN false\nredis-cli DEL DRIVER_DRAINER_STOP"]:
+        assert rem.parse_drainer_command(bad) is None
+
+
+def test_propose_drainer_gates_and_row():
+    assert _drainer(settings=rem.RemediationSettings(enabled=False)) is None
+    assert rem.propose_drainer(_settings(drainer_redis_host=""), incident_id="i", alert_title="t", platform="slack",
+                               channel="C", thread_ts="1", side="driver", evidence="e", queries_ran=[]) is None
+    assert rem.propose_drainer(_settings(), incident_id="i", alert_title="t", platform="slack", channel="C",
+                               thread_ts="1", side="bogus", evidence="e", queries_ran=[]) is None
+    a = _drainer()
+    assert rem.kind_of(a) == "drainer_resume" and a["status"] == "pending"
+    assert (a["service"], a["pod"], a["namespace"]) == ("driver-drainer", "driver", rem.DRAINER_NAMESPACE)
+    assert "SET DRIVER_FORCE_DRAIN true" in rem.proposal_text(a) and "DEL DRIVER_DRAINER_STOP" in rem.proposal_text(a)
+
+
+def test_drainer_approve_sets_force_then_deletes_stop_and_verifies():
+    a, r = _drainer(), RedisSim()
+    out = rem.decide(_settings(drainer_redis_port=6380, drainer_redis_cluster=True), a["id"], approved=True,
+                     approver="Alice", approver_email=ALICE, via="slack", runner=r)
+    assert out["status"] == "executed", out["text"]
+    verbs = [c[c.index("--no-auth-warning") + 1:] for c in r.calls]
+    assert verbs == [["GET", "DRIVER_DRAINER_STOP"], ["SET", "DRIVER_FORCE_DRAIN", "true"],
+                     ["DEL", "DRIVER_DRAINER_STOP"], ["GET", "DRIVER_DRAINER_STOP"], ["GET", "DRIVER_FORCE_DRAIN"]]
+    assert r.calls[0][:6] == ["redis-cli", "-h", "redis.internal", "-p", "6380", "-c"]
+    assert r.kv == {"DRIVER_FORCE_DRAIN": "true"}
+    assert store.get_action(a["id"])["approved_by"] == f"Alice <{ALICE}>"
+
+
+def test_drainer_already_resumed_is_a_noop():
+    a, r = _drainer(), RedisSim(stop=None)
+    out = rem.decide(_settings(), a["id"], approved=True, approver="Alice", approver_email=ALICE, via="slack", runner=r)
+    assert out["status"] == "executed" and "no-op" in store.get_action(a["id"])["output"]
+    assert all(c[c.index("--no-auth-warning") + 1] == "GET" for c in r.calls) and r.kv == {}
+
+
+def test_drainer_failure_midway_is_reported_not_hidden():
+    a, r = _drainer(), RedisSim(fail_on="DEL")
+    out = rem.decide(_settings(), a["id"], approved=True, approver="Alice", approver_email=ALICE, via="slack", runner=r)
+    assert out["status"] == "failed" and "DEL DRIVER_DRAINER_STOP failed" in store.get_action(a["id"])["output"]
+
+
+def test_drainer_unauthorized_touches_nothing():
+    a, r = _drainer(), RedisSim()
+    out = rem.decide(_settings(), a["id"], approved=True, approver="Mallory", approver_email="m@x.in", via="slack", runner=r)
+    assert out["status"] == "unauthorized" and r.calls == [] and r.kv == {"DRIVER_DRAINER_STOP": "true"}
+
+
+def test_drainer_routes_and_side_detection():
+    from vishwakarma.core.fast_triage import _drainer_sides_from_title
+    assert "Drainer Remediation" in _route_for_alert("[CRITICAL] NoRiderDrainerRunning in GCP")
+    assert "Drainer Remediation" in _route_for_alert("[CRITICAL] DriverDrainerNotProcessing")
+    assert _drainer_sides_from_title("NoDriverDrainerRunning") == ["driver"]
+    assert _drainer_sides_from_title("NoRiderDrainerRunning") == ["rider"]
+    assert _drainer_sides_from_title("CustomerDrainerNotProcessing") == ["rider"]
+    assert _drainer_sides_from_title("SomethingDrainerStopped") == []
+
+
+class StopProm:
+    def __init__(self, driver, rider):
+        self.v = {"max(driver_drainer_stop_status)": driver, "max(drainer_stop_status)": rider}
+
+    def _get(self, path, params):
+        v = self.v[params["query"]]
+        return {"data": {"result": [] if v is None else [{"metric": {}, "value": [0, str(v)]}]}}
+
+
+def _drain_stage(prom, title, settings=None):
+    from vishwakarma.core.fast_triage import _stage_drainer_remediation
+    proposed = []
+    ctx = {"_remediation": settings or _settings(), "alert_title": title,
+           "_propose_drainer": lambda **kw: proposed.append(kw) or kw}
+    text, _ = _stage_drainer_remediation(prom, ctx, 5)
+    return text, proposed
+
+
+def test_stage_driver_alert_only_resumes_the_driver_drainer_even_if_rider_also_stopped():
+    text, proposed = _drain_stage(StopProm(1, 1), "[CRITICAL] NoDriverDrainerRunning")
+    assert [p["side"] for p in proposed] == ["driver"] and "resume suggested" in text
+
+
+def test_stage_rider_alert_resumes_rider_with_the_rider_keys():
+    text, proposed = _drain_stage(StopProm(0, 1), "NoRiderDrainerRunning")
+    assert [p["side"] for p in proposed] == ["rider"]
+    assert "RIDER_DRAINER_STOP" in proposed[0]["evidence"] and "`FORCE_DRAIN`" in proposed[0]["evidence"]
+
+
+def test_stage_not_stopped_explains_and_proposes_nothing():
+    text, proposed = _drain_stage(StopProm(0, 0), "NoDriverDrainerRunning")
+    assert proposed == [] and "no resume needed" in text
+    assert _drain_stage(StopProm(0, 0), "NoDriverDrainerPodRunning") == ("", [])
+
+
+def test_stage_unknown_side_checks_both_and_missing_redis_config_is_explained():
+    text, proposed = _drain_stage(StopProm(1, 1), "SomeDrainerAlert")
+    assert sorted(p["side"] for p in proposed) == ["driver", "rider"]
+    text, proposed = _drain_stage(StopProm(1, 0), "NoDriverDrainerRunning", _settings(drainer_redis_host=""))
+    assert proposed == [] and "drainer_redis.host is not configured" in text
+    assert _drain_stage(StopProm(1, 0), "NoDriverDrainerRunning", rem.RemediationSettings(enabled=False)) == ("", [])

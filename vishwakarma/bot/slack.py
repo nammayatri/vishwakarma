@@ -989,17 +989,30 @@ def start_bot(config: "VishwakarmaConfig") -> None:
 
         action_id = body["actions"][0]["value"]
         user_id = body.get("user", {}).get("id", "unknown")
-        name, ids = user_id, [user_id]
+        name, email = user_id, ""
         try:
             info = client.users_info(user=user_id)["user"]
             name = info.get("real_name") or info.get("name") or user_id
-            ids += [info.get("name", ""), (info.get("profile") or {}).get("email", "")]
+            email = (info.get("profile") or {}).get("email", "") or ""
         except Exception as e:
-            log.debug(f"[REMEDIATE] users_info failed: {e}")
+            log.warning(f"[REMEDIATE] could not read approver email for {user_id}: {e}")
 
         result = rem.decide(rem.settings_from_config(config), action_id, approved=approved,
-                            approver=name, approver_ids=ids, via="slack")
+                            approver=name, approver_email=email, via="slack")
         channel_id = body["channel"]["id"]
+        action = result["action"]
+        if result["status"] == "unauthorized":
+            try:
+                client.chat_update(channel=channel_id, ts=body["message"]["ts"],
+                                   text=f"{rem.proposal_text(action)}\n{result['text']}",
+                                   blocks=rem.proposal_blocks(action, result["text"]))
+                client.chat_postEphemeral(channel=channel_id, user=user_id, text=result["text"],
+                                          thread_ts=body["message"].get("thread_ts"))
+            except Exception as e:
+                log.warning(f"[REMEDIATE] denied notice failed: {e}")
+            rem.mirror_notice_to_xyne(config, action, result["text"])
+            log.info(f"[REMEDIATE] {action_id} denied for {name} <{email or 'no email'}> via slack")
+            return
         if result["status"] not in rem.FINAL_STATUSES:
             try:
                 client.chat_postEphemeral(channel=channel_id, user=user_id, text=result["text"])
@@ -1011,8 +1024,8 @@ def start_bot(config: "VishwakarmaConfig") -> None:
                                text=result["text"], blocks=rem.outcome_blocks(result["text"]))
         except Exception as e:
             log.warning(f"[REMEDIATE] message update failed: {e}")
-        rem.mirror_outcome_to_xyne(config, result["action"], result["text"])
-        log.info(f"[REMEDIATE] {action_id} -> {result['status']} by {name} via slack")
+        rem.mirror_outcome_to_xyne(config, action, result["text"])
+        log.info(f"[REMEDIATE] {action_id} -> {result['status']} by {name} <{email}> via slack")
 
     @app.action("vk_remediate_approve")
     def handle_remediate_approve(ack, body, client):

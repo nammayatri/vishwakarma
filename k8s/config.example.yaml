@@ -51,6 +51,26 @@ alert_filter:
 #     <city-uuid-4>: Kolkata
 #     # Unset/empty = every city shown ranked by search volume, raw id.
 
+# ── Approval-gated remediation (0DC pod restart, drainer resume) ──────────────
+# Argus only SUGGESTS the action; it runs after an authorized person clicks
+# Approve in Slack / Xyne. Approver identity = the clicker's email. An empty
+# approver_emails list means NOBODY can approve. Every key has a VK_REMEDIATION_*
+# env override (comma-separated for lists).
+# remediation:
+#   enabled: true                       # VK_REMEDIATION_ENABLED
+#   approver_emails: [a@x.in, b@x.in]   # VK_REMEDIATION_APPROVER_EMAILS — the only people who can approve
+#   allowed_namespaces: [atlas]         # VK_REMEDIATION_ALLOWED_NAMESPACES — pod deletes limited to these
+#   min_requests: 50                    # VK_REMEDIATION_MIN_REQUESTS — min 0DC per 5m for a pod to count
+#   outlier_factor: 10                  # VK_REMEDIATION_OUTLIER_FACTOR — x median of the service's other pods
+#   max_pods: 3                         # VK_REMEDIATION_MAX_PODS — more bad pods => no suggestion
+#   ttl_seconds: 900                    # VK_REMEDIATION_TTL_SECONDS — approval window
+#   pod_label: pod                      # VK_REMEDIATION_POD_LABEL — Istio label holding the pod name
+#   drainer_redis:                      # the Redis the drainers read DRIVER_/RIDER_DRAINER_STOP from
+#     host: <stream-redis-host>         # VK_REMEDIATION_DRAINER_REDIS_HOST — unset => no drainer suggestions
+#     port: 6379                        # VK_REMEDIATION_DRAINER_REDIS_PORT
+#     cluster: false                    # VK_REMEDIATION_DRAINER_REDIS_CLUSTER (redis-cli -c)
+#   # redis-cli reads REDISCLI_AUTH from the pod env if the Redis needs a password.
+
 # ── Site Knowledge Base ────────────────────────────────────────────────────────
 # Injected into every investigation. Put cluster-specific facts here:
 # instance IDs, namespaces, metric names, proven commands, IAM gaps.

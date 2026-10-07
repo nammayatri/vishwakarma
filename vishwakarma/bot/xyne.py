@@ -100,6 +100,7 @@ def parse_xyne_mention_event(payload: dict) -> dict:
         "thread_ts": inner.get("conversationId", ""),
         "user": inner.get("userId", ""),
         "sender_name": inner.get("senderName", ""),
+        "sender_email": inner.get("senderEmail") or inner.get("userEmail") or inner.get("email") or "",
     }
 
 

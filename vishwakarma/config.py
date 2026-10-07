@@ -368,9 +368,18 @@ class VishwakarmaConfig:
         self.remediation_min_requests: float = float(_env("VK_REMEDIATION_MIN_REQUESTS", rem.get("min_requests", 50)))
         self.remediation_outlier_factor: float = float(_env("VK_REMEDIATION_OUTLIER_FACTOR", rem.get("outlier_factor", 10)))
         self.remediation_ttl_seconds: int = int(_env("VK_REMEDIATION_TTL_SECONDS", rem.get("ttl_seconds", 900)))
-        self.remediation_approvers: list[str] = _csv(_env("VK_REMEDIATION_APPROVERS", None), rem.get("approvers") or [])
+        self.remediation_approver_emails: list[str] = _csv(
+            _env("VK_REMEDIATION_APPROVER_EMAILS", None), rem.get("approver_emails") or [])
         self.remediation_pod_label: str = str(_env("VK_REMEDIATION_POD_LABEL", rem.get("pod_label", "pod")))
         self.remediation_kubectl_bin: str = str(_env("VK_REMEDIATION_KUBECTL_BIN", rem.get("kubectl_bin", "kubectl")))
+        drainer_redis = rem.get("drainer_redis") or {}
+        self.remediation_redis_cli_bin: str = str(_env("VK_REMEDIATION_REDIS_CLI_BIN", rem.get("redis_cli_bin", "redis-cli")))
+        self.remediation_drainer_redis_host: str = str(
+            _env("VK_REMEDIATION_DRAINER_REDIS_HOST", drainer_redis.get("host", "")) or "")
+        self.remediation_drainer_redis_port: int = int(
+            _env("VK_REMEDIATION_DRAINER_REDIS_PORT", drainer_redis.get("port", 6379)))
+        self.remediation_drainer_redis_cluster: bool = str(
+            _env("VK_REMEDIATION_DRAINER_REDIS_CLUSTER", drainer_redis.get("cluster", False))).lower() == "true"
 
         # GCP Cloud Monitoring webhook — receives Cloud Monitoring incident
         # notifications and triggers the same investigation flow as

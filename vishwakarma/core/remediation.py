@@ -18,6 +18,13 @@ _YES = re.compile(r"^\s*(yes|y|approve|approved|ok|go ahead|do it)\W*$", re.I)
 _NO = re.compile(r"^\s*(no|n|reject|rejected|cancel|stop)\W*$", re.I)
 
 
+DRAINER_KEYS = {
+    "driver": ("DRIVER_DRAINER_STOP", "DRIVER_FORCE_DRAIN"),
+    "rider": ("RIDER_DRAINER_STOP", "FORCE_DRAIN"),
+}
+DRAINER_NAMESPACE = "drainer-redis"
+
+
 @dataclass
 class RemediationSettings:
     enabled: bool = True
@@ -26,9 +33,13 @@ class RemediationSettings:
     min_requests: float = 50.0
     outlier_factor: float = 10.0
     ttl_seconds: int = 900
-    approvers: list[str] = field(default_factory=list)
+    approver_emails: list[str] = field(default_factory=list)
     pod_label: str = "pod"
     kubectl_bin: str = "kubectl"
+    redis_cli_bin: str = "redis-cli"
+    drainer_redis_host: str = ""
+    drainer_redis_port: int = 6379
+    drainer_redis_cluster: bool = False
     on_proposal: Callable[[dict], None] | None = None
 
 
@@ -40,9 +51,13 @@ def settings_from_config(config) -> RemediationSettings:
         min_requests=config.remediation_min_requests,
         outlier_factor=config.remediation_outlier_factor,
         ttl_seconds=config.remediation_ttl_seconds,
-        approvers=config.remediation_approvers,
+        approver_emails=config.remediation_approver_emails,
         pod_label=config.remediation_pod_label,
         kubectl_bin=config.remediation_kubectl_bin,
+        redis_cli_bin=config.remediation_redis_cli_bin,
+        drainer_redis_host=config.remediation_drainer_redis_host,
+        drainer_redis_port=config.remediation_drainer_redis_port,
+        drainer_redis_cluster=config.remediation_drainer_redis_cluster,
     )
 
 
@@ -58,6 +73,22 @@ def parse_command(command: str) -> tuple[str, str] | None:
     if not (_DNS_NAME.match(pod) and _NS_NAME.match(ns)):
         return None
     return ns, pod
+
+
+def build_drainer_command(side: str) -> str:
+    stop_key, force_key = DRAINER_KEYS[side]
+    return f"redis-cli SET {force_key} true\nredis-cli DEL {stop_key}"
+
+
+def parse_drainer_command(command: str) -> str | None:
+    for side in DRAINER_KEYS:
+        if command == build_drainer_command(side):
+            return side
+    return None
+
+
+def kind_of(action: dict) -> str:
+    return "drainer_resume" if (action.get("command") or "").startswith("redis-cli ") else "pod_delete"
 
 
 def is_yes(text: str) -> bool:
@@ -90,42 +121,73 @@ def propose(settings: RemediationSettings, *, incident_id: str, alert_title: str
     return store.get_action(action_id)
 
 
+def propose_drainer(settings: RemediationSettings, *, incident_id: str, alert_title: str, platform: str,
+                    channel: str, thread_ts: str, side: str, evidence: str,
+                    queries_ran: list[str]) -> dict | None:
+    if not settings.enabled or side not in DRAINER_KEYS:
+        return None
+    if not settings.drainer_redis_host:
+        log.warning("Drainer remediation skipped: remediation.drainer_redis.host is not configured")
+        return None
+    action_id = store.create_action(
+        incident_id=incident_id, alert_title=alert_title, platform=platform, channel=channel,
+        thread_ts=thread_ts, namespace=DRAINER_NAMESPACE, service=f"{side}-drainer", pod=side,
+        command=build_drainer_command(side), queries_ran=queries_ran, evidence=evidence,
+    )
+    return store.get_action(action_id)
+
+
+def _command_block(action: dict) -> str:
+    if kind_of(action) == "drainer_resume":
+        return f"```{action['command']}```"
+    return f"`{action['command']}`"
+
+
 def proposal_text(action: dict) -> str:
+    if kind_of(action) == "drainer_resume":
+        title = f":wrench: *Suggested fix — resume the {action['pod']} drainer*"
+        how = "Approve to run exactly these commands, in this order"
+    else:
+        title = ":wrench: *Suggested fix — restart the 0DC pod*"
+        how = "Approve to run exactly this command"
     return (
-        f":wrench: *Suggested fix — restart the 0DC pod*\n{action['evidence']}\n"
-        f"Command: `{action['command']}`\n"
-        f"_Approve to run exactly this command (on Xyne, reply `yes` in the thread). Expires in 15 min._"
+        f"{title}\n{action['evidence']}\n{_command_block(action)}\n"
+        f"_{how} (on Xyne, reply `yes` in the thread). Only authorized approvers can approve. Expires in 15 min._"
     )
 
 
-def proposal_blocks(action: dict) -> list[dict]:
-    return [
-        {"type": "section", "text": {"type": "mrkdwn", "text": proposal_text(action)}},
-        {
-            "type": "actions",
-            "block_id": f"remediate_{action['id']}",
-            "elements": [
-                {"type": "button", "text": {"type": "plain_text", "text": "✅ Approve & run", "emoji": True},
-                 "style": "primary", "action_id": APPROVE_ACTION_ID, "value": action["id"]},
-                {"type": "button", "text": {"type": "plain_text", "text": "❌ Reject", "emoji": True},
-                 "style": "danger", "action_id": REJECT_ACTION_ID, "value": action["id"]},
-            ],
-        },
-    ]
+def proposal_blocks(action: dict, notice: str = "") -> list[dict]:
+    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": proposal_text(action)}}]
+    if notice:
+        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": notice}]})
+    blocks.append({
+        "type": "actions",
+        "block_id": f"remediate_{action['id']}",
+        "elements": [
+            {"type": "button", "text": {"type": "plain_text", "text": "✅ Approve & run", "emoji": True},
+             "style": "primary", "action_id": APPROVE_ACTION_ID, "value": action["id"]},
+            {"type": "button", "text": {"type": "plain_text", "text": "❌ Reject", "emoji": True},
+             "style": "danger", "action_id": REJECT_ACTION_ID, "value": action["id"]},
+        ],
+    })
+    return blocks
+
+
+def denied_notice(approver: str, email: str) -> str:
+    who = f"{approver} ({email})" if email else approver
+    return f":no_entry: {who} — you don't have access to approve this. Nothing was run; an authorized approver can still use the buttons."
 
 
 def result_text(action: dict, status: str, approver: str, output: str = "") -> str:
-    cmd = f"`{action['command']}`"
+    cmd = _command_block(action)
     if status == "executed":
-        return f":white_check_mark: *Executed* by {approver}: {cmd}\n{output[:400]}"
+        return f":white_check_mark: *Executed* by {approver}: {cmd}\n{output[:600]}"
     if status == "failed":
-        return f":x: *Approved by {approver} but failed*: {cmd}\n{output[:400]}"
+        return f":x: *Approved by {approver} but failed*: {cmd}\n{output[:600]}"
     if status == "rejected":
         return f":no_entry_sign: *Rejected* by {approver}: {cmd} — nothing was run."
     if status == "expired":
         return f":hourglass: *Expired* — no approval within the window, nothing was run: {cmd}"
-    if status == "unauthorized":
-        return f":lock: {approver} is not in the approver list — nothing was run."
     return f":information_source: Already handled ({status}): {cmd}"
 
 
@@ -137,50 +199,86 @@ def _run(argv: list[str]) -> tuple[int, str]:
         return 1, str(e)
 
 
-def _authorized(settings: RemediationSettings, approver_ids: list[str]) -> bool:
-    if not settings.approvers:
-        return True
-    allowed = {a.lower() for a in settings.approvers}
-    return any((i or "").lower() in allowed for i in approver_ids)
+def _authorized(settings: RemediationSettings, email: str) -> bool:
+    allowed = {e.strip().lower() for e in settings.approver_emails if e.strip()}
+    return bool(email) and email.strip().lower() in allowed
+
+
+def _redis_argv(settings: RemediationSettings, *args: str) -> list[str]:
+    argv = [settings.redis_cli_bin, "-h", settings.drainer_redis_host, "-p", str(settings.drainer_redis_port)]
+    if settings.drainer_redis_cluster:
+        argv.append("-c")
+    return argv + ["--no-auth-warning", *args]
+
+
+def _execute_pod_delete(settings: RemediationSettings, action: dict, runner) -> tuple[bool, str]:
+    parsed = parse_command(action["command"])
+    if parsed is None or parsed[0] not in settings.allowed_namespaces:
+        return False, "command failed validation at execution time"
+    ns, pod = parsed
+    code, out = runner([settings.kubectl_bin, "get", "pod", pod, "-n", ns, "-o", "name"])
+    if code != 0:
+        return False, f"pod check failed (already gone?): {out}"
+    code, out = runner([settings.kubectl_bin, "delete", "pod", pod, "-n", ns])
+    return code == 0, out
+
+
+def _execute_drainer_resume(settings: RemediationSettings, action: dict, runner) -> tuple[bool, str]:
+    side = parse_drainer_command(action["command"])
+    if side is None:
+        return False, "command failed validation at execution time"
+    if not settings.drainer_redis_host:
+        return False, "drainer redis host is not configured"
+    stop_key, force_key = DRAINER_KEYS[side]
+    code, out = runner(_redis_argv(settings, "GET", stop_key))
+    if code != 0:
+        return False, f"could not read {stop_key}: {out}"
+    if out.strip().lower() != "true":
+        return True, f"no-op: {stop_key} is not set (drainer already resumed), nothing changed"
+    code, out = runner(_redis_argv(settings, "SET", force_key, "true"))
+    if code != 0:
+        return False, f"SET {force_key} true failed: {out}"
+    code, out = runner(_redis_argv(settings, "DEL", stop_key))
+    if code != 0:
+        return False, f"{force_key} was set but DEL {stop_key} failed: {out}"
+    _, stop_now = runner(_redis_argv(settings, "GET", stop_key))
+    _, force_now = runner(_redis_argv(settings, "GET", force_key))
+    ok = stop_now.strip() == "" and force_now.strip().lower() == "true"
+    return ok, f"{stop_key} deleted, {force_key}={force_now.strip() or '?'} (verified)" if ok else \
+        f"verify mismatch: {stop_key}={stop_now.strip() or '(nil)'}, {force_key}={force_now.strip() or '(nil)'}"
 
 
 def decide(settings: RemediationSettings, action_id: str, *, approved: bool, approver: str,
-           approver_ids: list[str] | None = None, via: str,
+           approver_email: str = "", via: str,
            runner: Callable[[list[str]], tuple[int, str]] = _run) -> dict:
     action = store.get_action(action_id)
     if action is None:
         return {"status": "missing", "text": ":information_source: Unknown remediation request.", "action": None}
     if not settings.enabled:
         return {"status": "disabled", "text": ":lock: Remediation is disabled.", "action": action}
-    if not _authorized(settings, (approver_ids or []) + [approver]):
-        return {"status": "unauthorized", "text": result_text(action, "unauthorized", approver), "action": action}
+    if not _authorized(settings, approver_email):
+        try:
+            from vishwakarma.storage.audit import audit
+            audit(approver, "remediation.denied", action_id, {"email": approver_email, "via": via})
+        except Exception:
+            pass
+        return {"status": "unauthorized", "text": denied_notice(approver, approver_email), "action": action}
 
-    status = store.claim_decision(action_id, approved=approved, approver=approver, via=via,
-                                  ttl_seconds=settings.ttl_seconds)
+    status = store.claim_decision(action_id, approved=approved, approver=f"{approver} <{approver_email}>",
+                                  via=via, ttl_seconds=settings.ttl_seconds)
     action = store.get_action(action_id)
     if status != "approved":
         return {"status": status, "text": result_text(action, status, approver), "action": action}
 
-    parsed = parse_command(action["command"])
-    if parsed is None or parsed[0] not in settings.allowed_namespaces:
-        store.record_result(action_id, ok=False, output="command failed validation at execution time")
-        action = store.get_action(action_id)
-        return {"status": "failed", "text": result_text(action, "failed", approver, action["output"]), "action": action}
-    ns, pod = parsed
-
-    code, out = runner([settings.kubectl_bin, "get", "pod", pod, "-n", ns, "-o", "name"])
-    if code != 0:
-        store.record_result(action_id, ok=False, output=f"pod check failed (already gone?): {out}")
-        action = store.get_action(action_id)
-        return {"status": "failed", "text": result_text(action, "failed", approver, action["output"]), "action": action}
-
-    code, out = runner([settings.kubectl_bin, "delete", "pod", pod, "-n", ns])
-    ok = code == 0
+    if kind_of(action) == "drainer_resume":
+        ok, out = _execute_drainer_resume(settings, action, runner)
+    else:
+        ok, out = _execute_pod_delete(settings, action, runner)
     store.record_result(action_id, ok=ok, output=out)
     try:
         from vishwakarma.storage.audit import audit
         audit(approver, "remediation.execute" if ok else "remediation.failed", action_id,
-              {"command": action["command"], "via": via, "output": out[:500]})
+              {"command": action["command"], "email": approver_email, "via": via, "output": out[:500]})
     except Exception:
         pass
     action = store.get_action(action_id)
@@ -223,18 +321,50 @@ def update_primary_slack(config, action: dict | None, text: str) -> None:
         log.warning(f"Slack remediation outcome update failed (non-fatal): {e}")
 
 
+def mirror_notice_to_xyne(config, action: dict | None, notice: str) -> None:
+    if not (action and action.get("mirror_channel") and action.get("mirror_message_ts")):
+        return
+    if not (config.xyne_base_url and config.xyne_bot_token):
+        return
+    try:
+        from vishwakarma.plugins.relays.xyne.plugin import XyneWebClient
+        XyneWebClient(config.xyne_base_url, config.xyne_bot_token).chat_update(
+            channel=action["mirror_channel"], ts=action["mirror_message_ts"],
+            text=f"{proposal_text(action)}\n{notice}", blocks=proposal_blocks(action, notice),
+        )
+    except Exception as e:
+        log.warning(f"Xyne remediation notice update failed (non-fatal): {e}")
+
+
+def update_primary_slack_notice(config, action: dict | None, notice: str) -> None:
+    if not (action and action.get("platform") == "slack" and action.get("channel") and action.get("message_ts")):
+        return
+    if not config.slack_bot_token:
+        return
+    try:
+        from slack_sdk import WebClient
+        WebClient(token=config.slack_bot_token).chat_update(
+            channel=action["channel"], ts=action["message_ts"],
+            text=f"{proposal_text(action)}\n{notice}", blocks=proposal_blocks(action, notice))
+    except Exception as e:
+        log.warning(f"Slack remediation notice update failed (non-fatal): {e}")
+
+
 def find_pending_for_xyne(channel: str, ttl_seconds: int) -> dict | None:
     return store.latest_pending(channel, ttl_seconds) or store.only_pending(ttl_seconds)
 
 
-def extract_click(payload: dict) -> tuple[str, str, str, str] | None:
+def extract_click(payload: dict) -> tuple[str, str, str, str, str] | None:
     actions = payload.get("actions")
     if isinstance(actions, list) and actions and isinstance(actions[0], dict):
         a = actions[0]
         user = payload.get("user") if isinstance(payload.get("user"), dict) else {}
+        profile = user.get("profile") if isinstance(user.get("profile"), dict) else {}
         uid = user.get("id") or payload.get("userId") or ""
         uname = user.get("name") or user.get("username") or payload.get("senderName") or uid
-        return a.get("action_id", ""), a.get("value", ""), uid, uname
+        email = (user.get("email") or profile.get("email") or payload.get("email")
+                 or payload.get("userEmail") or payload.get("senderEmail") or "")
+        return a.get("action_id", ""), a.get("value", ""), uid, uname, email
     inner = payload.get("payload")
     if isinstance(inner, dict):
         return extract_click(inner)

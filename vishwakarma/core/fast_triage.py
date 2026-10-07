@@ -695,6 +695,54 @@ def _stage_drainer(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
     return findings, {}
 
 
+_DRAINER_STOP_QUERIES = {
+    "driver": "max(driver_drainer_stop_status)",
+    "rider": "max(drainer_stop_status)",
+}
+
+
+def _drainer_sides_from_title(title: str) -> list[str]:
+    sides = []
+    if re.search(r"driver", title or "", re.I):
+        sides.append("driver")
+    if re.search(r"rider|customer", title or "", re.I):
+        sides.append("rider")
+    return sides
+
+
+def _stage_drainer_remediation(prom, ctx: dict, top_n: int) -> tuple[str, dict]:
+    settings = ctx.get("_remediation")
+    if settings is None or not settings.enabled:
+        return "", {}
+
+    title = ctx.get("alert_title", "")
+    sides = _drainer_sides_from_title(title) or list(_DRAINER_STOP_QUERIES)
+    stop_alert = bool(re.search(r"DrainerRunning|NotProcessing", title or "", re.I))
+    lines = []
+    for side in sides:
+        promql = _DRAINER_STOP_QUERIES[side]
+        rows = _query(prom, promql)
+        stopped = bool(rows and rows[0][1] > 0)
+        if not stopped:
+            if stop_alert:
+                lines.append(f"{side} drainer stop status is 0 — stop key not set, no resume needed")
+            continue
+        if not settings.drainer_redis_host:
+            lines.append(f"{side} drainer is stopped, but remediation.drainer_redis.host is not configured — "
+                         f"no resume suggested")
+            continue
+        from vishwakarma.core.remediation import DRAINER_KEYS
+        stop_key, force_key = DRAINER_KEYS[side]
+        action = ctx["_propose_drainer"](
+            side=side, queries_ran=[promql],
+            evidence=f"`{promql}` = 1 — the {side} drainer paused itself (`{stop_key}` is set in Redis). "
+                     f"Resuming sets `{force_key}`=true and deletes `{stop_key}`.",
+        )
+        lines.append(f"{side} drainer is STOPPED ({stop_key} set)"
+                     + (" — resume suggested, awaiting approval" if action else " — resume not suggested"))
+    return "\n".join(lines), {}
+
+
 # ── Stackdriver (GCP Cloud Monitoring) — Redis/AlloyDB/LB are not in Prometheus ──
 
 _STACKDRIVER_DATASOURCE_UID = "dfdebqgdd5vk0a"  # Grafana "stackdriver" datasource — confirmed live via list_datasources
@@ -1369,6 +1417,7 @@ _STAGE_FNS: dict[str, Callable] = {
     "Pod CPU/Mem": _stage_pod_resources,
     "Scheduler": _stage_scheduler,
     "Drainer": _stage_drainer,
+    "Drainer Remediation": _stage_drainer_remediation,
     "ClickHouse": _stage_clickhouse,
     "GCP LB 5xx": _stage_gcp_lb_5xx,
     "GCP Redis": _stage_gcp_redis,
@@ -1385,7 +1434,8 @@ _ALERT_ROUTES: list[tuple[re.Pattern, list[str]]] = [
     (re.compile(r"DriverAllocatorLooksDead", re.I), ["Scheduler"]),
     (re.compile(r"(NoDriverDrainerRunning|NoRiderDrainerRunning|NoDriverDrainerPodRunning|"
                 r"NoCustomerDrainerPodRunning|DriverDrainerLagIncreasing|CustomerDrainerLagIncreasing|"
-                r"CustomerDrainerNotProcessing|DriverDrainerNotProcessing)", re.I), ["Drainer"]),
+                r"CustomerDrainerNotProcessing|DriverDrainerNotProcessing)", re.I),
+     ["Drainer", "Drainer Remediation"]),
     (re.compile(r"(RideToSearchRatioDown|LowCityRides)", re.I), ["Istio mesh", "Release Monitoring", "Logs & Infra"]),
     (re.compile(r"^Node[A-Z]", re.I), []),
     (re.compile(r"GCP ELB 5xx Alert", re.I), ["Istio mesh", "Release Monitoring", "GCP LB 5xx", "Logs & Infra"]),
@@ -1459,6 +1509,7 @@ def _run_triage_stages(prom, grafana, bash_tool, es_tool, llm, issue, on_stage_r
         "redis_instances": redis_instances or {},
         "gcp_resource_instance_id": _sanitize(labels.get("instance_id") or ""),
         "_remediation": remediation,
+        "alert_title": issue.title or "",
     }
 
     def _propose(**kw):
@@ -1472,7 +1523,19 @@ def _run_triage_stages(prom, grafana, bash_tool, es_tool, llm, issue, on_stage_r
             log.warning(f"Remediation proposal failed (non-fatal): {e}")
             return None
 
+    def _propose_drainer(**kw):
+        from vishwakarma.core.remediation import propose_drainer
+        try:
+            action = propose_drainer(remediation, alert_title=issue.title, **(proposal_context or {}), **kw)
+            if action and remediation.on_proposal:
+                remediation.on_proposal(action)
+            return action
+        except Exception as e:
+            log.warning(f"Drainer remediation proposal failed (non-fatal): {e}")
+            return None
+
     ctx["_propose"] = _propose
+    ctx["_propose_drainer"] = _propose_drainer
     # Business Impact always runs first, ahead of the alert-specific route —
     # it's independent of which category (Istio/DB-Redis/GCP-Redis/AlloyDB/
     # default) matched, so it isn't gated by `_route_for_alert` like the rest.
