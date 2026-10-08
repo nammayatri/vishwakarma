@@ -41,6 +41,8 @@ class Runner:
     def __call__(self, argv):
         self.calls.append(argv)
         if argv[1] == "get":
+            if any("jsonpath" in a for a in argv):
+                return 0, "2026-10-08T10:11:40Z"
             return (0, "pod/x") if self.get_ok else (1, "NotFound")
         return (0, 'pod "x" deleted') if self.delete_ok else (1, "forbidden")
 
@@ -67,13 +69,82 @@ def test_approve_executes_exact_command_once():
     a, r = _propose(), Runner()
     out = rem.decide(_settings(), a["id"], approved=True, approver="Alice", approver_email=ALICE, via="slack", runner=r)
     assert out["status"] == "executed"
-    assert r.calls[-1] == ["kubectl", "delete", "pod", "beckn-offer-abc12-xyz", "-n", "atlas"]
+    deletes = [c for c in r.calls if c[1] == "delete"]
+    assert deletes == [["kubectl", "delete", "pod", "beckn-offer-abc12-xyz", "-n", "atlas", "--wait=false"]]
+    assert "terminating" in store.get_action(a["id"])["output"]
     row = store.get_action(a["id"])
     assert row["is_approved"] == 1 and row["approved_via"] == "slack"
     assert row["approved_by"] == f"Alice <{ALICE}>"
     again = rem.decide(_settings(), a["id"], approved=True, approver="Bob", approver_email=BOB, via="slack", runner=r)
-    assert again["status"] == "executed"
+    assert again["status"] == "already:executed" and "Already executed" in again["text"]
     assert sum(1 for c in r.calls if c[1] == "delete") == 1
+
+
+def test_second_click_while_the_first_is_still_running_does_not_execute_again():
+    a, r = _propose(), Runner()
+    first = store.claim_decision(a["id"], approved=True, approver="Alice <a>", via="xyne", ttl_seconds=900)
+    assert first == "approved"
+    out = rem.decide(_settings(), a["id"], approved=True, approver="Sidharth", approver_email=BOB, via="xyne", runner=r)
+    assert out["status"] == "already:approved" and r.calls == []
+    assert "Already approved" in out["text"] and "Alice" in out["text"]
+    assert store.claim_decision(a["id"], approved=False, approver="x", via="slack", ttl_seconds=900) == "already:approved"
+    assert store.get_action(a["id"])["approved_by"] == "Alice <a>"
+
+
+def test_a_concurrent_second_click_is_ignored_and_never_overwrites_the_card():
+    import threading
+    a = _propose()
+    release, entered = threading.Event(), threading.Event()
+    calls = []
+
+    def slow(argv):
+        calls.append(argv)
+        entered.set()
+        release.wait(5)
+        if argv[1] == "get" and any("jsonpath" in x for x in argv):
+            return 0, "2026-10-08T10:11:40Z"
+        return 0, "pod/x"
+
+    results = {}
+    t = threading.Thread(target=lambda: results.update(first=rem.handle_flow_action(
+        _cfg(), _click(rem.APPROVE_ACTION_ID, a["id"]), _lookup, runner=slow)))
+    t.start()
+    assert entered.wait(5)
+    second = rem.handle_flow_action(_cfg(), _click(rem.APPROVE_ACTION_ID, a["id"], "u-alice"), _lookup, runner=slow)
+    assert second["type"] == "error" and "Already approved" in second["message"]
+    n_before = len(calls)
+    release.set()
+    t.join(10)
+    assert results["first"]["type"] == "ack" and len(calls) == n_before + 2
+    assert sum(1 for c in calls if c[1] == "delete") == 1
+
+
+def test_pod_delete_does_not_wait_for_termination_and_reports_a_gone_pod_as_success():
+    a = _propose()
+
+    class Gone(Runner):
+        def __call__(self, argv):
+            self.calls.append(argv)
+            if argv[1] == "get" and any("jsonpath" in x for x in argv):
+                return 1, 'Error from server (NotFound): pods "x" not found'
+            return (0, "pod/x") if argv[1] == "get" else (0, 'pod "x" deleted')
+
+    r = Gone()
+    out = rem.decide(_settings(), a["id"], approved=True, approver="Alice", approver_email=ALICE, via="slack", runner=r)
+    assert out["status"] == "executed" and "pod is gone" in store.get_action(a["id"])["output"]
+    assert "--wait=false" in [c for c in r.calls if c[1] == "delete"][0]
+
+
+def test_delete_issued_but_unconfirmed_state_is_reported_as_failure():
+    a = _propose()
+
+    def odd(argv):
+        if argv[1] == "get" and any("jsonpath" in x for x in argv):
+            return 0, ""
+        return 0, "pod/x"
+
+    out = rem.decide(_settings(), a["id"], approved=True, approver="Alice", approver_email=ALICE, via="slack", runner=odd)
+    assert out["status"] == "failed" and "could not be confirmed" in store.get_action(a["id"])["output"]
 
 
 def test_reject_never_runs():
@@ -557,7 +628,8 @@ def test_flow_click_by_authorized_user_runs_the_pod_delete_and_acks():
     a, r = _propose(), Runner()
     resp = rem.handle_flow_action(_cfg(), _click(rem.APPROVE_ACTION_ID, a["id"]), _lookup, runner=r)
     assert resp["type"] == "ack" and "Executed" in resp["message"]
-    assert r.calls[-1] == ["kubectl", "delete", "pod", "beckn-offer-abc12-xyz", "-n", "atlas"]
+    assert [c for c in r.calls if c[1] == "delete"] == [
+        ["kubectl", "delete", "pod", "beckn-offer-abc12-xyz", "-n", "atlas", "--wait=false"]]
     row = store.get_action(a["id"])
     assert row["approved_via"] == "xyne" and row["approved_by"] == f"Alice A <{ALICE}>" and row["is_approved"] == 1
 

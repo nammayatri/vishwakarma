@@ -245,8 +245,18 @@ def _execute_pod_delete(settings: RemediationSettings, action: dict, runner) -> 
     code, out = runner([settings.kubectl_bin, "get", "pod", pod, "-n", ns, "-o", "name"])
     if code != 0:
         return False, f"pod check failed (already gone?): {out}"
-    code, out = runner([settings.kubectl_bin, "delete", "pod", pod, "-n", ns])
-    return code == 0, out
+    code, out = runner([settings.kubectl_bin, "delete", "pod", pod, "-n", ns, "--wait=false"])
+    if code != 0:
+        return False, out
+    gcode, gout = runner([settings.kubectl_bin, "get", "pod", pod, "-n", ns,
+                          "-o", "jsonpath={.metadata.deletionTimestamp}"])
+    if gcode != 0 and "NotFound" in gout:
+        state = "pod is gone"
+    elif gcode == 0 and gout.strip():
+        state = f"pod is terminating (deletionTimestamp {gout.strip()})"
+    else:
+        return False, f"delete was issued but the pod state could not be confirmed: {gout or out}"
+    return True, f"{out.strip()} — {state}"
 
 
 def _execute_drainer_resume(settings: RemediationSettings, action: dict, runner) -> tuple[bool, str]:
@@ -298,6 +308,11 @@ def decide(settings: RemediationSettings, action_id: str, *, approved: bool, app
     status = store.claim_decision(action_id, approved=approved, approver=f"{approver} <{approver_email}>",
                                   via=via, ttl_seconds=settings.ttl_seconds)
     action = store.get_action(action_id)
+    if status.startswith("already:"):
+        prior = status.split(":", 1)[1]
+        who = f" by {action['approved_by']}" if action.get("approved_by") else ""
+        return {"status": status, "action": action,
+                "text": f":information_source: Already {prior}{who} — nothing more was run: {_command_block(action)}"}
     if status != "approved":
         return {"status": status, "text": result_text(action, status, approver), "action": action}
 

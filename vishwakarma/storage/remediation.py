@@ -75,7 +75,7 @@ def claim_decision(action_id: str, *, approved: bool, approver: str, via: str, t
             return "missing"
         status, created_at = row["status"], row["created_at"]
         if status != "pending":
-            return status
+            return f"already:{status}"
         if now - created_at > ttl_seconds:
             conn.execute("UPDATE remediation_actions SET status = 'expired' WHERE id = ? AND status = 'pending'",
                          (action_id,))
