@@ -495,13 +495,13 @@ def test_proposal_blocks_become_a_flow_card_with_submit_buttons():
     assert "notice here" in flow["components"][1]["props"]["content"]
 
 
-def test_only_remediation_buttons_become_flows():
+def test_only_our_buttons_become_flows():
     p = _xyne_plugin()
     assert p.blocks_to_flow(None) is None and p.blocks_to_flow([]) is None
     assert p.blocks_to_flow(rem.outcome_blocks("done")) is None
-    rca = [{"type": "actions", "elements": [{"type": "button", "action_id": "vk_rca_correct", "value": "x",
-                                              "text": {"type": "plain_text", "text": "ok"}}]}]
-    assert p.blocks_to_flow(rca) is None
+    other = [{"type": "actions", "elements": [{"type": "button", "action_id": "some_other_action", "value": "x",
+                                                "text": {"type": "plain_text", "text": "ok"}}]}]
+    assert p.blocks_to_flow(other) is None
 
 
 def test_xyne_client_sends_flow_not_blocks_and_keeps_action_ids_intact():

@@ -112,3 +112,17 @@ def test_stream_request_has_no_thinking_flag_by_default(monkeypatch):
     with patch.object(llm_mod, "completion", side_effect=fake_completion):
         list(_llm().stream([{"role": "user", "content": "x"}]))
     assert "extra_body" not in seen
+
+
+def test_engine_strips_narration_before_first_heading():
+    llm = MagicMock()
+    llm.stream.side_effect = lambda *a, **k: iter([{
+        "type": "analysis_done",
+        "content": "All evidence is in. Writing the final RCA.\n\n---\n\n## Root Cause\nredis is full " + "z" * 100}])
+    executor = MagicMock()
+    executor.toolsets = []
+    engine = InvestigationEngine(llm=llm, executor=executor, max_steps=5)
+    llm.synthesize_final.return_value = "unused"
+    events = list(engine.stream_investigate(question="why?"))
+    content = [e for e in events if e["type"] == "done"][-1]["content"]
+    assert content.startswith("## Root Cause")

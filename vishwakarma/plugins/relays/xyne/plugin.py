@@ -66,6 +66,8 @@ def _emojify(value):
 _FLOW_STATE = {"values": {}, "touched": {}, "errors": {}, "submitting": False, "submitted": False,
                "history": [], "loadingComponentIds": []}
 _FLOW_ACTION_PREFIX = "vk_remediate_"
+_FEEDBACK_ACTION_PREFIX = "vk_rca_"
+_FLOW_ACTION_PREFIXES = (_FLOW_ACTION_PREFIX, _FEEDBACK_ACTION_PREFIX)
 FLOW_TS_PREFIX = "flow:"
 
 
@@ -87,12 +89,12 @@ def text_flow(text: str, screen_id: str = "argus-outcome") -> dict:
 
 
 def blocks_to_flow(blocks: list | None) -> dict | None:
-    """Slack-style blocks carrying our remediation Approve/Reject buttons become a Xyne Flow UI v2 card
-    whose buttons submit `<action_id>:<remediation id>` to the app webhook. Any other blocks are left
-    for the Slack-compat layer."""
+    """Slack-style blocks carrying our remediation Approve/Reject or RCA feedback buttons become a Xyne
+    Flow UI v2 card whose buttons submit `<action_id>:<id>` to the app webhook. Any other blocks are
+    left for the Slack-compat layer."""
     def is_ours(b):
         return b.get("type") == "actions" and any(
-            str(e.get("action_id", "")).startswith(_FLOW_ACTION_PREFIX) for e in b.get("elements", []))
+            str(e.get("action_id", "")).startswith(_FLOW_ACTION_PREFIXES) for e in b.get("elements", []))
 
     if not blocks or not any(is_ours(b) for b in blocks):
         return None
@@ -115,7 +117,12 @@ def blocks_to_flow(blocks: list | None) -> dict | None:
                               "variant": "destructive" if destructive else "primary",
                               "action": {"type": "submit", "actionId": f"{e['action_id']}:{e.get('value', '')}"}}})
             components.append({"id": f"row{i}", "type": "row", "style": {"gap": "8px"}, "children": children})
-    return {"version": "2.0", "screenId": "argus-remediation", "title": "Argus — approval needed",
+    feedback = any(
+        str(e.get("action_id", "")).startswith(_FEEDBACK_ACTION_PREFIX)
+        for b in blocks if is_ours(b) for e in b.get("elements", []))
+    screen_id, title = (("argus-feedback", "Argus — RCA feedback") if feedback
+                        else ("argus-remediation", "Argus — approval needed"))
+    return {"version": "2.0", "screenId": screen_id, "title": title,
             "components": components, "state": {**_FLOW_STATE}}
 
 
@@ -163,8 +170,10 @@ class XyneWebClient:
 
     def _post_flow_card(self, channel, text: str, flow: dict, thread_ts: str | None) -> dict:
         if thread_ts:
+            hint = ("Mark the RCA correct or wrong" if flow.get("screenId") == "argus-feedback"
+                    else "Approve or reject")
             self.chat_postMessage(channel=channel, thread_ts=thread_ts,
-                                  text=f"{_xyne_text(text)}\n\n⬇️ Approve or reject with the card posted just below in the channel.")
+                                  text=f"{_xyne_text(text)}\n\n⬇️ {hint} with the card posted just below in the channel.")
         data = self._native_post("chat/postMessage", {"channelId": channel, "text": _xyne_text(text)[:300], "flow": flow})
         return {"ok": True, "ts": f"{FLOW_TS_PREFIX}{data.get('messageId', '')}", "channel": channel}
 
@@ -339,6 +348,9 @@ class MirroredClient:
     def xyne_ts(self, primary_ts):
         return self._ts.get(primary_ts) if primary_ts else None
 
+    def xyne_target(self, primary_ts):
+        return self._xyne_channel, self.xyne_ts(primary_ts)
+
     def chat_postMessage(self, **kwargs):
         resp = self._primary.chat_postMessage(**kwargs)
         try:
@@ -377,6 +389,14 @@ class MirroredClient:
             thread_ts=self.xyne_ts(primary_thread_ts),
             **kwargs,
         )
+
+
+def restore_alert_mirror(config, xyne_channel: str, primary_ts: str, xyne_ts: str):
+    if not (config.xyne_base_url and config.xyne_bot_token and xyne_channel and xyne_ts):
+        return None
+    mirror = MirroredClient(None, XyneWebClient(config.xyne_base_url, config.xyne_bot_token), xyne_channel)
+    mirror._ts[primary_ts] = xyne_ts
+    return mirror
 
 
 def build_alert_mirror(config, primary_client):

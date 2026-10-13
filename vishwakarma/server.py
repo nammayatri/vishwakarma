@@ -496,7 +496,7 @@ def create_app(config=None) -> FastAPI:
         event_type = payload.get("eventType") if isinstance(payload, dict) else None
         if event_type == "APP_MENTIONED":
             log.warning(f"Xyne APP_MENTIONED raw payload: {payload!r}")
-        elif event_type != "ADDITIONAL_FORM_FIELD_UPDATED":
+        elif event_type != "ADDITIONAL_FORM_FIELD_UPDATED" and not (isinstance(payload, dict) and "actionId" in payload):
             log.warning(f"Xyne unhandled eventType={event_type!r} payload={str(payload)[:3000]}")
 
         if request.headers.get("x-xyne-event") == "flow_action" or (isinstance(payload, dict) and "actionId" in payload):
@@ -505,6 +505,11 @@ def create_app(config=None) -> FastAPI:
             log.info(f"Xyne flow_action actionId={payload.get('actionId')!r} "
                      f"user={(payload.get('context') or {}).get('userId')!r}")
             xc = XyneWebClient(config.xyne_base_url, config.xyne_bot_token)
+            from vishwakarma.core import feedback as fb
+            if str(payload.get("actionId") or "").startswith("vk_rca_"):
+                fb_response = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: fb.handle_flow_action(config, payload, xc.get_user))
+                return fb_response or {"type": "ack", "message": "No action taken."}
             fut = asyncio.get_event_loop().run_in_executor(
                 None, lambda: rem.handle_flow_action(config, payload, xc.get_user))
             try:
@@ -808,6 +813,73 @@ async def _run_alert_investigation(config, state, issue, incident_id: str, finge
     await _do_investigation(config, state, issue, incident_id, fingerprint)
 
 
+def _resume_context(inv: dict, inc: dict) -> dict:
+    delivery = inv.get("delivery") if isinstance(inv.get("delivery"), dict) else {}
+    labels = {**(inc.get("labels") or {}), **(delivery.get("labels") or {})}
+    title = delivery.get("title") or inc.get("title") or inv.get("alert_key") or "RCA"
+    return {
+        "title": title,
+        "severity": delivery.get("severity") or inc.get("severity") or "high",
+        "source": delivery.get("source") or inc.get("source") or "",
+        "question": delivery.get("question") or inc.get("question") or title,
+        "labels": labels,
+        "channel": delivery.get("channel") or labels.get("slack_channel") or "",
+        "thread_ts": delivery.get("thread_ts") or labels.get("slack_thread_ts") or None,
+        "runbook_ids": delivery.get("matched_runbook_ids") or [],
+        "xyne": delivery.get("xyne") or {},
+    }
+
+
+def _deliver_resumed_rca(config, ctx: dict, incident_id: str, analysis: str) -> tuple[str | None, str | None]:
+    pdf_path = None
+    try:
+        from vishwakarma.bot.pdf import generate_pdf
+        pdf_path = generate_pdf(title=ctx["title"], analysis=analysis, source=ctx["source"],
+                                severity=ctx["severity"], meta={"matched_runbook_ids": ctx["runbook_ids"]})
+    except Exception as e:
+        log.warning(f"Reaper: PDF generation failed, posting text: {e}")
+
+    slack_ts = None
+    channel, thread_ts, labels = ctx["channel"], ctx["thread_ts"], ctx["labels"]
+    if not (channel and _destination_configured(config, labels)):
+        log.warning(f"Reaper: {incident_id[:8]} has no delivery target (channel={channel!r}) — RCA saved, not posted")
+        return pdf_path, slack_ts
+    try:
+        dest = _make_destination(config, labels)
+        if thread_ts:
+            try:
+                dest._get_client().chat_update(
+                    channel=channel, ts=thread_ts,
+                    text=f":white_check_mark: RCA complete for {ctx['title']}",
+                    attachments=[{"color": "#36a64f", "blocks": [
+                        {"type": "header", "text": {"type": "plain_text", "text": f":white_check_mark: {ctx['title']}"[:148], "emoji": True}},
+                        {"type": "divider"},
+                        {"type": "context", "elements": [{"type": "mrkdwn", "text": ":thread: _Investigation resumed after a restart and completed. See thread for the RCA report + PDF._"}]},
+                    ]}],
+                )
+            except Exception as e:
+                log.debug(f"Reaper: ack update failed (non-fatal): {e}")
+        resp = dest.post_investigation(
+            title=ctx["title"], analysis=analysis, source=ctx["source"], severity=ctx["severity"],
+            pdf_path=pdf_path, incident_id=incident_id, thread_ts=thread_ts, channel=channel)
+        slack_ts = resp.get("ts")
+        log.info(f"Reaper: {incident_id[:8]} RCA posted to {channel} thread={thread_ts} pdf={'yes' if pdf_path else 'no'}")
+    except Exception as e:
+        log.warning(f"Reaper: RCA post failed for {incident_id[:8]}: {e}")
+    xyne = ctx["xyne"]
+    if xyne and thread_ts:
+        try:
+            from vishwakarma.plugins.relays.xyne.plugin import restore_alert_mirror
+            mirror = restore_alert_mirror(config, xyne.get("channel", ""), thread_ts, xyne.get("ts", ""))
+            if mirror:
+                mirror.post_investigation(
+                    thread_ts, title=ctx["title"], analysis=analysis, source=ctx["source"],
+                    severity=ctx["severity"], incident_id=incident_id, pdf_path=pdf_path)
+        except Exception as e:
+            log.warning(f"Reaper: Xyne mirror post failed (non-fatal): {e}")
+    return pdf_path, slack_ts
+
+
 async def _resume_investigation(config, state, inv: dict) -> None:
     """Resume one orphaned investigation from its last checkpoint — continue the
     engine from the saved messages, then post + finish. Killed runs pick up where
@@ -828,14 +900,13 @@ async def _resume_investigation(config, state, inv: dict) -> None:
     llm = config.make_llm()
     engine = config.make_engine(llm=llm, toolset_manager=tm)
     engine.max_steps = max(int(inv.get("step") or 0) + 25, 30)
-    question = inc.get("question") or inc.get("title") or "Resume investigation"
+    ctx = _resume_context(inv, inc)
     final = ""
     from vishwakarma.core import eventbus
     try:
-        for ev in engine.stream_investigate(question=question, incident_id=incident_id,
+        for ev in engine.stream_investigate(question=ctx["question"], incident_id=incident_id,
                                              resume_messages=messages):
             et = ev.get("type", "")
-            # Stream resumed-investigation events to the console UI too (SSE).
             if et in ("tool_call_start", "tool_call_result", "hypothesis",
                       "compaction", "status", "done", "max_steps_reached"):
                 try:
@@ -848,34 +919,19 @@ async def _resume_investigation(config, state, inv: dict) -> None:
         log.error(f"Reaper: resume failed for {incident_id[:8]}: {e}")
         finish_investigation(incident_id, "failed")
         return
-    labels = inc.get("labels") or {}
-    if final:
-        try:
-            save_incident(incident_id=incident_id, title=inc.get("title", "Resumed RCA"),
-                          question=question, analysis=final, source=inc.get("source", ""),
-                          severity=inc.get("severity", "high"), labels=labels, tool_outputs=[])
-        except Exception as e:
-            log.debug(f"Reaper: save failed: {e}")
-        ch = labels.get("slack_channel")
-        if _destination_configured(config, labels) and ch:
-            # Resumed RCAs get a PDF too — without this the repost always
-            # falls back to a wall of text in the thread.
-            pdf_path = None
-            try:
-                from vishwakarma.bot.pdf import generate_pdf
-                pdf_path = generate_pdf(
-                    title=f"{inc.get('title', 'RCA')} (resumed)", analysis=final,
-                    source=inc.get("source", ""), severity=inc.get("severity", "high"))
-            except Exception as e:
-                log.warning(f"Reaper: PDF generation failed, posting text: {e}")
-            try:
-                _make_destination(config, labels).post_investigation(
-                    title=f"{inc.get('title', 'RCA')} (resumed)", analysis=final,
-                    source=inc.get("source", ""), severity=inc.get("severity", "high"),
-                    incident_id=incident_id, thread_ts=labels.get("slack_thread_ts"), channel=ch,
-                    pdf_path=pdf_path)
-            except Exception as e:
-                log.debug(f"Reaper: slack post failed: {e}")
+    if not final:
+        log.warning(f"Reaper: {incident_id[:8]} finished with no analysis")
+        finish_investigation(incident_id, "failed")
+        return
+    pdf_path, slack_ts = _deliver_resumed_rca(config, ctx, incident_id, final)
+    try:
+        save_incident(incident_id=incident_id, title=ctx["title"], question=ctx["question"],
+                      analysis=final, source=ctx["source"], severity=ctx["severity"],
+                      labels=ctx["labels"], tool_outputs=[],
+                      meta={"matched_runbook_ids": ctx["runbook_ids"], "resumed": True},
+                      slack_ts=slack_ts, pdf_path=pdf_path)
+    except Exception as e:
+        log.warning(f"Reaper: save failed for {incident_id[:8]}: {e}")
     finish_investigation(incident_id, "done")
     log.info(f"Reaper: {incident_id[:8]} resumed + completed")
 
@@ -1435,6 +1491,18 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
                         alert_key=issue.labels.get("alertname") or issue.title,
                     )
                     claim_investigation(incident_id, worker_id=socket.gethostname())
+                    from vishwakarma.storage.investigations import set_delivery
+                    delivery = {
+                        "title": issue.title, "severity": issue.severity, "source": issue.source,
+                        "question": question, "labels": issue.labels,
+                        "channel": slack_channel_id or "", "thread_ts": ack_ts or "",
+                        "matched_runbook_ids": matched_runbook_ids,
+                    }
+                    if ack_ts and hasattr(slack_client, "xyne_target"):
+                        xyne_channel, xyne_ts = slack_client.xyne_target(ack_ts)
+                        if xyne_channel and xyne_ts:
+                            delivery["xyne"] = {"channel": xyne_channel, "ts": xyne_ts}
+                    set_delivery(incident_id, delivery)
                 except Exception as inv_err:
                     log.warning(f"Durable-job setup failed (continuing without): {inv_err}")
 

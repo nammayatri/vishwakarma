@@ -753,96 +753,20 @@ def start_bot(config: "VishwakarmaConfig") -> None:
             pass
 
         try:
-            from vishwakarma.storage.queries import get_incident
-            incident = get_incident(incident_id)
-            if not incident:
+            from vishwakarma.core.feedback import record_correct
+            result = record_correct(config, incident_id)
+            if result["status"] == "missing":
                 return
-
-            analysis = incident.get("analysis", "")
-            alert_name = (incident.get("labels") or {}).get("alertname") or incident.get("title", "")
-
-            # Pass full analysis — LLM will extract key insight from the whole RCA
-            existing = learnings_manager.get(_infer_category(alert_name))
-            fact = _distill_fact(config, analysis, alert_name, existing_facts=existing)
-            if not fact:
+            if result["status"] == "duplicate":
                 client.chat_update(
                     channel=channel_id, ts=msg_ts,
                     text="✅ Already in learnings",
                     blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": f"✅ *<@{user}>* — this root cause is already captured in learnings."}}],
                 )
                 return
-            category = _infer_category(alert_name, config=config, fact=fact)
-            learnings_manager.append(category, fact)
-            log.info(f"[FEEDBACK] ✅ Appended to learnings[{category}]: {fact[:80]}")
-            # Compact if category has grown large
-            llm = config.make_llm()
-            learnings_manager.compact(category, llm.summarize)
-
-            # Update evidence baselines
-            try:
-                from vishwakarma.storage.evidence import mark_evidence_correct
-                mark_evidence_correct(incident_id, alert_name=alert_name)
-                log.info(f"[FEEDBACK] Evidence marked correct, baselines updated for {alert_name}")
-            except Exception as e:
-                log.debug(f"[FEEDBACK] Evidence update failed (non-fatal): {e}")
-
-            # Credit the runbooks used (hit + self-populate alert→runbook map)
-            try:
-                from vishwakarma.storage.runbooks import mark_runbook_hit
-                meta = incident.get("meta") or {}
-                if isinstance(meta, str):
-                    meta = json.loads(meta) if meta else {}
-                for rid in meta.get("matched_runbook_ids", []):
-                    mark_runbook_hit(rid, alert_name=alert_name)
-            except Exception as e:
-                log.debug(f"[FEEDBACK] Runbook hit update failed (non-fatal): {e}")
-
-            # Learned tool routing: credit the toolsets that produced this
-            # confirmed RCA's evidence for this alert class.
-            try:
-                from vishwakarma.storage.tool_effectiveness import (
-                    record_effective, tools_to_toolsets)
-                from vishwakarma.storage.runbooks import normalize_alert_key
-                tos = incident.get("tool_outputs") or []
-                if isinstance(tos, str):
-                    tos = json.loads(tos) if tos else []
-                used_tools = {o.get("tool_name") for o in tos if o.get("tool_name")}
-                toolsets = config.make_toolset_manager().active_toolsets()
-                used_toolsets = tools_to_toolsets(used_tools, toolsets)
-                record_effective(normalize_alert_key(alert_name), used_toolsets)
-            except Exception as e:
-                log.debug(f"[FEEDBACK] Tool effectiveness update failed (non-fatal): {e}")
-
-            # Extract and save replayable pattern
-            pattern_saved = False
-            try:
-                from vishwakarma.storage.patterns import extract_pattern_from_rca, save_pattern
-                import uuid
-                tool_outputs = incident.get("tool_outputs") or []
-                if isinstance(tool_outputs, str):
-                    tool_outputs = json.loads(tool_outputs) if tool_outputs else []
-                pattern_data = extract_pattern_from_rca(llm, alert_name, analysis, tool_outputs)
-                if pattern_data:
-                    save_pattern(
-                        pattern_id=str(uuid.uuid4()),
-                        alert_name=alert_name,
-                        root_cause_type=pattern_data["root_cause_type"],
-                        root_cause_detail=pattern_data["root_cause_detail"],
-                        investigation_steps=pattern_data["investigation_steps"],
-                        verification_keywords=pattern_data.get("verification_keywords", []),
-                        verification_anti_keywords=pattern_data.get("verification_anti_keywords", []),
-                        fix=pattern_data["fix"],
-                        incident_id=incident_id,
-                    )
-                    pattern_saved = True
-                    log.info(f"[FEEDBACK] Pattern saved: {alert_name}/{pattern_data['root_cause_type']}")
-            except Exception as e:
-                log.warning(f"[FEEDBACK] Pattern extraction failed (non-fatal): {e}")
-
-            # Replace with detailed confirmation of what was saved
-            saved_items = [f":brain: Learning saved to `{category}`"]
-            if pattern_saved:
-                saved_items.append(f":gear: Investigation pattern saved (`{pattern_data.get('root_cause_type', '?')}`) — will auto-replay on next same alert")
+            saved_items = [f":brain: Learning saved to `{result['category']}`"]
+            if result["pattern_saved"]:
+                saved_items.append(f":gear: Investigation pattern saved (`{result['pattern_type']}`) — will auto-replay on next same alert")
             saved_items.append(":chart_with_upwards_trend: Evidence baselines updated")
             saved_text = "\n".join(saved_items)
             client.chat_update(
@@ -908,15 +832,9 @@ def start_bot(config: "VishwakarmaConfig") -> None:
             channel_id = meta.get("channel", "")
             msg_ts = meta.get("msg_ts", "")
 
-            from vishwakarma.storage.queries import get_incident
-            incident = get_incident(incident_id) if incident_id else None
-            alert_name = (incident.get("labels") or {}).get("alertname") if incident else ""
-
-            # Distill correction into a clean fact, deduped against existing learnings
-            existing = learnings_manager.get(_infer_category(alert_name or ""))
-            fact = _distill_fact(config, real_cause, alert_name or "", correction=True, existing_facts=existing)
-            if not fact:
-                # Duplicate — remove buttons from original message
+            from vishwakarma.core.feedback import record_wrong
+            result = record_wrong(config, incident_id, real_cause)
+            if result["status"] == "duplicate":
                 if channel_id and msg_ts:
                     client.chat_update(
                         channel=channel_id, ts=msg_ts,
@@ -924,51 +842,6 @@ def start_bot(config: "VishwakarmaConfig") -> None:
                         blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": f"✅ *<@{user}>* — this correction is already captured in learnings."}}],
                     )
                 return
-            category = _infer_category(alert_name or "", config=config, fact=fact)
-            learnings_manager.append(category, fact)
-            llm = config.make_llm()
-            learnings_manager.compact(category, llm.summarize)
-            log.info(f"[FEEDBACK] ❌ Correction appended to learnings[{category}]: {fact[:80]}")
-
-            # After saving correction to learnings, invalidate matching patterns
-            try:
-                from vishwakarma.storage.patterns import invalidate_patterns_for_incident
-                invalidate_patterns_for_incident(incident_id)
-                log.info(f"[FEEDBACK] Invalidated patterns linked to incident {incident_id}")
-            except Exception as e:
-                log.warning(f"[FEEDBACK] Pattern invalidation failed (non-fatal): {e}")
-
-            # Penalize the runbooks that led to the wrong RCA (auto-demote on
-            # repeated misses).
-            matched_runbook_ids = []
-            try:
-                from vishwakarma.storage.runbooks import mark_runbook_miss
-                inc_meta = (incident.get("meta") or {}) if incident else {}
-                if isinstance(inc_meta, str):
-                    inc_meta = _json.loads(inc_meta) if inc_meta else {}
-                matched_runbook_ids = inc_meta.get("matched_runbook_ids", [])
-                for rid in matched_runbook_ids:
-                    mark_runbook_miss(rid)
-            except Exception as e:
-                log.debug(f"[FEEDBACK] Runbook miss update failed (non-fatal): {e}")
-
-            try:
-                from vishwakarma.core.amendment_proposals import propose_amendments
-                from vishwakarma.storage import runbooks as rb
-                wrong_rca = (incident.get("analysis") or "")[:4000] if incident else ""
-                bot_llm = config.make_llm()
-                propose_amendments(
-                    incident_id, matched_runbook_ids, corrected=False,
-                    fetch_incident=lambda i: {
-                        "analysis": f"WRONG RCA:\n{wrong_rca}\n\n"
-                                    f"CORRECT ROOT CAUSE (per human):\n{real_cause}"},
-                    get_runbook=rb.get_runbook,
-                    summarize=lambda p: bot_llm.summarize(p),
-                    save_proposal=rb.save_proposal)
-            except Exception as e:
-                log.debug(f"[FEEDBACK] Amendment proposal failed (non-fatal): {e}")
-
-            # Update the original feedback message
             if channel_id and msg_ts:
                 client.chat_update(
                     channel=channel_id,
@@ -976,7 +849,7 @@ def start_bot(config: "VishwakarmaConfig") -> None:
                     text=f"❌ RCA corrected by <@{user}>",
                     blocks=[{
                         "type": "section",
-                        "text": {"type": "mrkdwn", "text": f"❌ *Corrected by <@{user}>* — real cause added to `{category}` learnings."},
+                        "text": {"type": "mrkdwn", "text": f"❌ *Corrected by <@{user}>* — real cause added to `{result['category']}` learnings."},
                     }],
                 )
         except Exception as e:

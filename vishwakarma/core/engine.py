@@ -24,6 +24,7 @@ from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable
 
+from vishwakarma.core.rca_text import clean_rca
 from vishwakarma.core.compaction import compact_messages
 from vishwakarma.core.llm import VishwakarmaLLM
 from vishwakarma.core.models import (
@@ -837,6 +838,7 @@ class InvestigationEngine:
                             )
                     for f in overlap_futures.values():
                         f.cancel()
+                    collected_content = clean_rca(collected_content)
                     messages.append({"role": "assistant", "content": collected_content})
                     _checkpoint(step + 1)
                     yield {"type": "done", "content": collected_content, "messages": messages}

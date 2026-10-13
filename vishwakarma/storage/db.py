@@ -78,6 +78,7 @@ CREATE TABLE IF NOT EXISTS investigations (
     messages      TEXT,                  -- JSON: conversation so far (resumable state)
     findings      TEXT,                  -- JSON: per-cloud sub-agent results
     code_session  TEXT,                  -- JSON: coding-agent session id + transcript
+    delivery      TEXT,                  -- JSON: where/how to post the RCA if the run is resumed
     attempt       INTEGER DEFAULT 0,
     worker_id     TEXT,
     heartbeat_at  REAL,
@@ -347,6 +348,25 @@ def _to_pg_schema(schema: str) -> str:
             .replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY"))
 
 
+_MIGRATIONS = (
+    "ALTER TABLE investigations ADD COLUMN delivery TEXT",
+)
+
+
+def _apply_migrations(conn) -> None:
+    for stmt in _MIGRATIONS:
+        if _backend == "postgres":
+            stmt = stmt.replace("ADD COLUMN", "ADD COLUMN IF NOT EXISTS")
+        try:
+            conn.execute(stmt)
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
+
 def init_db(db_path: str | None = None, dsn: str | None = None,
             embedding_dim: int | None = None) -> None:
     """
@@ -374,6 +394,8 @@ def init_db(db_path: str | None = None, dsn: str | None = None,
             _conn.executescript(_to_pg_schema(PATTERNS_SCHEMA))
             from vishwakarma.storage.evidence import EVIDENCE_SCHEMA
             _conn.executescript(_to_pg_schema(EVIDENCE_SCHEMA))
+            _conn.commit()
+            _apply_migrations(_conn)
             # Commit base schema BEFORE attempting pgvector — a failed
             # CREATE EXTENSION rolls back its transaction, and must not
             # take the uncommitted schema down with it.
@@ -397,6 +419,7 @@ def init_db(db_path: str | None = None, dsn: str | None = None,
             from vishwakarma.storage.evidence import EVIDENCE_SCHEMA
             _conn.executescript(EVIDENCE_SCHEMA)
             _conn.commit()
+            _apply_migrations(_conn)
             log.info(f"Database initialized at {_db_path}")
 
 
