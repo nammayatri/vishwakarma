@@ -528,11 +528,11 @@ def test_xyne_client_sends_flow_not_blocks_and_keeps_action_ids_intact():
     c._session = Sess()
     a = _propose()
     out = c.chat_postMessage(channel="C", thread_ts="R", text=":wrench: *hi* `x`", blocks=rem.proposal_blocks(a))
-    thread_url, thread_body = sent[0]
+    card_url, card = sent[0]
+    thread_url, thread_body = sent[1]
     assert thread_url.endswith("/api/apps/slack/chat.postMessage") and thread_body["thread_ts"] == "R"
     assert "flow" not in thread_body and "blocks" not in thread_body
     assert thread_body["text"].startswith("🔧 hi x") and "card posted just below" in thread_body["text"]
-    card_url, card = sent[1]
     assert card_url == "https://x/api/apps/chat/postMessage" and card["channelId"] == "C" and "thread_ts" not in card
     assert card["flow"]["components"][-1]["children"][0]["props"]["action"]["actionId"] == f"{rem.APPROVE_ACTION_ID}:{a['id']}"
     assert out["ts"] == "flow:MID-1"

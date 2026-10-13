@@ -840,12 +840,15 @@ def _deliver_resumed_rca(config, ctx: dict, incident_id: str, analysis: str) -> 
         log.warning(f"Reaper: PDF generation failed, posting text: {e}")
 
     slack_ts = None
-    channel, thread_ts, labels = ctx["channel"], ctx["thread_ts"], ctx["labels"]
+    channel, thread_ts, labels, xyne = ctx["channel"], ctx["thread_ts"], ctx["labels"], ctx["xyne"]
     if not (channel and _destination_configured(config, labels)):
         log.warning(f"Reaper: {incident_id[:8]} has no delivery target (channel={channel!r}) — RCA saved, not posted")
         return pdf_path, slack_ts
     try:
         dest = _make_destination(config, labels)
+        if xyne.get("ts") and xyne.get("conversation_id"):
+            from vishwakarma.plugins.relays.xyne.plugin import seed_conversation
+            seed_conversation(xyne["ts"], xyne["conversation_id"])
         if thread_ts:
             try:
                 dest._get_client().chat_update(
@@ -866,11 +869,11 @@ def _deliver_resumed_rca(config, ctx: dict, incident_id: str, analysis: str) -> 
         log.info(f"Reaper: {incident_id[:8]} RCA posted to {channel} thread={thread_ts} pdf={'yes' if pdf_path else 'no'}")
     except Exception as e:
         log.warning(f"Reaper: RCA post failed for {incident_id[:8]}: {e}")
-    xyne = ctx["xyne"]
-    if xyne and thread_ts:
+    if xyne and thread_ts and labels.get("platform") != "xyne":
         try:
             from vishwakarma.plugins.relays.xyne.plugin import restore_alert_mirror
-            mirror = restore_alert_mirror(config, xyne.get("channel", ""), thread_ts, xyne.get("ts", ""))
+            mirror = restore_alert_mirror(config, xyne.get("channel", ""), thread_ts, xyne.get("ts", ""),
+                                          xyne.get("conversation_id", ""))
             if mirror:
                 mirror.post_investigation(
                     thread_ts, title=ctx["title"], analysis=analysis, source=ctx["source"],
@@ -1500,8 +1503,16 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
                     }
                     if ack_ts and hasattr(slack_client, "xyne_target"):
                         xyne_channel, xyne_ts = slack_client.xyne_target(ack_ts)
-                        if xyne_channel and xyne_ts:
-                            delivery["xyne"] = {"channel": xyne_channel, "ts": xyne_ts}
+                    elif ack_ts and (issue.labels or {}).get("platform") == "xyne":
+                        xyne_channel, xyne_ts = slack_channel_id, ack_ts
+                    else:
+                        xyne_channel = xyne_ts = None
+                    if xyne_channel and xyne_ts:
+                        from vishwakarma.plugins.relays.xyne.plugin import conversation_id_for
+                        delivery["xyne"] = {"channel": xyne_channel, "ts": xyne_ts}
+                        xyne_conversation = conversation_id_for(xyne_ts)
+                        if xyne_conversation:
+                            delivery["xyne"]["conversation_id"] = xyne_conversation
                     set_delivery(incident_id, delivery)
                 except Exception as inv_err:
                     log.warning(f"Durable-job setup failed (continuing without): {inv_err}")

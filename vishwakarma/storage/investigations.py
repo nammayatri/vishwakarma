@@ -169,6 +169,13 @@ def get_investigation(incident_id: str) -> dict | None:
     return _row_to_dict(row) if row else None
 
 
+def get_delivery(incident_id: str) -> dict:
+    conn = _get_conn()
+    row = conn.execute("SELECT delivery FROM investigations WHERE id=?", (incident_id,)).fetchone()
+    value = _row_to_dict(row).get("delivery") if row else None
+    return value if isinstance(value, dict) else {}
+
+
 def find_orphaned(stale_seconds: int = 180, limit: int = 20) -> list[dict]:
     """
     Investigations whose worker stopped heartbeating — candidates for

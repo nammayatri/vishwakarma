@@ -29,6 +29,7 @@ real API (2026-08-11):
 """
 import logging
 import re
+import threading
 
 import requests
 
@@ -69,6 +70,58 @@ _FLOW_ACTION_PREFIX = "vk_remediate_"
 _FEEDBACK_ACTION_PREFIX = "vk_rca_"
 _FLOW_ACTION_PREFIXES = (_FLOW_ACTION_PREFIX, _FEEDBACK_ACTION_PREFIX)
 FLOW_TS_PREFIX = "flow:"
+_CONVERSATION_KEYS = ("conversationId", "conversation_id", "threadId", "thread_id")
+_CONVERSATION_IDS: dict[str, str] = {}
+_CONVERSATION_LOCK = threading.Lock()
+_MAX_CONVERSATION_IDS = 2000
+_logged_response_shapes: set[str] = set()
+FEEDBACK_CHANNEL_SEP = "|"
+_CHANNEL_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,40}$")
+
+
+def seed_conversation(ts: str, conversation_id: str) -> None:
+    if not (ts and conversation_id):
+        return
+    with _CONVERSATION_LOCK:
+        _CONVERSATION_IDS.pop(ts, None)
+        while len(_CONVERSATION_IDS) >= _MAX_CONVERSATION_IDS:
+            _CONVERSATION_IDS.pop(next(iter(_CONVERSATION_IDS)), None)
+        _CONVERSATION_IDS[ts] = str(conversation_id)
+
+
+def _find_conversation_id(data, depth: int = 2) -> str:
+    if not isinstance(data, dict):
+        return ""
+    for key in _CONVERSATION_KEYS:
+        if data.get(key) and isinstance(data[key], (str, int)):
+            return str(data[key])
+    if depth > 0:
+        for value in data.values():
+            found = _find_conversation_id(value, depth - 1)
+            if found:
+                return found
+    return ""
+
+
+def _remember_conversation(kind: str, ts: str, data) -> None:
+    with _CONVERSATION_LOCK:
+        first = kind not in _logged_response_shapes
+        _logged_response_shapes.add(kind)
+    if first:
+        log.info(f"Xyne {kind} response keys: {sorted(data) if isinstance(data, dict) else type(data).__name__}")
+    found = _find_conversation_id(data)
+    if ts and found:
+        seed_conversation(ts, found)
+
+
+def conversation_id_for(ts: str | None) -> str:
+    if not ts:
+        return ""
+    with _CONVERSATION_LOCK:
+        value = _CONVERSATION_IDS.pop(ts, "")
+        if value:
+            _CONVERSATION_IDS[ts] = value
+        return value
 
 
 def _xyne_text(text: str) -> str:
@@ -88,7 +141,7 @@ def text_flow(text: str, screen_id: str = "argus-outcome") -> dict:
             "state": {**_FLOW_STATE}}
 
 
-def blocks_to_flow(blocks: list | None) -> dict | None:
+def blocks_to_flow(blocks: list | None, channel: str = "") -> dict | None:
     """Slack-style blocks carrying our remediation Approve/Reject or RCA feedback buttons become a Xyne
     Flow UI v2 card whose buttons submit `<action_id>:<id>` to the app webhook. Any other blocks are
     left for the Slack-compat layer."""
@@ -111,11 +164,14 @@ def blocks_to_flow(blocks: list | None) -> dict | None:
             children = []
             for j, e in enumerate(b["elements"]):
                 destructive = e.get("style") == "danger"
+                action_id = f"{e['action_id']}:{e.get('value', '')}"
+                if channel and str(e["action_id"]).startswith(_FEEDBACK_ACTION_PREFIX):
+                    action_id += f"{FEEDBACK_CHANNEL_SEP}{channel}"
                 children.append({
                     "id": f"btn{i}_{j}", "type": "button",
                     "props": {"label": (e.get("text") or {}).get("text", "OK"),
                               "variant": "destructive" if destructive else "primary",
-                              "action": {"type": "submit", "actionId": f"{e['action_id']}:{e.get('value', '')}"}}})
+                              "action": {"type": "submit", "actionId": action_id}}})
             components.append({"id": f"row{i}", "type": "row", "style": {"gap": "8px"}, "children": children})
     feedback = any(
         str(e.get("action_id", "")).startswith(_FEEDBACK_ACTION_PREFIX)
@@ -169,18 +225,35 @@ class XyneWebClient:
         return r.json() if r.content else {}
 
     def _post_flow_card(self, channel, text: str, flow: dict, thread_ts: str | None) -> dict:
-        if thread_ts:
-            hint = ("Mark the RCA correct or wrong" if flow.get("screenId") == "argus-feedback"
-                    else "Approve or reject")
-            self.chat_postMessage(channel=channel, thread_ts=thread_ts,
-                                  text=f"{_xyne_text(text)}\n\n⬇️ {hint} with the card posted just below in the channel.")
-        data = self._native_post("chat/postMessage", {"channelId": channel, "text": _xyne_text(text)[:300], "flow": flow})
-        return {"ok": True, "ts": f"{FLOW_TS_PREFIX}{data.get('messageId', '')}", "channel": channel}
+        body = {"channelId": channel, "text": _xyne_text(text)[:300], "flow": flow}
+        conversation_id = conversation_id_for(thread_ts)
+        data = None
+        in_thread = False
+        if conversation_id:
+            try:
+                data = self._native_post("chat/postMessage", {**body, "conversationId": conversation_id})
+                returned = _find_conversation_id(data)
+                in_thread = not returned or returned == conversation_id
+            except XyneApiError as e:
+                log.warning(f"Xyne threaded card post failed ({e}) — posting to the channel instead")
+        if data is None:
+            data = self._native_post("chat/postMessage", body)
+        if thread_ts and not in_thread:
+            self._thread_pointer(channel, text, flow, thread_ts)
+        card_ts = f"{FLOW_TS_PREFIX}{data.get('messageId', '')}"
+        _remember_conversation("flow card", card_ts, data)
+        return {"ok": True, "ts": card_ts, "channel": channel}
+
+    def _thread_pointer(self, channel, text: str, flow: dict, thread_ts: str) -> None:
+        hint = ("Mark the RCA correct or wrong" if flow.get("screenId") == "argus-feedback"
+                else "Approve or reject")
+        self.chat_postMessage(channel=channel, thread_ts=thread_ts,
+                              text=f"{_xyne_text(text)}\n\n⬇️ {hint} with the card posted just below in the channel.")
 
     def chat_postMessage(self, channel, text: str = "", thread_ts: str | None = None,
                           blocks: list | None = None, attachments: list | None = None,
                           flow: dict | None = None, **_ignored) -> dict:
-        flow = flow or blocks_to_flow(blocks)
+        flow = flow or blocks_to_flow(blocks, channel)
         if flow:
             return self._post_flow_card(channel, text, flow, thread_ts)
         body: dict = {"channel": channel, "text": text}
@@ -204,6 +277,7 @@ class XyneWebClient:
                 data = self._post("chat.postMessage", body)
             else:
                 raise
+        _remember_conversation("chat.postMessage", data.get("ts", ""), data)
         return {"ok": True, "ts": data.get("ts", ""), "channel": data.get("channel") or channel}
 
     def chat_update(self, channel, ts, text: str = "", blocks: list | None = None,
@@ -351,6 +425,9 @@ class MirroredClient:
     def xyne_target(self, primary_ts):
         return self._xyne_channel, self.xyne_ts(primary_ts)
 
+    def xyne_conversation(self, primary_ts):
+        return conversation_id_for(self.xyne_ts(primary_ts))
+
     def chat_postMessage(self, **kwargs):
         resp = self._primary.chat_postMessage(**kwargs)
         try:
@@ -391,9 +468,10 @@ class MirroredClient:
         )
 
 
-def restore_alert_mirror(config, xyne_channel: str, primary_ts: str, xyne_ts: str):
+def restore_alert_mirror(config, xyne_channel: str, primary_ts: str, xyne_ts: str, conversation_id: str = ""):
     if not (config.xyne_base_url and config.xyne_bot_token and xyne_channel and xyne_ts):
         return None
+    seed_conversation(xyne_ts, conversation_id)
     mirror = MirroredClient(None, XyneWebClient(config.xyne_base_url, config.xyne_bot_token), xyne_channel)
     mirror._ts[primary_ts] = xyne_ts
     return mirror

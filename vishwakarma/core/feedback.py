@@ -175,15 +175,32 @@ def _outcome_text(verb: str, result: dict, who: str) -> str:
     return f"❌ Marked wrong by {who}{note}. Matching replay patterns were invalidated."
 
 
+def _xyne_channel_for(incident_id: str) -> str:
+    try:
+        from vishwakarma.storage.investigations import get_delivery
+        return str((get_delivery(incident_id).get("xyne") or {}).get("channel") or "")
+    except Exception as e:
+        log.debug(f"[FEEDBACK] Could not resolve Xyne channel for {incident_id[:8]}: {e}")
+    return ""
+
+
+def _card_channel(incident_id: str, embedded: str) -> str:
+    from vishwakarma.plugins.relays.xyne.plugin import _CHANNEL_ID_RE
+    saved = _xyne_channel_for(incident_id)
+    if saved:
+        return saved
+    return embedded if _CHANNEL_ID_RE.match(embedded or "") else ""
+
+
 def handle_flow_action(config, payload: dict, user_lookup) -> dict | None:
-    verb, _, incident_id = str(payload.get("actionId") or "").partition(":")
+    verb, _, rest = str(payload.get("actionId") or "").partition(":")
+    incident_id, _, embedded_channel = rest.partition("|")
     if verb not in (CORRECT_ACTION_ID, WRONG_ACTION_ID) or not incident_id:
         return None
     context = payload.get("context") or {}
     user_id = str(context.get("userId") or payload.get("userId") or "")
     name, _email = user_lookup(user_id)
     who = name or user_id or "someone"
-    channel = str(payload.get("conversationId") or "")
     message_id = str(payload.get("messageId") or "")
 
     key = f"{verb}:{incident_id}"
@@ -191,6 +208,10 @@ def handle_flow_action(config, payload: dict, user_lookup) -> dict | None:
         if key in _in_flight:
             return {"type": "ack", "message": "Already saving this feedback."}
         _in_flight.add(key)
+
+    channel = _card_channel(incident_id, embedded_channel)
+    if not channel:
+        log.warning(f"[FEEDBACK] No Xyne channel known for {incident_id[:8]} — feedback will be saved but the card cannot be updated")
 
     def _update_card(text: str) -> None:
         if not (channel and message_id and config.xyne_base_url and config.xyne_bot_token):
