@@ -712,7 +712,7 @@ def load_matching_runbooks(alert_name: str, llm=None, cloud: str = "") -> list[s
         # Empty table → fall through to file-based. Non-empty table with no
         # match → also fall through (file catalog may still know it).
     except Exception as e:
-        log.debug(f"DB runbook matching unavailable ({e}) — using file-based")
+        log.warning(f"DB runbook matching unavailable ({e}) — using file-based")
 
     agents, agents_parent = _load_agents_catalog()
     if agents is None:

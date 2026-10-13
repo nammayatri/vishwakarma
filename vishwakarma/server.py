@@ -1120,13 +1120,18 @@ async def _do_investigation(config, state, issue, incident_id: str, fingerprint:
                     from vishwakarma.core.runbook_match import match_runbooks
                     matched = match_runbooks(alert_name, cloud=_cloud, llm=llm)
                     if matched:
+                        log.info(f"Runbook match for '{alert_name}' (cloud={_cloud or 'any'}): {[m['id'] for m in matched]}")
                         return ([f"# Runbook: {m['title']}\n\n{m['content_md']}" for m in matched],
                                 [m["id"] for m in matched])
+                    log.info(f"Runbook match for '{alert_name}' (cloud={_cloud or 'any'}): none from DB")
                 except Exception as e:
-                    log.debug(f"Hybrid runbook match failed: {e}")
+                    log.warning(f"Hybrid runbook match failed for '{alert_name}': {e}")
                 try:
-                    return load_matching_runbooks(alert_name, llm), []
-                except Exception:
+                    fallback = load_matching_runbooks(alert_name, llm)
+                    log.info(f"Runbook file fallback for '{alert_name}': {len(fallback)} loaded")
+                    return fallback, []
+                except Exception as e:
+                    log.warning(f"Runbook file fallback failed for '{alert_name}': {e}")
                     return [], []
 
             runbooks_future = loop.run_in_executor(None, _match_runbooks_once)

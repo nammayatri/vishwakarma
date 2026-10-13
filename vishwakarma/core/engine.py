@@ -813,7 +813,28 @@ class InvestigationEngine:
                         )})
                         yield {"type": "status", "message": "0 tools run — directing the agent to investigate + propose a fix before concluding"}
                         continue
-                    # Genuinely done (tools were run, or already nudged once).
+                    if len((collected_content or "").strip()) < 80:
+                        log.warning(
+                            "Step %d: model ended with %d chars of text after %d tool outputs — forcing RCA synthesis",
+                            step + 1, len((collected_content or "").strip()), len(all_stream_tool_outputs))
+                        yield {"type": "status", "message": "Model returned no analysis — forcing RCA synthesis from gathered evidence"}
+                        synth_msgs = messages + [{"role": "user", "content": (
+                            "Your last reply contained no analysis. Using ONLY the tool results above, "
+                            "write the final RCA now. Do NOT call any tools.\n\n"
+                            "## Root Cause\n## Confidence\n## Evidence Chain\n## Immediate Fix\n## Prevention\n"
+                            "## Needs More Investigation\n\nIf the cause is unclear, state what was checked, "
+                            "what was found, and what is needed to confirm."
+                        )}]
+                        try:
+                            collected_content = self.llm.synthesize_final(synth_msgs).strip()
+                        except Exception as e:
+                            log.error("Forced RCA synthesis failed: %s", e)
+                        if len(collected_content.strip()) < 80:
+                            collected_content = (
+                                "Investigation finished but the model produced no written analysis. "
+                                f"{len(all_stream_tool_outputs)} tool call(s) ran — review the tool outputs "
+                                "in the console for the raw evidence."
+                            )
                     for f in overlap_futures.values():
                         f.cancel()
                     messages.append({"role": "assistant", "content": collected_content})
