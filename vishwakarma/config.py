@@ -293,6 +293,24 @@ class VishwakarmaConfig:
         self.argus_app_token: str = _env("ARGUS_APP_TOKEN", argus.get("app_token", "")) or ""
         self.argus_mre_group_id: str = _env("ARGUS_MRE_GROUP_ID", argus.get("mre_group_id", "")) or ""
 
+        # Xyne — same @mention-triggered investigation flow as Argus, on Xyne's
+        # Slack-compatible REST API instead of Slack itself. Events arrive via
+        # a webhook (/api/xyne/events) rather than a socket connection, gated
+        # by signing_secret (preferred — real HMAC request-signature
+        # verification, matching what Xyne actually issued) or webhook_token
+        # (fallback shared-secret-in-URL) if signing_secret is unset.
+        # bot_user_id is optional — self-discovered via auth.test if unset.
+        # Unset base_url/bot_token = Xyne disabled entirely.
+        xyne = raw.get("xyne", {})
+        self.xyne_base_url: str = _env("XYNE_BASE_URL", xyne.get("base_url", "")) or ""
+        self.xyne_bot_token: str = _env("XYNE_BOT_TOKEN", xyne.get("bot_token", "")) or ""
+        self.xyne_bot_user_id: str = _env("XYNE_BOT_USER_ID", xyne.get("bot_user_id", "")) or ""
+        self.xyne_mre_group_id: str = _env("XYNE_MRE_GROUP_ID", xyne.get("mre_group_id", "")) or ""
+        self.xyne_signing_secret: str = _env("XYNE_SIGNING_SECRET", xyne.get("signing_secret", "")) or ""
+        self.xyne_webhook_token: str = _env("XYNE_WEBHOOK_TOKEN", xyne.get("webhook_token", "")) or ""
+        self.xyne_alert_channel: str = _env("XYNE_ALERT_CHANNEL", xyne.get("alert_channel", "")) or ""
+        self.xyne_mirror_alerts: bool = (_env("XYNE_MIRROR_ALERTS", str(xyne.get("mirror_alerts", True))) or "true").lower() != "false"
+
         # Embeddings provider (semantic RAG). Unset = keyword-only matching.
         emb = raw.get("embeddings", {})
         self.embeddings_api_base: str = _env("VK_EMBEDDINGS_API_BASE", emb.get("api_base", "")) or ""
@@ -311,6 +329,67 @@ class VishwakarmaConfig:
 
         # Toolsets config (dict of name → {enabled, config})
         self.toolsets_config: dict[str, Any] = raw.get("toolsets", {})
+
+        # Fast triage — staged Istio→Release Monitoring→DB/Redis→pod-resource
+        # narration posted to Slack (one message per stage) ahead of the full
+        # agentic RCA. Needs the `prometheus` toolset; defaults to on whenever
+        # that toolset is enabled, override with fast_triage.enabled: false.
+        # timeout_seconds is a TOTAL budget across all 4 stages, not per-stage.
+        ft = raw.get("fast_triage", {})
+        _prom_enabled = bool(self.toolsets_config.get("prometheus", {}).get("enabled", False))
+        self.fast_triage_enabled: bool = bool(ft.get("enabled", _prom_enabled)) and _prom_enabled
+        self.fast_triage_timeout_seconds: int = int(
+            _env("VK_FAST_TRIAGE_TIMEOUT", str(ft.get("timeout_seconds", 240)))
+        )
+        self.fast_triage_top_n: int = int(_env("VK_FAST_TRIAGE_TOP_N", str(ft.get("top_n", 5))))
+        self.fast_triage_namespace_exclude: str = ft.get("istio_namespace_exclude", "app-monitor")
+        # Business Impact stage — merchantOperatingCityId -> display-name map.
+        # A city has one merchant_operating_city row per onboarded merchant,
+        # so several ids legitimately map to one name; the stage sums them.
+        # Empty/unset = every city shown ranked by search volume, raw id.
+        self.fast_triage_business_impact_cities: dict[str, str] = ft.get("business_impact_cities", {}) or {}
+        self.fast_triage_service_hints: dict[str, list[dict]] = ft.get("service_hints", {}) or {}
+        self.fast_triage_redis_instances: dict[str, dict] = ft.get("redis_instances", {}) or {}
+        # How long the deep investigation will wait for the fast-triage
+        # pipeline to finish before proceeding without its findings as
+        # pre-investigation evidence — separate from (and much shorter than)
+        # fast_triage_timeout_seconds, which is triage's own total budget.
+        # Slack narration from fast_triage is unaffected either way (posts as
+        # each stage completes, on its own schedule).
+        self.fast_triage_evidence_wait_seconds: int = int(
+            _env("VK_FAST_TRIAGE_EVIDENCE_WAIT", str(ft.get("evidence_wait_seconds", 90)))
+        )
+
+        rem = raw.get("remediation", {})
+        self.remediation_enabled: bool = str(_env("VK_REMEDIATION_ENABLED", str(rem.get("enabled", True)))).lower() == "true"
+        self.remediation_allowed_namespaces: list[str] = _csv(
+            _env("VK_REMEDIATION_ALLOWED_NAMESPACES", None), rem.get("allowed_namespaces") or ["atlas"])
+        self.remediation_max_pods: int = int(_env("VK_REMEDIATION_MAX_PODS", rem.get("max_pods", 3)))
+        self.remediation_min_requests: float = float(_env("VK_REMEDIATION_MIN_REQUESTS", rem.get("min_requests", 50)))
+        self.remediation_outlier_factor: float = float(_env("VK_REMEDIATION_OUTLIER_FACTOR", rem.get("outlier_factor", 10)))
+        self.remediation_ttl_seconds: int = int(_env("VK_REMEDIATION_TTL_SECONDS", rem.get("ttl_seconds", 900)))
+        self.remediation_approver_emails: list[str] = _csv(
+            _env("VK_REMEDIATION_APPROVER_EMAILS", None), rem.get("approver_emails") or [])
+        self.remediation_pod_label: str = str(_env("VK_REMEDIATION_POD_LABEL", rem.get("pod_label", "pod")))
+        self.remediation_kubectl_bin: str = str(_env("VK_REMEDIATION_KUBECTL_BIN", rem.get("kubectl_bin", "kubectl")))
+        drainer_redis = rem.get("drainer_redis") or {}
+        self.remediation_redis_cli_bin: str = str(_env("VK_REMEDIATION_REDIS_CLI_BIN", rem.get("redis_cli_bin", "redis-cli")))
+        self.remediation_drainer_redis_host: str = str(
+            _env("VK_REMEDIATION_DRAINER_REDIS_HOST", drainer_redis.get("host", "")) or "")
+        self.remediation_drainer_redis_port: int = int(
+            _env("VK_REMEDIATION_DRAINER_REDIS_PORT", drainer_redis.get("port", 6379)))
+        self.remediation_drainer_redis_cluster: bool = str(
+            _env("VK_REMEDIATION_DRAINER_REDIS_CLUSTER", drainer_redis.get("cluster", False))).lower() == "true"
+
+        # GCP Cloud Monitoring webhook — receives Cloud Monitoring incident
+        # notifications and triggers the same investigation flow as
+        # /api/alertmanager. GCP doesn't support IP-allowlisting webhooks, so
+        # this is secured with a shared secret token instead (checked via
+        # constant-time comparison); unset = endpoint stays disabled.
+        gcm = raw.get("gcp_cloud_monitoring", {})
+        self.gcp_cm_webhook_token: str = _env(
+            "VK_GCP_CM_WEBHOOK_TOKEN", gcm.get("webhook_token", "")
+        ) or ""
 
         # Custom toolset YAML paths
         self.custom_toolset_paths: list[str] = raw.get("custom_toolset_paths", [])
@@ -340,6 +419,20 @@ class VishwakarmaConfig:
             _env("VK_DEDUP_WINDOW", str(raw.get("dedup_window", 300)))
         )
 
+        # Alert channel allowlist — AlertManager's catch-all 'argus' receiver
+        # forwards EVERY critical/warning alert (all vm-rule routes: system,
+        # sev2, pt, data, ...). Only alerts whose routing label value is in
+        # this allowlist trigger an investigation; the rest still reach their
+        # own Slack channels via their normal receivers. Applies only to
+        # source="alertmanager" issues — GCP Cloud Monitoring / Slack mentions
+        # are unaffected. Empty allow list = no filtering.
+        # e.g. alert_filter: {allow: [ny-system-alerts, ny-sev2-alerts], label: alert}
+        af = raw.get("alert_filter", {})
+        self.alert_filter_allow: list[str] = (
+            _split_keys(_env("VK_ALERT_FILTER_ALLOW", "")) or af.get("allow") or []
+        )
+        self.alert_filter_label: str = str(_env("VK_ALERT_FILTER_LABEL", af.get("label", "alert")))
+
         # Cost report scheduler
         cost_cfg = raw.get("cost_report", {})
         self.cost_report = {
@@ -349,6 +442,25 @@ class VishwakarmaConfig:
             "channel": _env("VK_COST_REPORT_CHANNEL", cost_cfg.get("channel", "")),
             "anomaly_threshold": float(cost_cfg.get("anomaly_threshold", 0.15)),
             "region": cost_cfg.get("region", "ap-south-1"),
+        }
+
+        handoff_cfg = raw.get("handoff", {})
+        self.handoff = {
+            "enabled": _env("VK_HANDOFF_ENABLED",
+                            str(handoff_cfg.get("enabled", False))).lower() in ("true", "1", "yes"),
+            "weekday": str(handoff_cfg.get("weekday", "1")),
+            "hour": str(handoff_cfg.get("hour", "04")),
+            "channel": _env("VK_HANDOFF_CHANNEL", handoff_cfg.get("channel", "")),
+        }
+
+        infra_gpt_cfg = raw.get("ny_infra_gpt", {})
+        self.ny_infra_gpt = {
+            "enabled": _env("NY_INFRA_GPT_ENABLED",
+                            str(infra_gpt_cfg.get("enabled", False))).lower() in ("true", "1", "yes"),
+            "url": _env("NY_INFRA_GPT_URL",
+                        infra_gpt_cfg.get("url", "http://nyinfragpt.atlas.svc.cluster.local")),
+            "token": _env("NY_INFRA_GPT_TOKEN", infra_gpt_cfg.get("token", "")) or "",
+            "timeout": float(_env("NY_INFRA_GPT_TIMEOUT", str(infra_gpt_cfg.get("timeout", 180)))),
         }
 
     # ── Factory methods ────────────────────────────────────────────────────────
@@ -469,6 +581,12 @@ def _env(key: str, fallback: Any = None) -> Any:
     """Return env var if set, else fallback."""
     val = os.environ.get(key)
     return val if val is not None else fallback
+
+
+def _csv(env_val: str | None, fallback: list) -> list[str]:
+    if env_val is None:
+        return [str(x) for x in fallback]
+    return [x.strip() for x in env_val.split(",") if x.strip()]
 
 
 def _split_keys(val: str) -> list[str]:
@@ -594,7 +712,7 @@ def load_matching_runbooks(alert_name: str, llm=None, cloud: str = "") -> list[s
         # Empty table → fall through to file-based. Non-empty table with no
         # match → also fall through (file catalog may still know it).
     except Exception as e:
-        log.debug(f"DB runbook matching unavailable ({e}) — using file-based")
+        log.warning(f"DB runbook matching unavailable ({e}) — using file-based")
 
     agents, agents_parent = _load_agents_catalog()
     if agents is None:

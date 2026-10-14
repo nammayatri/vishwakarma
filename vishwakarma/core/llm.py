@@ -31,6 +31,20 @@ litellm.num_retries = 2              # max 2 retries per call (not infinite)
 litellm.request_timeout = 30         # 30s per attempt
 
 
+def _thinking_off_body() -> dict | None:
+    if os.environ.get("VK_DISABLE_THINKING", "").lower() in ("1", "true", "yes"):
+        return {"chat_template_kwargs": {"enable_thinking": False, "thinking": False}}
+    return None
+
+
+def _strip_think(text: str) -> str:
+    import re
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    if "</think>" in text:
+        text = text.rsplit("</think>", 1)[1]
+    return text.strip()
+
+
 class LLMConfig(BaseModel):
     model: str
     fast_model: str | None = None  # cheap/fast model for summarization + compaction
@@ -209,14 +223,9 @@ class VishwakarmaLLM:
             if tools:
                 kwargs["tools"] = tools
                 kwargs["tool_choice"] = "auto"
-            # Same reasoning policy as complete(): thinking off by default —
-            # it adds 10-30s/step on GLM-class models and reduces parallel
-            # tool-call batching. VK_THINK_ON_TOOL_STEPS=true re-enables.
-            _think = os.environ.get("VK_THINK_ON_TOOL_STEPS", "").lower() in ("1", "true", "yes")
-            if not tools or not _think:
-                kwargs["extra_body"] = {
-                    "chat_template_kwargs": {"enable_thinking": False, "thinking": False}
-                }
+            _body = _thinking_off_body()
+            if _body:
+                kwargs["extra_body"] = _body
 
             try:
                 response = completion(**kwargs)
@@ -235,6 +244,7 @@ class VishwakarmaLLM:
             raise last_err  # type: ignore
 
         collected_content = ""
+        collected_reasoning = ""
         collected_tool_calls: dict[int, dict] = {}
         emitted_complete: set[int] = set()  # indices already yielded as tool_call_complete
 
@@ -252,7 +262,9 @@ class VishwakarmaLLM:
             if not delta:
                 continue
 
-            # Text delta
+            if getattr(delta, "reasoning_content", None):
+                collected_reasoning += delta.reasoning_content
+
             if delta.content:
                 collected_content += delta.content
                 yield {"type": "text_delta", "content": delta.content}
@@ -300,6 +312,10 @@ class VishwakarmaLLM:
         if tool_calls:
             yield {"type": "tool_calls", "tool_calls": tool_calls, "content": collected_content}
         else:
+            if not collected_content.strip() and collected_reasoning.strip():
+                log.warning(
+                    "Stream ended with empty content and %d chars of reasoning_content — engine will synthesize the answer",
+                    len(collected_reasoning))
             yield {"type": "analysis_done", "content": collected_content}
 
     def _parse_response(self, response) -> LLMResponse:
@@ -307,6 +323,11 @@ class VishwakarmaLLM:
         message = choice.message
 
         content = message.content or ""
+        if not content.strip() and not message.tool_calls:
+            reasoning = getattr(message, "reasoning_content", "") or ""
+            if reasoning.strip():
+                log.warning("Empty content with %d chars of reasoning_content — using it as the answer", len(reasoning))
+                content = _strip_think(reasoning)
         tool_calls = []
 
         if message.tool_calls:
@@ -403,16 +424,9 @@ class VishwakarmaLLM:
                 if tools:
                     kwargs["tools"] = tools
                     kwargs["tool_choice"] = "auto"
-                # Disable reasoning by default — on GLM-class models thinking
-                # adds 10-30s per step and empirically yields FEWER parallel
-                # tool calls per step (deeper progress without it). Set
-                # VK_THINK_ON_TOOL_STEPS=true to re-enable for tool steps.
-                # Works for GLM-5 (enable_thinking) and Kimi-K2.5 (thinking).
-                _think = os.environ.get("VK_THINK_ON_TOOL_STEPS", "").lower() in ("1", "true", "yes")
-                if not tools or not _think:
-                    kwargs["extra_body"] = {
-                        "chat_template_kwargs": {"enable_thinking": False, "thinking": False}
-                    }
+                _body = _thinking_off_body()
+                if _body:
+                    kwargs["extra_body"] = _body
                 # Apply env var overrides (custom providers)
                 max_output = os.environ.get("OVERRIDE_MAX_OUTPUT_TOKEN")
                 if max_output:
@@ -446,6 +460,35 @@ class VishwakarmaLLM:
                            f"[{time.time() - start:.1f}s elapsed]")
                 i += 1
         raise last_error  # type: ignore
+
+    def _final_chain(self) -> list[str]:
+        chain: list[str] = []
+        for m in [self.cfg.model] + (self.cfg.fast_fallbacks or []) + (self.cfg.model_fallbacks or []) + [self.cfg.fast_model]:
+            if m and m not in chain:
+                chain.append(m)
+        return chain
+
+    def synthesize_final(self, messages: list[dict], min_chars: int = 80) -> str:
+        reasoning_fallback = ""
+        for model in self._final_chain():
+            try:
+                response = self._call_with_fallback(
+                    models=[model], messages=messages, max_tokens=6000,
+                    temperature=self.cfg.temperature, timeout=150, total_budget=150,
+                )
+            except Exception as e:
+                log.warning("Final synthesis failed on %s: %s", model, e)
+                continue
+            msg = response.choices[0].message
+            content = _strip_think(msg.content or "")
+            if len(content) >= min_chars:
+                log.info("Final synthesis produced %d chars via %s", len(content), model)
+                return content
+            reasoning = _strip_think(getattr(msg, "reasoning_content", "") or "")
+            if len(reasoning) > len(reasoning_fallback):
+                reasoning_fallback = reasoning
+            log.warning("Final synthesis on %s returned %d chars of content — trying next model", model, len(content))
+        return reasoning_fallback
 
     def _get_fast_chain(self) -> list[str]:
         """Get ordered list of fast models to try."""

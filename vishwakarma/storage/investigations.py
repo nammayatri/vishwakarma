@@ -44,6 +44,17 @@ def create_investigation(
     return incident_id
 
 
+def set_delivery(incident_id: str, delivery: dict) -> None:
+    now = time.time()
+    conn = _get_conn()
+    with _lock:
+        conn.execute(
+            "UPDATE investigations SET delivery=?, updated_at=? WHERE id=?",
+            (json.dumps(delivery, default=str), now, incident_id),
+        )
+        conn.commit()
+
+
 def claim_investigation(incident_id: str, worker_id: str) -> dict | None:
     """
     Claim a queued/orphaned investigation for this worker.
@@ -158,6 +169,13 @@ def get_investigation(incident_id: str) -> dict | None:
     return _row_to_dict(row) if row else None
 
 
+def get_delivery(incident_id: str) -> dict:
+    conn = _get_conn()
+    row = conn.execute("SELECT delivery FROM investigations WHERE id=?", (incident_id,)).fetchone()
+    value = _row_to_dict(row).get("delivery") if row else None
+    return value if isinstance(value, dict) else {}
+
+
 def find_orphaned(stale_seconds: int = 180, limit: int = 20) -> list[dict]:
     """
     Investigations whose worker stopped heartbeating — candidates for
@@ -192,7 +210,7 @@ def list_active(limit: int = 50) -> list[dict]:
 
 def _row_to_dict(row) -> dict:
     d = dict(row)
-    for field in ("messages", "findings", "code_session"):
+    for field in ("messages", "findings", "code_session", "delivery"):
         if isinstance(d.get(field), str) and d[field]:
             try:
                 d[field] = json.loads(d[field])

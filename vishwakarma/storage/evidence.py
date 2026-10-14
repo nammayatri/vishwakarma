@@ -229,17 +229,31 @@ def store_evidence(
             log.info(f"[EVIDENCE] Cleaned up {deleted} stale pending snapshots")
 
 
-def mark_evidence_correct(incident_id: str) -> None:
-    """Mark evidence as correct and update baselines."""
+def _upsert_outcome(incident_id: str, alert_name: str, outcome: str) -> None:
+    """Insert the row if store_evidence's (now-removed) fast-RCA caller never did."""
     conn = _get_conn()
     with _lock:
-        conn.execute(
-            "UPDATE evidence_snapshots SET outcome = 'correct' WHERE incident_id = ?",
-            (incident_id,),
+        cur = conn.execute(
+            "UPDATE evidence_snapshots SET outcome = ? WHERE incident_id = ?",
+            (outcome, incident_id),
         )
+        if cur.rowcount == 0:
+            import uuid
+            conn.execute(
+                "INSERT INTO evidence_snapshots "
+                "(id, alert_name, scenario, root_cause_type, metrics, outcome, incident_id, created_at) "
+                "VALUES (?, ?, '', '', '{}', ?, ?, ?)",
+                (uuid.uuid4().hex[:12], alert_name, outcome, incident_id, time.time()),
+            )
         conn.commit()
 
+
+def mark_evidence_correct(incident_id: str, alert_name: str = "") -> None:
+    """Mark evidence as correct and update baselines."""
+    _upsert_outcome(incident_id, alert_name, "correct")
+
     # Recompute baselines for this alert
+    conn = _get_conn()
     row = conn.execute(
         "SELECT alert_name, metrics FROM evidence_snapshots WHERE incident_id = ?",
         (incident_id,),
@@ -248,15 +262,9 @@ def mark_evidence_correct(incident_id: str) -> None:
         _update_baselines(row["alert_name"])
 
 
-def mark_evidence_wrong(incident_id: str) -> None:
+def mark_evidence_wrong(incident_id: str, alert_name: str = "") -> None:
     """Mark evidence as wrong — don't update baselines."""
-    conn = _get_conn()
-    with _lock:
-        conn.execute(
-            "UPDATE evidence_snapshots SET outcome = 'wrong' WHERE incident_id = ?",
-            (incident_id,),
-        )
-        conn.commit()
+    _upsert_outcome(incident_id, alert_name, "wrong")
 
 
 # ── Baseline Computation ──────────────────────────────────────────────────────

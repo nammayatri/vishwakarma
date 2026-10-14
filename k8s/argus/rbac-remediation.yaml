@@ -1,0 +1,28 @@
+# Lets Argus delete a single pod in `atlas` — and nothing else — once a human
+# approves the suggested `kubectl delete pod <pod> -n atlas` in Slack/Xyne.
+# Not applied automatically. Without this the approved command fails with
+# "forbidden" (the argus SA only has the read-only `view` ClusterRole).
+# Namespace-scoped on purpose: no ClusterRole, no other verbs, no other resources.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: argus-pod-restarter
+  namespace: atlas
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: argus-pod-restarter
+  namespace: atlas
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: argus-pod-restarter
+subjects:
+  - kind: ServiceAccount
+    name: argus
+    namespace: argus

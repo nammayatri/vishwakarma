@@ -78,6 +78,7 @@ CREATE TABLE IF NOT EXISTS investigations (
     messages      TEXT,                  -- JSON: conversation so far (resumable state)
     findings      TEXT,                  -- JSON: per-cloud sub-agent results
     code_session  TEXT,                  -- JSON: coding-agent session id + transcript
+    delivery      TEXT,                  -- JSON: where/how to post the RCA if the run is resumed
     attempt       INTEGER DEFAULT 0,
     worker_id     TEXT,
     heartbeat_at  REAL,
@@ -132,6 +133,23 @@ CREATE TABLE IF NOT EXISTS alert_runbook_map (
     PRIMARY KEY (alert_pattern, runbook_id)
 );
 
+CREATE TABLE IF NOT EXISTS runbook_proposals (
+    id           TEXT PRIMARY KEY,
+    runbook_id   TEXT NOT NULL,
+    incident_id  TEXT NOT NULL,
+    proposed_md  TEXT NOT NULL,
+    reason       TEXT,
+    status       TEXT DEFAULT 'open',
+    created_at   REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_proposals_open ON runbook_proposals(status);
+
+CREATE TABLE IF NOT EXISTS infra_gpt_conversations (
+    thread_key      TEXT PRIMARY KEY,     -- "{channel}:{thread_ts}"
+    conversation_id INTEGER NOT NULL,
+    updated_at      REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS code_index_state (
     repo        TEXT NOT NULL,
     path        TEXT NOT NULL,
@@ -184,6 +202,35 @@ CREATE TABLE IF NOT EXISTS audit_log (
     detail      TEXT                     -- JSON
 );
 
+CREATE TABLE IF NOT EXISTS remediation_actions (
+    id            TEXT PRIMARY KEY,
+    incident_id   TEXT,
+    alert_title   TEXT,
+    platform      TEXT,
+    channel       TEXT,
+    thread_ts     TEXT,
+    message_ts    TEXT,
+    mirror_channel    TEXT,
+    mirror_thread_ts  TEXT,
+    mirror_message_ts TEXT,
+    namespace     TEXT NOT NULL,
+    service       TEXT,
+    pod           TEXT NOT NULL,
+    command       TEXT NOT NULL,
+    queries_ran   TEXT,
+    evidence      TEXT,
+    is_approved   INTEGER,
+    status        TEXT NOT NULL,
+    approved_by   TEXT,
+    approved_via  TEXT,
+    approved_at   REAL,
+    executed_at   REAL,
+    output        TEXT,
+    created_at    REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_remediation_status ON remediation_actions(status);
+CREATE INDEX IF NOT EXISTS idx_remediation_thread ON remediation_actions(channel, thread_ts);
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts);
 CREATE INDEX IF NOT EXISTS idx_embeddings_kind ON embeddings_json(kind);
 CREATE INDEX IF NOT EXISTS idx_runbooks_status ON runbooks(status);
@@ -301,6 +348,25 @@ def _to_pg_schema(schema: str) -> str:
             .replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY"))
 
 
+_MIGRATIONS = (
+    "ALTER TABLE investigations ADD COLUMN delivery TEXT",
+)
+
+
+def _apply_migrations(conn) -> None:
+    for stmt in _MIGRATIONS:
+        if _backend == "postgres":
+            stmt = stmt.replace("ADD COLUMN", "ADD COLUMN IF NOT EXISTS")
+        try:
+            conn.execute(stmt)
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
+
 def init_db(db_path: str | None = None, dsn: str | None = None,
             embedding_dim: int | None = None) -> None:
     """
@@ -328,6 +394,8 @@ def init_db(db_path: str | None = None, dsn: str | None = None,
             _conn.executescript(_to_pg_schema(PATTERNS_SCHEMA))
             from vishwakarma.storage.evidence import EVIDENCE_SCHEMA
             _conn.executescript(_to_pg_schema(EVIDENCE_SCHEMA))
+            _conn.commit()
+            _apply_migrations(_conn)
             # Commit base schema BEFORE attempting pgvector — a failed
             # CREATE EXTENSION rolls back its transaction, and must not
             # take the uncommitted schema down with it.
@@ -351,6 +419,7 @@ def init_db(db_path: str | None = None, dsn: str | None = None,
             from vishwakarma.storage.evidence import EVIDENCE_SCHEMA
             _conn.executescript(EVIDENCE_SCHEMA)
             _conn.commit()
+            _apply_migrations(_conn)
             log.info(f"Database initialized at {_db_path}")
 
 

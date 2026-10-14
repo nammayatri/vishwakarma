@@ -65,19 +65,33 @@ def save_incident(
     return incident_id
 
 
-def update_incident_status(incident_id: str, status: str) -> bool:
+def update_incident_status(incident_id: str, status: str, meta_update: dict | None = None) -> bool:
     conn = _get_conn()
     now = time.time()
     with _lock:
-        cur = conn.execute(
-            "UPDATE incidents SET status=?, updated_at=?, resolved_at=? WHERE id=?",
-            (status, now, now if status == "resolved" else None, incident_id),
-        )
+        if meta_update:
+            row = conn.execute("SELECT meta FROM incidents WHERE id=?", (incident_id,)).fetchone()
+            if not row:
+                return False
+            try:
+                meta = json.loads(dict(row).get("meta") or "{}")
+            except Exception:
+                meta = {}
+            meta.update(meta_update)
+            cur = conn.execute(
+                "UPDATE incidents SET status=?, updated_at=?, resolved_at=?, meta=? WHERE id=?",
+                (status, now, now if status == "resolved" else None, json.dumps(meta), incident_id),
+            )
+        else:
+            cur = conn.execute(
+                "UPDATE incidents SET status=?, updated_at=?, resolved_at=? WHERE id=?",
+                (status, now, now if status == "resolved" else None, incident_id),
+            )
         conn.commit()
     return cur.rowcount > 0
 
 
-def resolve_incidents_by_labels(labels: dict) -> int:
+def resolve_incidents_by_labels(labels: dict, source: str = "alertmanager") -> int:
     """Mark OPEN incidents matching this alert's identity (alertname + namespace +
     service) as resolved — called when AlertManager reports the alert cleared, so
     incidents don't sit at 'open' forever after the underlying issue is gone."""
@@ -98,7 +112,7 @@ def resolve_incidents_by_labels(labels: dict) -> int:
         if (L.get("alertname") == alertname
                 and (not ns or L.get("namespace") == ns)
                 and (not svc or L.get("service") == svc)):
-            if update_incident_status(d["id"], "resolved"):
+            if update_incident_status(d["id"], "resolved", meta_update={"resolution_source": source}):
                 resolved += 1
     return resolved
 

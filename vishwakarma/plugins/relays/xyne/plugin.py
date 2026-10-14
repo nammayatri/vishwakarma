@@ -1,0 +1,490 @@
+"""
+Xyne destination — post investigation results to Xyne, mirroring the Slack flow.
+
+Xyne (spaces.xyne.juspay.net) exposes a Slack-API-compatible REST surface at
+https://spaces.xyne.juspay.net/api/apps/slack/ — CONFIRMED live against the
+real API (2026-08-11):
+  - chat.postMessage: works, auth via `Authorization: Bearer <app JWT>`.
+  - Response shape matches Slack exactly: {"ok": false, "error": "..."} on
+    failure, HTTP 200 even on API-level failure (never raises via HTTP status
+    alone — chat_postMessage/chat_update below check `ok` explicitly).
+  - auth.test: works, returns {"ok", "user_id", "bot_id", "user": "Argus",
+    "team": "Nammayatri", ...} — same shape Slack's auth.test returns.
+  - conversations.replies/.history/.list: work once `channels:read` is
+    granted.
+  - KNOWN GAP (confirmed live, 2026-08-11): the APP_MENTIONED webhook
+    payload's conversationId/messageId are UUID-format internal
+    event/delivery ids — NOT the real Xyne message ts (a different
+    cuid-style format, e.g. "cmsoj0act44c1v48c1l31jm1g", only obtainable
+    from a chat.postMessage response). Passing the webhook's ids as
+    thread_ts always fails with {"ok": false, "error": "thread_not_found"}.
+    chat_postMessage below retries without thread_ts on that specific
+    error, so the reply still lands (as a new top-level message in the
+    right channel) instead of being silently dropped — it just can't be
+    literally nested under the original mention message, since the webhook
+    never exposes a usable id for that. Once the first post in an
+    investigation falls back this way, its real returned ts is reused for
+    every later post in the same investigation (ack/phase/RCA), so the
+    whole conversation still threads together correctly from that point on.
+"""
+import logging
+import re
+import threading
+
+import requests
+
+from vishwakarma.plugins.relays.slack.plugin import SlackDestination
+
+log = logging.getLogger(__name__)
+
+
+_EMOJI = {
+    "rotating_light": "🚨", "page_facing_up": "📄", "thread": "🧵",
+    "hourglass_flowing_sand": "⏳", "hourglass": "⌛", "mag": "🔍",
+    "white_check_mark": "✅", "memo": "📝", "warning": "⚠️", "wave": "👋",
+    "brain": "🧠", "gear": "⚙️", "chart_with_upwards_trend": "📈",
+    "x": "❌", "red_circle": "🔴", "large_green_circle": "🟢",
+    "large_yellow_circle": "🟡", "bar_chart": "📊", "rocket": "🚀",
+    "mega": "📣", "bulb": "💡", "bug": "🐛", "fire": "🔥",
+    "wrench": "🔧", "test_tube": "🧪", "no_entry": "⛔", "no_entry_sign": "🚫",
+    "information_source": "ℹ️", "lock": "🔒", "pushpin": "📌", "eyes": "👀",
+}
+
+
+_NO_EMOJIFY_KEYS = ("action_id", "block_id", "type", "value", "actionId", "id", "screenId", "version", "variant")
+
+
+def _emojify(value):
+    if isinstance(value, str):
+        return re.sub(r":([a-z0-9_+-]+):", lambda m: _EMOJI.get(m.group(1), m.group(0)), value)
+    if isinstance(value, list):
+        return [_emojify(v) for v in value]
+    if isinstance(value, dict):
+        return {k: (v if k in _NO_EMOJIFY_KEYS else _emojify(v)) for k, v in value.items()}
+    return value
+
+
+_FLOW_STATE = {"values": {}, "touched": {}, "errors": {}, "submitting": False, "submitted": False,
+               "history": [], "loadingComponentIds": []}
+_FLOW_ACTION_PREFIX = "vk_remediate_"
+_FEEDBACK_ACTION_PREFIX = "vk_rca_"
+_FLOW_ACTION_PREFIXES = (_FLOW_ACTION_PREFIX, _FEEDBACK_ACTION_PREFIX)
+FLOW_TS_PREFIX = "flow:"
+_CONVERSATION_KEYS = ("conversationId", "conversation_id", "threadId", "thread_id")
+_CONVERSATION_IDS: dict[str, str] = {}
+_CONVERSATION_LOCK = threading.Lock()
+_MAX_CONVERSATION_IDS = 2000
+_logged_response_shapes: set[str] = set()
+FEEDBACK_CHANNEL_SEP = "|"
+_CHANNEL_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,40}$")
+
+
+def seed_conversation(ts: str, conversation_id: str) -> None:
+    if not (ts and conversation_id):
+        return
+    with _CONVERSATION_LOCK:
+        _CONVERSATION_IDS.pop(ts, None)
+        while len(_CONVERSATION_IDS) >= _MAX_CONVERSATION_IDS:
+            _CONVERSATION_IDS.pop(next(iter(_CONVERSATION_IDS)), None)
+        _CONVERSATION_IDS[ts] = str(conversation_id)
+
+
+def _find_conversation_id(data, depth: int = 2) -> str:
+    if not isinstance(data, dict):
+        return ""
+    for key in _CONVERSATION_KEYS:
+        if data.get(key) and isinstance(data[key], (str, int)):
+            return str(data[key])
+    if depth > 0:
+        for value in data.values():
+            found = _find_conversation_id(value, depth - 1)
+            if found:
+                return found
+    return ""
+
+
+def _remember_conversation(kind: str, ts: str, data) -> None:
+    with _CONVERSATION_LOCK:
+        first = kind not in _logged_response_shapes
+        _logged_response_shapes.add(kind)
+    if first:
+        log.info(f"Xyne {kind} response keys: {sorted(data) if isinstance(data, dict) else type(data).__name__}")
+    found = _find_conversation_id(data)
+    if ts and found:
+        seed_conversation(ts, found)
+
+
+def conversation_id_for(ts: str | None) -> str:
+    if not ts:
+        return ""
+    with _CONVERSATION_LOCK:
+        value = _CONVERSATION_IDS.pop(ts, "")
+        if value:
+            _CONVERSATION_IDS[ts] = value
+        return value
+
+
+def _xyne_text(text: str) -> str:
+    return _emojify(text or "").replace("```", "").replace("`", "").replace("*", "")
+
+
+def _flow_md(text: str) -> str:
+    def fence(m):
+        return "\n".join(f"`{ln}`" for ln in m.group(1).strip().splitlines() if ln.strip())
+
+    return re.sub(r"```(.*?)```", fence, text or "", flags=re.S)
+
+
+def text_flow(text: str, screen_id: str = "argus-outcome") -> dict:
+    return {"version": "2.0", "screenId": screen_id,
+            "components": [{"id": "t0", "type": "text", "props": {"content": _flow_md(text)}}],
+            "state": {**_FLOW_STATE}}
+
+
+def blocks_to_flow(blocks: list | None, channel: str = "") -> dict | None:
+    """Slack-style blocks carrying our remediation Approve/Reject or RCA feedback buttons become a Xyne
+    Flow UI v2 card whose buttons submit `<action_id>:<id>` to the app webhook. Any other blocks are
+    left for the Slack-compat layer."""
+    def is_ours(b):
+        return b.get("type") == "actions" and any(
+            str(e.get("action_id", "")).startswith(_FLOW_ACTION_PREFIXES) for e in b.get("elements", []))
+
+    if not blocks or not any(is_ours(b) for b in blocks):
+        return None
+    components = []
+    for i, b in enumerate(blocks):
+        kind = b.get("type")
+        if kind == "section":
+            components.append({"id": f"t{i}", "type": "text",
+                               "props": {"content": _flow_md((b.get("text") or {}).get("text", ""))}})
+        elif kind == "context":
+            text = " ".join((e.get("text") or "") for e in b.get("elements", []))
+            components.append({"id": f"t{i}", "type": "text", "props": {"content": _flow_md(text)}})
+        elif is_ours(b):
+            children = []
+            for j, e in enumerate(b["elements"]):
+                destructive = e.get("style") == "danger"
+                action_id = f"{e['action_id']}:{e.get('value', '')}"
+                if channel and str(e["action_id"]).startswith(_FEEDBACK_ACTION_PREFIX):
+                    action_id += f"{FEEDBACK_CHANNEL_SEP}{channel}"
+                children.append({
+                    "id": f"btn{i}_{j}", "type": "button",
+                    "props": {"label": (e.get("text") or {}).get("text", "OK"),
+                              "variant": "destructive" if destructive else "primary",
+                              "action": {"type": "submit", "actionId": action_id}}})
+            components.append({"id": f"row{i}", "type": "row", "style": {"gap": "8px"}, "children": children})
+    feedback = any(
+        str(e.get("action_id", "")).startswith(_FEEDBACK_ACTION_PREFIX)
+        for b in blocks if is_ours(b) for e in b.get("elements", []))
+    screen_id, title = (("argus-feedback", "Argus — RCA feedback") if feedback
+                        else ("argus-remediation", "Argus — approval needed"))
+    return {"version": "2.0", "screenId": screen_id, "title": title,
+            "components": components, "state": {**_FLOW_STATE}}
+
+
+class XyneApiError(Exception):
+    """Raised when Xyne's Slack-compatible API returns {"ok": false, ...} —
+    mirrors slack_sdk's SlackApiError so callers written against the real
+    Slack SDK's error-handling behave the same way against Xyne."""
+
+
+class XyneWebClient:
+    """
+    Minimal slack_sdk.WebClient-compatible shim — implements only the methods
+    SlackDestination/_do_investigation actually call (chat_postMessage,
+    chat_update). `base_url` is the full API prefix
+    (https://spaces.xyne.juspay.net/api/apps/slack) — methods are appended
+    directly, not re-prefixed.
+    """
+
+    def __init__(self, base_url: str, token: str):
+        self._base_url = base_url.rstrip("/")
+        self._session = requests.Session()
+        if token:
+            self._session.headers.update({"Authorization": f"Bearer {token}"})
+
+    def _post(self, method: str, body: dict) -> dict:
+        if method in ("chat.postMessage", "chat.update"):
+            body = _emojify(body)
+        r = self._session.post(f"{self._base_url}/{method}", json=body, timeout=15)
+        r.raise_for_status()  # transport-level failures still raise
+        data = r.json() if r.content else {}
+        if not data.get("ok", False):
+            # Xyne returns HTTP 200 even on API-level failure (confirmed) —
+            # raise_for_status() above can't catch this; check `ok` explicitly.
+            raise XyneApiError(data.get("error", "unknown_error"))
+        return data
+
+    def _native_base(self) -> str:
+        return self._base_url[: -len("/slack")] if self._base_url.endswith("/slack") else self._base_url
+
+    def _native_post(self, path: str, body: dict) -> dict:
+        r = self._session.post(f"{self._native_base()}/{path}", json=_emojify(body), timeout=15)
+        if r.status_code >= 300:
+            raise XyneApiError(f"{path} {r.status_code}: {r.text[:200]}")
+        return r.json() if r.content else {}
+
+    def _post_flow_card(self, channel, text: str, flow: dict, thread_ts: str | None) -> dict:
+        body = {"channelId": channel, "text": _xyne_text(text)[:300], "flow": flow}
+        conversation_id = conversation_id_for(thread_ts)
+        data = None
+        in_thread = False
+        if conversation_id:
+            try:
+                data = self._native_post("chat/postMessage", {**body, "conversationId": conversation_id})
+                returned = _find_conversation_id(data)
+                in_thread = not returned or returned == conversation_id
+            except XyneApiError as e:
+                log.warning(f"Xyne threaded card post failed ({e}) — posting to the channel instead")
+        if data is None:
+            data = self._native_post("chat/postMessage", body)
+        if thread_ts and not in_thread:
+            self._thread_pointer(channel, text, flow, thread_ts)
+        card_ts = f"{FLOW_TS_PREFIX}{data.get('messageId', '')}"
+        _remember_conversation("flow card", card_ts, data)
+        return {"ok": True, "ts": card_ts, "channel": channel}
+
+    def _thread_pointer(self, channel, text: str, flow: dict, thread_ts: str) -> None:
+        hint = ("Mark the RCA correct or wrong" if flow.get("screenId") == "argus-feedback"
+                else "Approve or reject")
+        self.chat_postMessage(channel=channel, thread_ts=thread_ts,
+                              text=f"{_xyne_text(text)}\n\n⬇️ {hint} with the card posted just below in the channel.")
+
+    def chat_postMessage(self, channel, text: str = "", thread_ts: str | None = None,
+                          blocks: list | None = None, attachments: list | None = None,
+                          flow: dict | None = None, **_ignored) -> dict:
+        flow = flow or blocks_to_flow(blocks, channel)
+        if flow:
+            return self._post_flow_card(channel, text, flow, thread_ts)
+        body: dict = {"channel": channel, "text": text}
+        if thread_ts:
+            body["thread_ts"] = thread_ts
+        if blocks:
+            body["blocks"] = blocks
+        if attachments:
+            body["attachments"] = attachments
+        try:
+            data = self._post("chat.postMessage", body)
+        except XyneApiError as e:
+            if thread_ts and str(e) == "thread_not_found":
+                # The webhook-supplied thread_ts (see module docstring) is
+                # never a real message id — fall back to a top-level post so
+                # the reply lands somewhere instead of being dropped. Its
+                # real returned ts becomes the thread root for every later
+                # post in this investigation (see server.py: ack_ts reuse).
+                log.info("Xyne thread_not_found — posting as a new top-level message instead")
+                body.pop("thread_ts", None)
+                data = self._post("chat.postMessage", body)
+            else:
+                raise
+        _remember_conversation("chat.postMessage", data.get("ts", ""), data)
+        return {"ok": True, "ts": data.get("ts", ""), "channel": data.get("channel") or channel}
+
+    def chat_update(self, channel, ts, text: str = "", blocks: list | None = None,
+                     flow: dict | None = None, **_ignored) -> dict:
+        if str(ts).startswith(FLOW_TS_PREFIX):
+            card = flow or blocks_to_flow(blocks) or text_flow(text)
+            self._native_post("chat/updateMessage", {
+                "channelId": channel, "messageId": str(ts)[len(FLOW_TS_PREFIX):],
+                "text": _xyne_text(text)[:300], "flowJSON": card})
+            return {"ok": True, "ts": ts, "channel": channel}
+        body: dict = {"channel": channel, "ts": ts, "text": text}
+        if blocks:
+            body["blocks"] = blocks
+        data = self._post("chat.update", body)
+        return {"ok": True, "ts": data.get("ts", ts), "channel": data.get("channel") or channel}
+
+    def get_user(self, user_id: str) -> tuple[str, str]:
+        if not user_id:
+            return "", ""
+        try:
+            u = self._post("users.info", {"user": user_id}).get("user") or {}
+        except Exception as e:
+            log.warning(f"Xyne users.info failed for {user_id!r}: {e}")
+            return "", ""
+        profile = u.get("profile") or {}
+        return (u.get("real_name") or u.get("name") or profile.get("display_name") or ""), (profile.get("email") or "")
+
+    def files_upload_v2(self, channel, content: bytes, filename: str, title: str = "",
+                         thread_ts: str | None = None, initial_comment: str = "", **_ignored) -> dict:
+        slot = self._post("files.getUploadURLExternal", {"filename": filename, "length": len(content)})
+        up = self._session.post(slot["upload_url"], data=content, timeout=60,
+                                headers={"Content-Type": "application/pdf" if filename.lower().endswith(".pdf") else "application/octet-stream"})
+        up.raise_for_status()
+        body: dict = {"files": [{"id": slot["file_id"], "title": title or filename}],
+                      "channel_id": channel}
+        if thread_ts:
+            body["thread_ts"] = thread_ts
+        if initial_comment:
+            body["initial_comment"] = _emojify(initial_comment)
+        try:
+            return self._post("files.completeUploadExternal", body)
+        except XyneApiError as e:
+            if thread_ts and str(e) == "thread_not_found":
+                body.pop("thread_ts", None)
+                return self._post("files.completeUploadExternal", body)
+            raise
+
+    def auth_test(self) -> dict:
+        """Confirmed live — returns {"ok", "user_id", "bot_id", "user", "team", ...},
+        same shape as Slack's auth.test. Used to self-discover our bot's own
+        user_id (the <@ID> tag to match for mentions) instead of requiring it
+        as separate config."""
+        return self._post("auth.test", {})
+
+
+def verify_xyne_signature(signing_secret: str, body: bytes, signature: str) -> bool:
+    """
+    Xyne's REAL request signature scheme — CONFIRMED from a live webhook
+    request (2026-08-11): a single `x-xyne-signature` header, no timestamp
+    header at all, value = plain hex-encoded HMAC-SHA256 of the raw request
+    body (64 hex chars observed). No "v0:" prefix, no Slack-style basestring
+    — this is NOT the Slack request-signing scheme, despite the "signing
+    secret" naming suggesting it. (Corrects the original Slack-shaped
+    assumption, which never matched a single real request.)
+    """
+    import hashlib
+    import hmac
+
+    if not (signing_secret and signature):
+        return False
+    computed = hmac.new(signing_secret.encode(), body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(computed, signature)
+
+
+class XyneDestination(SlackDestination):
+    """
+    Reuses SlackDestination's entire post_investigation flow (thread-vs-new-message
+    decision, text chunking, feedback buttons) — only the transport differs:
+    XyneWebClient instead of the real Slack SDK. PDFs go through Xyne's
+    files.getUploadURLExternal/completeUploadExternal flow, falling back to
+    chunked text if the upload fails.
+
+    Config:
+      base_url: https://spaces.xyne.juspay.net
+      token: Bearer token for the Xyne API
+      channel: default channel if none is passed per-call
+    """
+
+    def __init__(self, config: dict):
+        self._base_url = config.get("base_url", "").rstrip("/")
+        self._token = config.get("token", "")
+        self._channel = config.get("channel", "")
+        self._mention = ""
+        self._client = None
+
+    def _get_client(self):
+        if self._client is None:
+            self._client = XyneWebClient(self._base_url, self._token)
+        return self._client
+
+    def _resolve_channel_id(self, channel: str) -> str:
+        # The Xyne event payload's channel id is assumed directly usable —
+        # no known channel-list-lookup equivalent to resolve names against.
+        return channel
+
+
+
+_channel_cache: dict[str, str] = {}
+
+
+def resolve_xyne_channel(client: XyneWebClient, channel: str) -> str:
+    if not channel:
+        return ""
+    name = channel.lstrip("#")
+    if name in _channel_cache:
+        return _channel_cache[name]
+    try:
+        data = client._post("conversations.list", {"limit": 1000})
+    except Exception as e:
+        log.warning(f"Xyne channel lookup failed for '{channel}': {e}")
+        return channel if not channel.startswith("#") else ""
+    for c in data.get("channels", []):
+        if c.get("name") == name:
+            _channel_cache[name] = c["id"]
+            return c["id"]
+        if c.get("id") == channel:
+            return channel
+    log.warning(f"Xyne channel '{channel}' not found")
+    return ""
+
+
+class MirroredClient:
+    def __init__(self, primary, xyne_client: XyneWebClient, xyne_channel: str):
+        self._primary = primary
+        self._xyne = xyne_client
+        self._xyne_channel = xyne_channel
+        self._ts: dict[str, str] = {}
+
+    def __getattr__(self, name):
+        return getattr(self._primary, name)
+
+    def xyne_ts(self, primary_ts):
+        return self._ts.get(primary_ts) if primary_ts else None
+
+    def xyne_target(self, primary_ts):
+        return self._xyne_channel, self.xyne_ts(primary_ts)
+
+    def xyne_conversation(self, primary_ts):
+        return conversation_id_for(self.xyne_ts(primary_ts))
+
+    def chat_postMessage(self, **kwargs):
+        resp = self._primary.chat_postMessage(**kwargs)
+        try:
+            thread = kwargs.get("thread_ts")
+            xr = self._xyne.chat_postMessage(
+                channel=self._xyne_channel,
+                text=kwargs.get("text", ""),
+                thread_ts=self._ts.get(thread) if thread else None,
+                blocks=kwargs.get("blocks"),
+                attachments=kwargs.get("attachments"),
+            )
+            if xr.get("ts"):
+                self._ts[resp["ts"]] = xr["ts"]
+        except Exception as e:
+            log.warning(f"Xyne mirror post failed (non-fatal): {e}")
+        return resp
+
+    def chat_update(self, **kwargs):
+        resp = self._primary.chat_update(**kwargs)
+        try:
+            xts = self._ts.get(kwargs.get("ts"))
+            if xts:
+                self._xyne.chat_update(
+                    channel=self._xyne_channel, ts=xts,
+                    text=kwargs.get("text", ""), blocks=kwargs.get("blocks"),
+                )
+        except Exception as e:
+            log.warning(f"Xyne mirror update failed (non-fatal): {e}")
+        return resp
+
+    def post_investigation(self, primary_thread_ts, **kwargs):
+        dest = XyneDestination({"base_url": self._xyne._base_url, "token": ""})
+        dest._client = self._xyne
+        return dest.post_investigation(
+            channel=self._xyne_channel,
+            thread_ts=self.xyne_ts(primary_thread_ts),
+            **kwargs,
+        )
+
+
+def restore_alert_mirror(config, xyne_channel: str, primary_ts: str, xyne_ts: str, conversation_id: str = ""):
+    if not (config.xyne_base_url and config.xyne_bot_token and xyne_channel and xyne_ts):
+        return None
+    seed_conversation(xyne_ts, conversation_id)
+    mirror = MirroredClient(None, XyneWebClient(config.xyne_base_url, config.xyne_bot_token), xyne_channel)
+    mirror._ts[primary_ts] = xyne_ts
+    return mirror
+
+
+def build_alert_mirror(config, primary_client):
+    if not (config.xyne_base_url and config.xyne_bot_token):
+        return primary_client
+    import os
+    xc = XyneWebClient(config.xyne_base_url, config.xyne_bot_token)
+    channel = resolve_xyne_channel(
+        xc, config.xyne_alert_channel or os.environ.get("SLACK_CHANNEL", ""))
+    if not channel:
+        log.warning("Xyne alert mirror disabled — no Xyne channel resolved")
+        return primary_client
+    return MirroredClient(primary_client, xc, channel)

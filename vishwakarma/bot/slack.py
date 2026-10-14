@@ -83,7 +83,7 @@ def start_bot(config: "VishwakarmaConfig") -> None:
         # Handle special commands
         question_lower = question.lower()
         if question_lower in ("help", "?"):
-            say(text=_help_text(), thread_ts=thread_ts)
+            say(text=_help_text(config), thread_ts=thread_ts)
             return
 
         if question_lower == "status":
@@ -323,11 +323,12 @@ def start_bot(config: "VishwakarmaConfig") -> None:
 
                             # Turn hint
                             turn = len(new_history) // 2
+                            handle = _persona_name(config).lower()
                             client_sdk.chat_postMessage(
                                 channel=channel,
                                 thread_ts=t_ts,
-                                text=f"Turn {turn} — ask a follow-up or @sage oracle stop to end",
-                                blocks=[{"type": "context", "elements": [{"type": "mrkdwn", "text": f"_Turn {turn} · Session `{sid[:8]}...` · Ask a follow-up or `@sage oracle stop` to end_"}]}],
+                                text=f"Turn {turn} — ask a follow-up or @{handle} oracle stop to end",
+                                blocks=[{"type": "context", "elements": [{"type": "mrkdwn", "text": f"_Turn {turn} · Session `{sid[:8]}...` · Ask a follow-up or `@{handle} oracle stop` to end_"}]}],
                             )
 
                     # Post-loop: if max_steps_reached fired but done never came
@@ -359,9 +360,10 @@ def start_bot(config: "VishwakarmaConfig") -> None:
                                 blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": chunk}}],
                             )
                         turn = len(new_history) // 2
+                        handle = _persona_name(config).lower()
                         client_sdk.chat_postMessage(
                             channel=channel, thread_ts=t_ts, text=f"Turn {turn}",
-                            blocks=[{"type": "context", "elements": [{"type": "mrkdwn", "text": f"_Turn {turn} · Session `{sid[:8]}...` · Ask a follow-up or `@sage oracle stop` to end_"}]}],
+                            blocks=[{"type": "context", "elements": [{"type": "mrkdwn", "text": f"_Turn {turn} · Session `{sid[:8]}...` · Ask a follow-up or `@{handle} oracle stop` to end_"}]}],
                         )
 
                 except Exception as e:
@@ -424,6 +426,8 @@ def start_bot(config: "VishwakarmaConfig") -> None:
 
             def run_chat():
                 try:
+                    if _run_infra_gpt_chat(config, channel, thread_ts, question, thread_text, say):
+                        return
                     if is_thread_reply and thread_text:
                         reply = _contextual_thread_reply(config, question, thread_text)
                     else:
@@ -594,10 +598,11 @@ def start_bot(config: "VishwakarmaConfig") -> None:
                 if analysis:
                     try:
                         category = _infer_category(question, config=config, fact=analysis[:200])
+                        handle = _persona_name(config).lower()
                         client_sdk.chat_postMessage(
                             channel=channel, thread_ts=thread_ts,
-                            text=f"Save learning: @sage learn {category} <your finding>",
-                            blocks=[{"type": "context", "elements": [{"type": "mrkdwn", "text": f"_Save learning · `@sage learn {category} <your finding>`_"}]}],
+                            text=f"Save learning: @{handle} learn {category} <your finding>",
+                            blocks=[{"type": "context", "elements": [{"type": "mrkdwn", "text": f"_Save learning · `@{handle} learn {category} <your finding>`_"}]}],
                         )
                     except Exception:
                         pass
@@ -748,90 +753,20 @@ def start_bot(config: "VishwakarmaConfig") -> None:
             pass
 
         try:
-            from vishwakarma.storage.queries import get_incident
-            incident = get_incident(incident_id)
-            if not incident:
+            from vishwakarma.core.feedback import record_correct
+            result = record_correct(config, incident_id)
+            if result["status"] == "missing":
                 return
-
-            analysis = incident.get("analysis", "")
-            alert_name = (incident.get("labels") or {}).get("alertname") or incident.get("title", "")
-
-            # Pass full analysis — LLM will extract key insight from the whole RCA
-            existing = learnings_manager.get(_infer_category(alert_name))
-            fact = _distill_fact(config, analysis, alert_name, existing_facts=existing)
-            if not fact:
+            if result["status"] == "duplicate":
                 client.chat_update(
                     channel=channel_id, ts=msg_ts,
                     text="✅ Already in learnings",
                     blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": f"✅ *<@{user}>* — this root cause is already captured in learnings."}}],
                 )
                 return
-            category = _infer_category(alert_name, config=config, fact=fact)
-            learnings_manager.append(category, fact)
-            log.info(f"[FEEDBACK] ✅ Appended to learnings[{category}]: {fact[:80]}")
-            # Compact if category has grown large
-            llm = config.make_llm()
-            learnings_manager.compact(category, llm.summarize)
-
-            # Update evidence baselines
-            try:
-                from vishwakarma.storage.evidence import mark_evidence_correct
-                mark_evidence_correct(incident_id)
-                log.info(f"[FEEDBACK] Evidence marked correct, baselines updated for {alert_name}")
-            except Exception as e:
-                log.debug(f"[FEEDBACK] Evidence update failed (non-fatal): {e}")
-
-            # Credit the runbooks used (hit + self-populate alert→runbook map)
-            try:
-                from vishwakarma.storage.runbooks import mark_runbook_hit
-                meta = json.loads(incident.get("meta", "{}")) if incident.get("meta") else {}
-                for rid in meta.get("matched_runbook_ids", []):
-                    mark_runbook_hit(rid, alert_name=alert_name)
-            except Exception as e:
-                log.debug(f"[FEEDBACK] Runbook hit update failed (non-fatal): {e}")
-
-            # Learned tool routing: credit the toolsets that produced this
-            # confirmed RCA's evidence for this alert class.
-            try:
-                from vishwakarma.storage.tool_effectiveness import (
-                    record_effective, tools_to_toolsets)
-                from vishwakarma.storage.runbooks import normalize_alert_key
-                tos = json.loads(incident.get("tool_outputs", "[]")) if incident.get("tool_outputs") else []
-                used_tools = {o.get("tool_name") for o in tos if o.get("tool_name")}
-                toolsets = config.make_toolset_manager().active_toolsets()
-                used_toolsets = tools_to_toolsets(used_tools, toolsets)
-                record_effective(normalize_alert_key(alert_name), used_toolsets)
-            except Exception as e:
-                log.debug(f"[FEEDBACK] Tool effectiveness update failed (non-fatal): {e}")
-
-            # Extract and save replayable pattern
-            pattern_saved = False
-            try:
-                from vishwakarma.storage.patterns import extract_pattern_from_rca, save_pattern
-                import uuid
-                tool_outputs = json.loads(incident.get("tool_outputs", "[]")) if incident.get("tool_outputs") else []
-                pattern_data = extract_pattern_from_rca(llm, alert_name, analysis, tool_outputs)
-                if pattern_data:
-                    save_pattern(
-                        pattern_id=str(uuid.uuid4()),
-                        alert_name=alert_name,
-                        root_cause_type=pattern_data["root_cause_type"],
-                        root_cause_detail=pattern_data["root_cause_detail"],
-                        investigation_steps=pattern_data["investigation_steps"],
-                        verification_keywords=pattern_data.get("verification_keywords", []),
-                        verification_anti_keywords=pattern_data.get("verification_anti_keywords", []),
-                        fix=pattern_data["fix"],
-                        incident_id=incident_id,
-                    )
-                    pattern_saved = True
-                    log.info(f"[FEEDBACK] Pattern saved: {alert_name}/{pattern_data['root_cause_type']}")
-            except Exception as e:
-                log.warning(f"[FEEDBACK] Pattern extraction failed (non-fatal): {e}")
-
-            # Replace with detailed confirmation of what was saved
-            saved_items = [f":brain: Learning saved to `{category}`"]
-            if pattern_saved:
-                saved_items.append(f":gear: Investigation pattern saved (`{pattern_data.get('root_cause_type', '?')}`) — will auto-replay on next same alert")
+            saved_items = [f":brain: Learning saved to `{result['category']}`"]
+            if result["pattern_saved"]:
+                saved_items.append(f":gear: Investigation pattern saved (`{result['pattern_type']}`) — will auto-replay on next same alert")
             saved_items.append(":chart_with_upwards_trend: Evidence baselines updated")
             saved_text = "\n".join(saved_items)
             client.chat_update(
@@ -897,15 +832,9 @@ def start_bot(config: "VishwakarmaConfig") -> None:
             channel_id = meta.get("channel", "")
             msg_ts = meta.get("msg_ts", "")
 
-            from vishwakarma.storage.queries import get_incident
-            incident = get_incident(incident_id) if incident_id else None
-            alert_name = (incident.get("labels") or {}).get("alertname") if incident else ""
-
-            # Distill correction into a clean fact, deduped against existing learnings
-            existing = learnings_manager.get(_infer_category(alert_name or ""))
-            fact = _distill_fact(config, real_cause, alert_name or "", correction=True, existing_facts=existing)
-            if not fact:
-                # Duplicate — remove buttons from original message
+            from vishwakarma.core.feedback import record_wrong
+            result = record_wrong(config, incident_id, real_cause)
+            if result["status"] == "duplicate":
                 if channel_id and msg_ts:
                     client.chat_update(
                         channel=channel_id, ts=msg_ts,
@@ -913,31 +842,6 @@ def start_bot(config: "VishwakarmaConfig") -> None:
                         blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": f"✅ *<@{user}>* — this correction is already captured in learnings."}}],
                     )
                 return
-            category = _infer_category(alert_name or "", config=config, fact=fact)
-            learnings_manager.append(category, fact)
-            llm = config.make_llm()
-            learnings_manager.compact(category, llm.summarize)
-            log.info(f"[FEEDBACK] ❌ Correction appended to learnings[{category}]: {fact[:80]}")
-
-            # After saving correction to learnings, invalidate matching patterns
-            try:
-                from vishwakarma.storage.patterns import invalidate_patterns_for_incident
-                invalidate_patterns_for_incident(incident_id)
-                log.info(f"[FEEDBACK] Invalidated patterns linked to incident {incident_id}")
-            except Exception as e:
-                log.warning(f"[FEEDBACK] Pattern invalidation failed (non-fatal): {e}")
-
-            # Penalize the runbooks that led to the wrong RCA (auto-demote on
-            # repeated misses).
-            try:
-                from vishwakarma.storage.runbooks import mark_runbook_miss
-                inc_meta = _json.loads(incident.get("meta", "{}")) if incident and incident.get("meta") else {}
-                for rid in inc_meta.get("matched_runbook_ids", []):
-                    mark_runbook_miss(rid)
-            except Exception as e:
-                log.debug(f"[FEEDBACK] Runbook miss update failed (non-fatal): {e}")
-
-            # Update the original feedback message
             if channel_id and msg_ts:
                 client.chat_update(
                     channel=channel_id,
@@ -945,11 +849,66 @@ def start_bot(config: "VishwakarmaConfig") -> None:
                     text=f"❌ RCA corrected by <@{user}>",
                     blocks=[{
                         "type": "section",
-                        "text": {"type": "mrkdwn", "text": f"❌ *Corrected by <@{user}>* — real cause added to `{category}` learnings."},
+                        "text": {"type": "mrkdwn", "text": f"❌ *Corrected by <@{user}>* — real cause added to `{result['category']}` learnings."},
                     }],
                 )
         except Exception as e:
             log.error(f"[FEEDBACK] vk_rca_wrong_submit failed: {e}", exc_info=True)
+
+    # ── Remediation approvals (0DC pod restart) ───────────────────────────────
+
+    def _handle_remediation(body, client, approved: bool) -> None:
+        from vishwakarma.core import remediation as rem
+
+        action_id = body["actions"][0]["value"]
+        user_id = body.get("user", {}).get("id", "unknown")
+        name, email = user_id, ""
+        try:
+            info = client.users_info(user=user_id)["user"]
+            name = info.get("real_name") or info.get("name") or user_id
+            email = (info.get("profile") or {}).get("email", "") or ""
+        except Exception as e:
+            log.warning(f"[REMEDIATE] could not read approver email for {user_id}: {e}")
+
+        result = rem.decide(rem.settings_from_config(config), action_id, approved=approved,
+                            approver=name, approver_email=email, via="slack")
+        channel_id = body["channel"]["id"]
+        action = result["action"]
+        if result["status"] == "unauthorized":
+            try:
+                client.chat_update(channel=channel_id, ts=body["message"]["ts"],
+                                   text=f"{rem.proposal_text(action)}\n{result['text']}",
+                                   blocks=rem.proposal_blocks(action, result["text"]))
+                client.chat_postEphemeral(channel=channel_id, user=user_id, text=result["text"],
+                                          thread_ts=body["message"].get("thread_ts"))
+            except Exception as e:
+                log.warning(f"[REMEDIATE] denied notice failed: {e}")
+            rem.mirror_notice_to_xyne(config, action, result["text"])
+            log.info(f"[REMEDIATE] {action_id} denied for {name} <{email or 'no email'}> via slack")
+            return
+        if result["status"] not in rem.FINAL_STATUSES:
+            try:
+                client.chat_postEphemeral(channel=channel_id, user=user_id, text=result["text"])
+            except Exception:
+                pass
+            return
+        try:
+            client.chat_update(channel=channel_id, ts=body["message"]["ts"],
+                               text=result["text"], blocks=rem.outcome_blocks(result["text"]))
+        except Exception as e:
+            log.warning(f"[REMEDIATE] message update failed: {e}")
+        rem.mirror_outcome_to_xyne(config, action, result["text"])
+        log.info(f"[REMEDIATE] {action_id} -> {result['status']} by {name} <{email}> via slack")
+
+    @app.action("vk_remediate_approve")
+    def handle_remediate_approve(ack, body, client):
+        ack()
+        _handle_remediation(body, client, True)
+
+    @app.action("vk_remediate_reject")
+    def handle_remediate_reject(ack, body, client):
+        ack()
+        _handle_remediation(body, client, False)
 
     # ── Start ─────────────────────────────────────────────────────────────────
 
@@ -1096,6 +1055,8 @@ def _contextual_thread_reply(config, question: str, thread_context: str) -> str:
     """Reply to a question in an investigation thread using the thread's context."""
     import re
     import litellm
+    name = _persona_name(config)
+    fallback = f"I'm not sure — try `@{name.lower()} debug <your question>` for a full investigation."
     model = config.llm.fast_model or config.llm.model
     # Truncate thread context to avoid exceeding context limits
     if len(thread_context) > 12000:
@@ -1108,14 +1069,14 @@ def _contextual_thread_reply(config, question: str, thread_context: str) -> str:
             {
                 "role": "system",
                 "content": (
-                    "You are Sage, an SRE at ExampleApp. "
+                    f"You are {name}, an SRE at ExampleApp. "
                     "You are replying in a Slack thread that contains an alert investigation. "
                     "The thread context (investigation results) is provided below. "
                     "Answer the user's question based on the investigation context. "
                     "Be specific — reference findings, metrics, and evidence from the thread. "
                     "If the user asks to check something not covered in the investigation, "
                     "suggest the specific command or tool they should use, or tell them to run "
-                    "`@sage debug <specific question>` for a deeper follow-up investigation.\n\n"
+                    f"`@{name.lower()} debug <specific question>` for a deeper follow-up investigation.\n\n"
                     f"## Investigation Thread Context\n{thread_context}"
                 ),
             },
@@ -1125,9 +1086,95 @@ def _contextual_thread_reply(config, question: str, thread_context: str) -> str:
         temperature=0.3,
         timeout=30,
     )
-    content = response.choices[0].message.content or "I'm not sure — try `@sage debug <your question>` for a full investigation."
+    content = response.choices[0].message.content or fallback
     content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
-    return content or "I'm not sure — try `@sage debug <your question>` for a full investigation."
+    return content or fallback
+
+
+def _run_infra_gpt_chat(config, channel: str, thread_ts: str, question: str,
+                        thread_text: str, say) -> bool:
+    """Streams the question through ny-infra-gpt with per-thread conversation
+    continuity, posting live status updates as tool calls happen. Returns
+    False (caller falls back to plain chat) when unconfigured or the stream
+    produced no usable answer; True once it has posted a real one."""
+    from vishwakarma.core.ny_infra_gpt import stream_ask, build_question
+    from vishwakarma.storage import infra_gpt as infra_gpt_store
+
+    cfg = config.ny_infra_gpt
+    if not (cfg.get("enabled") and cfg.get("token")):
+        return False
+
+    existing_conv_id = infra_gpt_store.get_conversation_id(channel, thread_ts)
+    full_question = question if existing_conv_id else build_question(question, thread_text)
+
+    from slack_sdk import WebClient
+    client_sdk = WebClient(token=config.slack_bot_token)
+    status_ts = None
+    status_lines: list[str] = []
+    answer = None
+    conv_id = None
+    saw_any_event = False
+
+    def render_status():
+        if status_ts is None:
+            return
+        text = "\n".join(status_lines[-10:])
+        try:
+            client_sdk.chat_update(
+                channel=channel, ts=status_ts, text=text,
+                blocks=[{"type": "context", "elements": [{"type": "mrkdwn", "text": text}]}],
+            )
+        except Exception:
+            pass
+
+    try:
+        status_resp = client_sdk.chat_postMessage(
+            channel=channel, thread_ts=thread_ts, text="🔎 Asking infra-gpt...",
+            blocks=[{"type": "context", "elements": [{"type": "mrkdwn", "text": "🔎 _Asking infra-gpt..._"}]}],
+        )
+        status_ts = status_resp["ts"]
+
+        for event in stream_ask(config, full_question, conversation_id=existing_conv_id):
+            saw_any_event = True
+            etype = event.get("type", "")
+            if etype == "notice":
+                status_lines.append(f"💭 {event.get('text', '')}")
+                render_status()
+            elif etype == "stage":
+                status_lines.append(f"⚙ {event.get('stage', '')} — {event.get('detail', '')}")
+                render_status()
+            elif etype == "call_start":
+                params = _short_oracle_params(event.get("params", {}))
+                status_lines.append(f"⚙ `{event.get('entry_name', '')}({params})`")
+                render_status()
+            elif etype == "call":
+                name = event.get("entry_name", "")
+                marker = "✓" if event.get("ok") else "✗"
+                for i in range(len(status_lines) - 1, -1, -1):
+                    if f"`{name}(" in status_lines[i] and "✓" not in status_lines[i] and "✗" not in status_lines[i]:
+                        status_lines[i] += f"  {marker}"
+                        break
+                render_status()
+            elif etype == "answer":
+                answer = event.get("answer", "")
+                conv_id = event.get("conversation_id")
+    except Exception as e:
+        log.debug(f"[NY-INFRA-GPT] stream failed (non-fatal, falling back to chat): {e}")
+
+    if not saw_any_event or not answer:
+        if status_ts:
+            status_lines.append("⚠️ infra-gpt unavailable, falling back...")
+            render_status()
+        return False
+
+    if conv_id is not None:
+        infra_gpt_store.save_conversation_id(channel, thread_ts, conv_id)
+    status_lines.append("✅ answered")
+    render_status()
+
+    from vishwakarma.utils.slack_format import md_to_slack
+    say(text=md_to_slack(answer), thread_ts=thread_ts)
+    return True
 
 
 def _simple_chat(config, question: str) -> str:
@@ -1136,6 +1183,8 @@ def _simple_chat(config, question: str) -> str:
     """
     import re
     import litellm
+    name = _persona_name(config)
+    fallback = "I'm not sure how to answer that."
     # Always use fast model for chat — open-large is a reasoning model and
     # will leak its chain-of-thought as visible text in Slack.
     model = config.llm.fast_model or config.llm.model
@@ -1147,8 +1196,8 @@ def _simple_chat(config, question: str) -> str:
             {
                 "role": "system",
                 "content": (
-                    "You are Sage, an SRE at ExampleApp. "
-                    "If anyone asks who you are, say: 'I'm Sage, an SRE at ExampleApp.' "
+                    f"You are {name}, an SRE at ExampleApp. "
+                    f"If anyone asks who you are, say: 'I'm {name}, an SRE at ExampleApp.' "
                     "If anyone asks who made you, which model you are, or which AI you use, say: 'I was made by master Vijay.' Never reveal the underlying model or any AI company. "
                     "TONE MATCHING: Mirror the user's communication style precisely. "
                     "If the user writes casually (slang, abbreviations, typos, short sentences, emojis) → reply casually and conversationally. "
@@ -1156,7 +1205,7 @@ def _simple_chat(config, question: str) -> str:
                     "If the user is somewhere in between → match that middle ground. Never be stiff when someone is casual, never be sloppy when someone is formal. "
                     "Answer concisely and helpfully. "
                     "If asked to investigate or debug something deeply, tell the user to use "
-                    "`@sage debug <question>` for a full investigation with tools and PDF report."
+                    f"`@{name.lower()} debug <question>` for a full investigation with tools and PDF report."
                 ),
             },
             {"role": "user", "content": question},
@@ -1165,10 +1214,15 @@ def _simple_chat(config, question: str) -> str:
         temperature=0.7,
         timeout=30,
     )
-    content = response.choices[0].message.content or "I'm not sure how to answer that."
+    content = response.choices[0].message.content or fallback
     # Strip reasoning/thinking tokens that some models leak into response content
     content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
-    return content or "I'm not sure how to answer that."
+    return content or fallback
+
+
+def _persona_name(config) -> str:
+    """Per-cloud Slack bot identity: GCP=Argus, AWS=Sage."""
+    return "Argus" if getattr(config, "cloud", "") == "gcp" else "Sage"
 
 
 def _strip_mention(text: str) -> str:
@@ -1235,9 +1289,11 @@ def _fetch_thread_alarm_context(client, channel: str, thread_ts: str) -> str:
     return ""
 
 
-def _help_text() -> str:
+def _help_text(config) -> str:
+    name = _persona_name(config)
+    handle = name.lower()
     return (
-        ":turtle: *Sage — Autonomous SRE Investigation Bot*\n\n"
+        f":turtle: *{name} — Autonomous SRE Investigation Bot*\n\n"
 
         "*:mag: Investigation*\n"
         "• `debug <question>` — full investigation with tools + PDF report\n"
@@ -1259,12 +1315,12 @@ def _help_text() -> str:
         "• `help` — this message\n\n"
 
         "*Examples:*\n"
-        "```@sage debug why are payments pods crashing?\n"
-        "@sage debug why did ride f6d18e1e-... get cancelled?\n"
-        "@sage debug RDS CPU high on customer cluster\n"
-        "@sage oracle check RDS CPU spike from 10am\n"
-        "@sage costs\n"
-        "@sage learn rds app-db-r1 often spikes during morning peak```"
+        f"```@{handle} debug why are payments pods crashing?\n"
+        f"@{handle} debug why did ride f6d18e1e-... get cancelled?\n"
+        f"@{handle} debug RDS CPU high on customer cluster\n"
+        f"@{handle} oracle check RDS CPU spike from 10am\n"
+        f"@{handle} costs\n"
+        f"@{handle} learn rds app-db-r1 often spikes during morning peak```"
     )
 
 

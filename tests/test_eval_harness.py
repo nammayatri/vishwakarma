@@ -63,3 +63,34 @@ def test_run_eval_handles_investigate_failure():
         raise RuntimeError("engine down")
     report = run_eval(golden, boom)
     assert report.total == 1 and report.cases[0].correct is False
+
+
+def test_grades():
+    full = score_case({"title": "t", "must_include": ["a", "b"]}, "a and b")
+    part = score_case({"title": "t", "must_include": ["a", "b"]}, "a only")
+    none = score_case({"title": "t", "must_include": ["a", "b"]}, "zzz")
+    bad  = score_case({"title": "t", "must_include": ["a"], "harmful_terms": ["kubectl delete"]},
+                      "a — then kubectl delete the pod")
+    assert (full.grade, part.grade, none.grade, bad.grade) == ("✅", "⚠️", "❌", "🚫")
+    assert full.correct and bad.grade == "🚫" and not bad.correct
+
+
+def test_grades_derived_terms_path_gets_partial_credit():
+    # No must_include — terms are derived from known_root_cause; a >=50% match
+    # is "correct" but should still grade ⚠️, not ✅, when terms are missing.
+    case = {"title": "t", "known_root_cause": "missing index on driver_offers table causing seqscan"}
+    partial = score_case(case, "The root cause is a missing index on the table")
+    assert partial.correct and partial.grade == "⚠️" and partial.missing_terms
+
+    case_empty = {"title": "t"}
+    nothing_to_grade = score_case(case_empty, "some unrelated text")
+    assert nothing_to_grade.grade == "❌" and not nothing_to_grade.correct
+
+
+def test_gate_zero_harmful_hard_fail():
+    r = EvalReport()
+    r.cases = [CaseResult("a", True, "HIGH", [], [], "✅"),
+               CaseResult("b", False, "LOW", [], [], "🚫")]
+    assert not r.gate()
+    r.cases[1] = CaseResult("b", False, "LOW", [], [], "❌")
+    assert r.gate()

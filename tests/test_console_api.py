@@ -153,6 +153,34 @@ def test_feedback_updates_runbook_counters(seeded):
     assert rb.get_runbook("rds-cpu")["miss_count"] == 1
 
 
+def test_proposal_approve_writes_runbook_and_clears_queue(seeded):
+    from vishwakarma.storage import runbooks as rb
+    pid = rb.save_proposal("rds-cpu", "inc-1", "## amended steps", "reason")
+    c = make_client(Cfg())
+    r = c.post(f"/api/console/runbook-proposals/{pid}/approve")
+    assert r.status_code == 200 and r.json() == {"applied": True}
+    assert rb.get_runbook("rds-cpu")["content_md"] == "## amended steps"
+    assert rb.list_proposals() == []
+
+
+def test_proposal_approve_404_when_runbook_gone(seeded):
+    from vishwakarma.storage import runbooks as rb
+    pid = rb.save_proposal("rds-cpu", "inc-1", "## amended steps", "reason")
+    rb.delete_runbook("rds-cpu")
+    c = make_client(Cfg())
+    r = c.post(f"/api/console/runbook-proposals/{pid}/approve")
+    assert r.status_code == 404
+
+
+def test_proposal_reject_deletes_it(seeded):
+    from vishwakarma.storage import runbooks as rb
+    pid = rb.save_proposal("rds-cpu", "inc-1", "## amended steps", "reason")
+    c = make_client(Cfg())
+    r = c.post(f"/api/console/runbook-proposals/{pid}/reject")
+    assert r.status_code == 200 and r.json() == {"rejected": True}
+    assert rb.list_proposals() == []
+
+
 # ── Fleet + fixes ─────────────────────────────────────────────────────────────
 
 def test_fleet_snapshot_without_redis(seeded):
