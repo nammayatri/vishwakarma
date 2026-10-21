@@ -289,7 +289,9 @@ class PGConnection:
 
     def _connect(self):
         import psycopg2
-        conn = psycopg2.connect(self._dsn)
+        conn = psycopg2.connect(
+            self._dsn, connect_timeout=10,
+            keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=5)
         conn.autocommit = False
         return conn
 
@@ -300,31 +302,47 @@ class PGConnection:
         # doubled for psycopg2.
         return sql.replace("%", "%%").replace("?", "%s")
 
+    def _reconnect(self):
+        try:
+            self._pg.close()
+        except Exception:
+            pass
+        self._pg = self._connect()
+
+    def _ensure_open(self):
+        if getattr(self._pg, "closed", 0):
+            log.warning("Postgres connection is closed — reconnecting")
+            self._reconnect()
+
+    def _safe_rollback(self):
+        try:
+            self._pg.rollback()
+        except Exception:
+            pass
+
     def execute(self, sql: str, params=()):  # noqa: ANN001 — mirrors sqlite3 API
         import psycopg2
         from psycopg2.extras import DictCursor
         for attempt in (1, 2):
             try:
+                self._ensure_open()
                 cur = self._pg.cursor(cursor_factory=DictCursor)
                 cur.execute(self._translate(sql), tuple(params))
                 return cur
-            except psycopg2.OperationalError:
+            except (psycopg2.OperationalError, psycopg2.InterfaceError):
                 if attempt == 2:
                     raise
                 log.warning("Postgres connection lost — reconnecting")
-                try:
-                    self._pg.close()
-                except Exception:
-                    pass
-                self._pg = self._connect()
+                self._reconnect()
             except Exception:
                 # Failed statement poisons the transaction — roll back so the
                 # connection stays usable for subsequent queries.
-                self._pg.rollback()
+                self._safe_rollback()
                 raise
 
     def executescript(self, sql: str):
         # psycopg2 supports multi-statement strings in a single execute.
+        self._ensure_open()
         cur = self._pg.cursor()
         cur.execute(sql)
 
@@ -332,7 +350,7 @@ class PGConnection:
         self._pg.commit()
 
     def rollback(self):
-        self._pg.rollback()
+        self._safe_rollback()
 
     def close(self):
         try:

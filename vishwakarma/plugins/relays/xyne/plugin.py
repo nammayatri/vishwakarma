@@ -27,6 +27,8 @@ real API (2026-08-11):
     every later post in the same investigation (ack/phase/RCA), so the
     whole conversation still threads together correctly from that point on.
 """
+import base64
+import json
 import logging
 import re
 import threading
@@ -224,9 +226,34 @@ class XyneWebClient:
             raise XyneApiError(f"{path} {r.status_code}: {r.text[:200]}")
         return r.json() if r.content else {}
 
+    def conversation_from_history(self, channel, ts: str, max_depth: int = 12) -> str:
+        for n in range(1, max_depth + 1):
+            try:
+                data = self._post("conversations.history", {"channel": channel, "limit": n})
+            except Exception as e:
+                log.debug(f"Xyne conversations.history lookup failed: {e}")
+                return ""
+            msgs = data.get("messages") or []
+            if len(msgs) < n:
+                return ""
+            if str(msgs[-1].get("ts")) == str(ts):
+                cursor = (data.get("response_metadata") or {}).get("next_cursor") or ""
+                try:
+                    decoded = json.loads(base64.b64decode(cursor + "=" * (-len(cursor) % 4)))
+                    return str(decoded.get("conversationId") or "")
+                except Exception:
+                    return ""
+        return ""
+
     def _post_flow_card(self, channel, text: str, flow: dict, thread_ts: str | None) -> dict:
         body = {"channelId": channel, "text": _xyne_text(text)[:300], "flow": flow}
         conversation_id = conversation_id_for(thread_ts)
+        if not conversation_id and thread_ts:
+            conversation_id = self.conversation_from_history(channel, thread_ts)
+            if conversation_id:
+                seed_conversation(thread_ts, conversation_id)
+            else:
+                log.warning(f"Xyne: no conversation id for thread {thread_ts} — card goes to the channel")
         data = None
         in_thread = False
         if conversation_id:

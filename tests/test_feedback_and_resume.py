@@ -617,3 +617,37 @@ def test_non_dict_response_does_not_break_logging():
     plugin._remember_conversation("weird", "ts-w", None)
     plugin._remember_conversation("weird", "ts-w", ["x"])
     assert plugin.conversation_id_for("ts-w") == ""
+
+
+def test_conversation_id_is_read_from_history_cursor():
+    import base64, json
+    from vishwakarma.plugins.relays.xyne import plugin as p
+
+    cursor = base64.b64encode(json.dumps({"conversationId": "CONV-9"}).encode()).decode()
+    calls = []
+
+    class Sess:
+        headers = {}
+
+        def post(self, url, json=None, timeout=None):
+            calls.append((url, json))
+
+            class R:
+                content = b"1"
+                status_code = 200
+                def raise_for_status(self): pass
+                def json(self_inner):
+                    if url.endswith("conversations.history"):
+                        n = json["limit"]
+                        msgs = [{"ts": f"m{i}"} for i in range(n)]
+                        msgs[-1] = {"ts": "ROOT"} if n == 3 else msgs[-1]
+                        return {"ok": True, "messages": msgs, "response_metadata": {"next_cursor": cursor}}
+                    return {"messageId": "MID"}
+            return R()
+
+    c = p.XyneWebClient("https://x/api/apps/slack", "tok")
+    c._session = Sess()
+    assert c.conversation_from_history("CH", "ROOT") == "CONV-9"
+    out = c.chat_postMessage(channel="CH", thread_ts="ROOT", text="t", flow=p.text_flow("x"))
+    card = next(b for u, b in calls if u.endswith("/chat/postMessage"))
+    assert card["conversationId"] == "CONV-9" and out["ts"] == "flow:MID"
