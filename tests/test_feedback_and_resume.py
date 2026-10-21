@@ -182,7 +182,7 @@ def _outcome(verb, result):
 def test_outcome_text_variants():
     assert "Learning saved to redis" in _outcome("vk_rca_correct", {"status": "saved", "category": "redis"})
     assert "already captured" in _outcome("vk_rca_correct", {"status": "duplicate"})
-    assert "Marked wrong by Asha" in _outcome("vk_rca_wrong", {"status": "saved", "runbooks_penalized": 0})
+    assert "Saved as wrong by Asha" in _outcome("vk_rca_wrong", {"status": "saved", "runbooks_penalized": 0})
     assert "Could not find" in _outcome("vk_rca_wrong", {"status": "missing"})
 
 
@@ -524,7 +524,7 @@ def test_click_uses_channel_embedded_in_action_id(monkeypatch):
 
     def fake_update(self, channel, ts, text="", **kw):
         seen.append((channel, ts))
-        if "Marked correct" in text:
+        if "Saved as correct" in text:
             done.set()
 
     monkeypatch.setattr(plugin.XyneWebClient, "chat_update", fake_update)

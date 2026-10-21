@@ -162,17 +162,17 @@ def _outcome_text(verb: str, result: dict, who: str) -> str:
         return "⚠️ Could not find this incident, so no feedback was recorded."
     if verb == CORRECT_ACTION_ID:
         if status == "duplicate":
-            return f"✅ {who} marked this RCA correct — the root cause is already captured in learnings."
-        lines = [f"✅ Marked correct by {who}", f"🧠 Learning saved to {result.get('category')}"]
+            return f"✅ Saved as correct by {who} — the root cause is already captured in learnings."
+        lines = [f"✅ Saved as correct by {who}", f"🧠 Learning saved to {result.get('category')}"]
         if result.get("pattern_saved"):
             lines.append(f"⚙️ Investigation pattern saved ({result.get('pattern_type')}) — it will replay on the next identical alert")
         lines.append("📈 Evidence baselines updated")
         return "\n".join(lines)
     if status == "duplicate":
-        return f"❌ {who} marked this RCA wrong — that correction is already captured in learnings."
+        return f"❌ Saved as wrong by {who} — that correction is already captured in learnings."
     penalized = result.get("runbooks_penalized", 0)
     note = f" ({penalized} runbook match(es) down-weighted)" if penalized else ""
-    return f"❌ Marked wrong by {who}{note}. Matching replay patterns were invalidated."
+    return f"❌ Saved as wrong by {who}{note}. Matching replay patterns were invalidated."
 
 
 def _xyne_channel_for(incident_id: str) -> str:
@@ -220,10 +220,12 @@ def handle_flow_action(config, payload: dict, user_lookup) -> dict | None:
             from vishwakarma.plugins.relays.xyne.plugin import FLOW_TS_PREFIX, XyneWebClient, text_flow
             XyneWebClient(config.xyne_base_url, config.xyne_bot_token).chat_update(
                 channel=channel, ts=f"{FLOW_TS_PREFIX}{message_id}", text=text, flow=text_flow(text))
+            log.info(f"[FEEDBACK] Card {message_id[:8]} updated: {text.splitlines()[0][:60]}")
         except Exception as e:
             log.warning(f"[FEEDBACK] Xyne card update failed (non-fatal): {e}")
 
     def _work() -> None:
+        _update_card("⏳ Saving feedback…")
         try:
             result = (record_correct(config, incident_id) if verb == CORRECT_ACTION_ID
                       else record_wrong(config, incident_id))
@@ -237,6 +239,5 @@ def handle_flow_action(config, payload: dict, user_lookup) -> dict | None:
                 _in_flight.discard(key)
         _update_card(text)
 
-    _update_card("⏳ Saving feedback…")
     threading.Thread(target=_work, daemon=True).start()
     return {"type": "ack", "message": "Saving feedback…"}
